@@ -19,13 +19,14 @@ JOB_TRANSITIONS: dict[str, frozenset[str]] = {
     "running": frozenset({"paused", "reviewing", "exporting", "cancelling", "failed", "interrupted"}),
     "paused": frozenset({"running", "exporting", "cancelling", "interrupted", "failed"}),
     # Startup journal recovery can find an interrupted commit already committed.
-    "interrupted": frozenset({"preparing_workspace", "running", "reviewing", "exporting", "cancelling", "succeeded", "failed", "discarded"}),
+    "interrupted": frozenset({"preparing_workspace", "running", "reviewing", "exporting", "cancelling", "succeeded", "succeeded_with_issues", "failed", "discarded"}),
     "reviewing": frozenset({"running", "exporting", "cancelling", "failed", "discarded", "interrupted"}),
     "exporting": frozenset({"paused", "committing", "reviewing", "cancelling", "failed", "interrupted"}),
-    "committing": frozenset({"succeeded", "cancelled_recoverable", "failed", "interrupted"}),
+    "committing": frozenset({"succeeded", "succeeded_with_issues", "cancelled_recoverable", "failed", "interrupted"}),
     "cancelling": frozenset({"cancelled_recoverable", "succeeded", "failed", "interrupted"}),
     "cancelled_recoverable": frozenset({"preparing_workspace", "running", "reviewing", "exporting", "interrupted", "discarded"}),
     "succeeded": frozenset(),
+    "succeeded_with_issues": frozenset(),
     "failed": frozenset({"preparing_workspace", "running", "reviewing", "discarded"}),
     "discarded": frozenset(),
 }
@@ -88,11 +89,15 @@ class RecoveryDecision:
 
 
 def decide_startup_recovery(status: str, journal_state: str | None) -> RecoveryDecision:
+    if journal_state in {"prepared", "declared", "staging", "staged", "backup_verified"}:
+        return RecoveryDecision("interrupted", True, "pre-swap Export requires confirmed recommit")
+    if journal_state in {"rollback_created", "rollback_required"}:
+        return RecoveryDecision("committing", False, "finish the journaled directory switch")
     if journal_state not in (None, "resolved", "committed", "rolled_back"):
         return RecoveryDecision("committing", False, "commit journal must be resolved before any new work")
     # Kept aligned with db.NON_INTERRUPTIBLE_JOB_STATUSES: whatever startup
     # recovery refuses to freeze must also be reported as needing no recovery.
-    if status in {"succeeded", "discarded", "draft", "ready", "failed", "cancelled_recoverable"}:
+    if status in {"succeeded", "succeeded_with_issues", "discarded", "draft", "ready", "failed", "cancelled_recoverable"}:
         return RecoveryDecision(status, False, "terminal or not-started state")
     if status == "cancelling":
         return RecoveryDecision("cancelling", False, "finish cancellation drain")

@@ -1,73 +1,62 @@
+import type { AnnotationPreset } from "../../draftPersistence";
 import type { Draft } from "../../draft";
-import { formatLabel, type UiLanguage } from "../../i18n";
 import { FormField, ToggleField, type FieldGuidanceCopy } from "../FormField";
 import { PathPicker, type PathPickerCopy } from "../PathPicker";
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 
-type SetupPreflight = {
-  sampleCount: number;
-  inScopeCount: number;
-  nonblankTxtCount: number;
-  nonblankJsonCount: number;
-  blankTxtCount: number;
-  blankJsonCount: number;
-  annotationKeyCollisionCount: number;
-  imageIssueCount: number;
-  projection: {
-    format?: string;
-    retainedSamples?: number;
-    jsonCreate?: number;
-    jsonOverwrite?: number;
-    jsonDelete?: number;
-    txtCreate?: number;
-    txtOverwrite?: number;
-    txtDelete?: number;
-  };
-  estimate: { incrementalWriteBytes?: number; backupUpperBoundBytes?: number };
-  api: { minRequests?: number; maxWithBackupRequests?: number; httpAttemptBudget?: number; estimatedUploadBytes?: number };
-};
-
-function formatBytes(value: number): string {
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let size = Math.max(0, value), unit = 0;
-  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
-  return `${size < 10 && unit ? size.toFixed(1) : Math.round(size)} ${units[unit]}`;
-}
-
 export type SetupStepProps = {
-  draft: Pick<Draft, "sourceRoot" | "workMode" | "outputRoot" | "overwriteMode" | "imageDecode" | "recursive" | "export">;
+  draft: Pick<Draft, "sourceRoot" | "workMode" | "outputRoot" | "overwriteMode" | "imageDecode" | "recursive">;
   defaults: Pick<Draft, "workMode" | "overwriteMode" | "imageDecode" | "recursive">;
   taskLocked: boolean;
-  resourcesLoading: boolean;
   profileResourcesReady: boolean;
-  workspaceReady: boolean;
-  preflightPending: boolean;
-  workspacePending: boolean;
-  preflight: SetupPreflight | null;
-  enabledModules: string;
-  language: UiLanguage;
+  presets: readonly AnnotationPreset[];
+  selectedPresetId: string;
+  presetName: string;
+  persistenceWarning: string | null;
   t: Translate;
   guidanceCopy: FieldGuidanceCopy;
   pathPickerCopy: PathPickerCopy;
-  copy: { preflightHint: string; profileReady: string; profileUnavailable: string; workspaceHint: string };
+  copy: { preflightHint: string; profileReady: string; profileUnavailable: string };
   onSourceRootChange: (value: string) => void;
   onWorkModeChange: (value: Draft["workMode"]) => void;
   onOutputRootChange: (value: string) => void;
   onOverwriteModeChange: (value: Draft["overwriteMode"]) => void;
   onInvalidImageActionChange: (value: Draft["imageDecode"]["invalidImageAction"]) => void;
   onRecursiveChange: (value: boolean) => void;
-  onRunPreflight: () => void;
-  onPrepareWorkspace: () => void;
+  onPresetSelect: (presetId: string) => void;
+  onPresetNameChange: (value: string) => void;
+  onSavePreset: () => void;
+  onDeletePreset: () => void;
 };
 
 export function SetupStep({
-  draft, defaults, taskLocked, resourcesLoading, profileResourcesReady, workspaceReady, preflightPending, workspacePending, preflight, enabledModules, language, t, guidanceCopy, pathPickerCopy, copy,
+  draft, defaults, taskLocked, profileResourcesReady, presets, selectedPresetId, presetName, persistenceWarning, t, guidanceCopy, pathPickerCopy, copy,
   onSourceRootChange, onWorkModeChange, onOutputRootChange, onOverwriteModeChange, onInvalidImageActionChange, onRecursiveChange,
-  onRunPreflight, onPrepareWorkspace,
+  onPresetSelect, onPresetNameChange, onSavePreset, onDeletePreset,
 }: SetupStepProps) {
   return <>
     <div className="step-intro"><p>{copy.preflightHint}</p><span className={`status ${profileResourcesReady ? "available" : "failed"}`}>{profileResourcesReady ? copy.profileReady : copy.profileUnavailable}</span></div>
+    <section className="annotation-presets" aria-labelledby="annotation-presets-heading">
+      <div className="subsection-heading"><h3 id="annotation-presets-heading">{t("taskPresets")}</h3></div>
+      <div className="form-grid">
+        <FormField id="annotation-preset-select" label={t("taskPreset")} copy={guidanceCopy} guidance={{ description: t("fieldHelp_taskPreset") }}>
+          <select id="annotation-preset-select" disabled={taskLocked} value={selectedPresetId} onChange={(event) => onPresetSelect(event.target.value)}>
+            <option value="">{t("noTaskPreset")}</option>
+            {presets.map((preset) => <option key={preset.presetId} value={preset.presetId}>{preset.name}</option>)}
+          </select>
+        </FormField>
+        <FormField id="annotation-preset-name" label={t("presetName")} copy={guidanceCopy} guidance={{ description: t("fieldHelp_taskPreset") }}>
+          <input id="annotation-preset-name" disabled={taskLocked} value={presetName} onChange={(event) => onPresetNameChange(event.target.value)} placeholder={t("taskPresetNamePlaceholder")} />
+        </FormField>
+      </div>
+      <div className="step-actions">
+        <button type="button" disabled={taskLocked || !presetName.trim()} onClick={onSavePreset}>{t("saveTaskPreset")}</button>
+        <button className="secondary" type="button" disabled={taskLocked || !selectedPresetId} onClick={onDeletePreset}>{t("deleteTaskPreset")}</button>
+      </div>
+      <p className="hint">{t("taskPresetHelp")}</p>
+      {persistenceWarning && <p className="resource-warning" role="status" data-persistence-warning>{persistenceWarning}</p>}
+    </section>
     <div data-config-surface="setup" className="form-grid">
       <FormField id="setup-source-dataset" label={t("sourceDataset")} copy={guidanceCopy} guidance={{ description: t("fieldHelp_sourceDataset") }}>
         <PathPicker id="setup-source-dataset" purpose="source_dataset" disabled={taskLocked} value={draft.sourceRoot} onChange={onSourceRootChange} placeholder={t("absoluteWindowsPath")} copy={pathPickerCopy} />
@@ -86,23 +75,16 @@ export function SetupStep({
       </FormField>
       <ToggleField id="setup-recursive" label={t("searchSubfolders")} checked={draft.recursive} disabled={taskLocked} onChange={onRecursiveChange} copy={guidanceCopy} guidance={{ description: t("fieldHelp_recursive"), defaultValue: defaults.recursive ? t("fieldEnabled") : t("fieldDisabled") }} />
     </div>
-    <div className="step-actions" aria-busy={preflightPending || workspacePending}><button type="button" disabled={taskLocked || resourcesLoading || preflightPending || !profileResourcesReady || !draft.sourceRoot.trim()} aria-busy={preflightPending} onClick={onRunPreflight}>{t("preflight")}</button><button className="secondary" type="button" disabled={!preflight || taskLocked || workspacePending || (draft.imageDecode.invalidImageAction === "block" && preflight.imageIssueCount > 0)} aria-busy={workspacePending} onClick={onPrepareWorkspace}>{t("confirmWorkspace")}</button></div>
-    {preflight && <><dl className="facts preflight">
-      <div><dt>{t("samples")}</dt><dd>{preflight.sampleCount}</dd></div>
-      <div><dt>{t("inScope")}</dt><dd>{preflight.inScopeCount}</dd></div>
-      <div><dt>{t("existingTxtJson")}</dt><dd>{preflight.nonblankTxtCount} / {preflight.nonblankJsonCount}</dd></div>
-      <div><dt>{t("blankTxtJson")}</dt><dd>{preflight.blankTxtCount} / {preflight.blankJsonCount}</dd></div>
-      <div><dt>{t("plannedJson")}</dt><dd>{preflight.projection.jsonCreate ?? 0} / {preflight.projection.jsonOverwrite ?? 0} / {preflight.projection.jsonDelete ?? 0}</dd></div>
-      <div><dt>{t("plannedTxt")}</dt><dd>{preflight.projection.txtCreate ?? 0} / {preflight.projection.txtOverwrite ?? 0} / {preflight.projection.txtDelete ?? 0}</dd></div>
-      <div><dt>{t("retainedSamples")}</dt><dd>{preflight.projection.retainedSamples ?? 0}</dd></div>
-      <div><dt>{t("keyCollisions")}</dt><dd>{preflight.annotationKeyCollisionCount}</dd></div>
-      <div><dt>{t("imageIssues")}</dt><dd>{preflight.imageIssueCount}</dd></div>
-      <div><dt>{t("spaceEstimate")}</dt><dd>{formatBytes(preflight.estimate.incrementalWriteBytes ?? 0)} / {formatBytes(preflight.estimate.backupUpperBoundBytes ?? 0)}</dd></div>
-      <div><dt>{t("apiRequests")}</dt><dd>{preflight.api.minRequests ?? 0} / {preflight.api.maxWithBackupRequests ?? 0}</dd></div>
-      <div><dt>{t("httpBudget")}</dt><dd>{preflight.api.httpAttemptBudget ?? 0}</dd></div>
-      <div><dt>{t("uploadEstimate")}</dt><dd>{formatBytes(preflight.api.estimatedUploadBytes ?? 0)}</dd></div>
-      <div><dt>{t("format")}</dt><dd>{formatLabel(language, String(preflight.projection.format ?? draft.export.format))}</dd></div>
-      <div><dt>{t("enabledModules")}</dt><dd>{enabledModules}</dd></div>
-    </dl><p className="hint">{workspaceReady ? copy.workspaceHint : copy.preflightHint}</p></>}
+    <details className="input-format-help" data-input-format-help>
+      <summary>{t("inputFormatHelpTitle")}</summary>
+      <ul>
+        <li>{t("inputFormatHelpPairing")}</li>
+        <li>{t("inputFormatHelpStandardJson")}</li>
+        <li>{t("inputFormatHelpRawJson")}</li>
+        <li>{t("inputFormatHelpTxt")}</li>
+        <li>{t("inputFormatHelpValidation")}</li>
+      </ul>
+    </details>
+    <p className="hint">{copy.preflightHint}</p>
   </>;
 }

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import os
+import hashlib
 from collections.abc import Iterable, Mapping
 from typing import Any
+from pathlib import Path
 
 from .contracts import ProgressEvent, SampleIssue, pipeline_module_ids, utc_now
 from .db_primitives import (
@@ -25,6 +28,12 @@ from .db_schema import (
 )
 
 
+# Oversize OCR issues were recorded as non-retriable before the worker gained
+# in-memory downscaling. They are now safe to target in a repair task without
+# widening repair eligibility for unrelated non-retriable issues.
+REPAIRABLE_LEGACY_OCR_ISSUE_SQL = "(retriable=1 OR (module_id='ocr' AND code='ocr_image_too_large'))"
+
+
 class JobDatabaseMixin:
     """Job, manifest, dataset claim, summary, diagnostic, issue, and event operations."""
 
@@ -42,6 +51,77 @@ class JobDatabaseMixin:
         self.connection.execute(
             f"INSERT INTO jobs({','.join(columns)}) VALUES ({placeholders})", values
         )
+
+    def create_preflight_progress(self, job_id: str, *, total_files: int) -> None:
+        """Create the independent progress row before an asynchronous scan starts."""
+        if type(total_files) is not int or total_files < 0:
+            raise ValueError("preflight total_files must be a non-negative integer")
+        with self.transaction(immediate=True):
+            if self.connection.execute("SELECT 1 FROM jobs WHERE job_id=?", (job_id,)).fetchone() is None:
+                raise KeyError(f"job does not exist: {job_id}")
+            self.connection.execute(
+                """INSERT INTO preflight_progress(
+                       job_id,status,checked_files,total_files,error,summary_json,updated_at
+                   ) VALUES (?, 'queued', 0, ?, NULL, NULL, ?)""",
+                (job_id, total_files, utc_now()),
+            )
+
+    def update_preflight_progress(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        checked_files: int | None = None,
+        total_files: int | None = None,
+        error: str | None = None,
+        summary_json: str | None = None,
+    ) -> None:
+        """Persist one monotonic asynchronous preflight status update."""
+        statuses = {"queued", "preflighting", "completed", "failed", "cancelled"}
+        if status not in statuses:
+            raise ValueError("invalid preflight progress status")
+        if checked_files is not None and (type(checked_files) is not int or checked_files < 0):
+            raise ValueError("preflight checked_files must be a non-negative integer")
+        if total_files is not None and (type(total_files) is not int or total_files < 0):
+            raise ValueError("preflight total_files must be a non-negative integer")
+        if error is not None and (not isinstance(error, str) or len(error) > 16_384):
+            raise ValueError("preflight progress error is invalid")
+        if summary_json is not None and (not isinstance(summary_json, str) or len(summary_json.encode("utf-8")) > 262_144):
+            raise ValueError("preflight summary is too large")
+        with self.transaction(immediate=True):
+            row = self.connection.execute(
+                "SELECT status,checked_files,total_files FROM preflight_progress WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"preflight progress does not exist: {job_id}")
+            previous_status = str(row["status"])
+            previous_checked = int(row["checked_files"])
+            previous_total = int(row["total_files"])
+            if previous_status in {"completed", "failed", "cancelled"} and status != previous_status:
+                raise ValueError("preflight progress is already terminal")
+            if status == "queued" and previous_status != "queued":
+                raise ValueError("preflight progress cannot return to queued")
+            next_checked = previous_checked if checked_files is None else checked_files
+            next_total = previous_total if total_files is None else total_files
+            if next_checked < previous_checked or next_checked > next_total:
+                raise ValueError("preflight progress counters are invalid")
+            if status == "completed" and next_checked != next_total:
+                raise ValueError("completed preflight must check every candidate image")
+            self.connection.execute(
+                """UPDATE preflight_progress
+                   SET status=?,checked_files=?,total_files=?,error=?,summary_json=?,updated_at=?
+                   WHERE job_id=?""",
+                (status, next_checked, next_total, error, summary_json, utc_now(), job_id),
+            )
+
+    def get_preflight_progress(self, job_id: str) -> dict[str, object]:
+        row = self.connection.execute(
+            "SELECT * FROM preflight_progress WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"preflight progress does not exist: {job_id}")
+        return dict(row)
 
     def update_preflight_config(
         self,
@@ -89,6 +169,9 @@ class JobDatabaseMixin:
 
     def delete_job_control_record(self, job_id: str) -> None:
         """Delete only control-plane rows. Backup paths are never tracked/deleted here."""
+        # Explicitly remove the progress row as well so databases created before
+        # the foreign-key addition do not retain an orphaned status record.
+        self.connection.execute("DELETE FROM preflight_progress WHERE job_id=?", (job_id,))
         result = self.connection.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
         if result.rowcount != 1:
             raise KeyError(f"job does not exist: {job_id}")
@@ -111,6 +194,137 @@ class JobDatabaseMixin:
             count += self._insert_sample_batch(batch)
         return count
 
+    def freeze_incremental_preservation(
+        self,
+        job_id: str,
+        *,
+        overwrite_mode: str,
+        overwrite_json: bool = False,
+        overwrite_txt: bool = False,
+        overwrite_count: bool = False,
+    ) -> dict[str, int]:
+        """Freeze one deterministic preserve/processable decision per sample.
+
+        Only validated, non-empty sibling annotations are eligible.  Invalid
+        bytes remain user data and are reported to their normal runner instead
+        of being treated as missing and silently overwritten.
+        """
+        if overwrite_mode not in {"incremental", "rebuild"}:
+            raise ValueError("invalid overwrite mode")
+        job = self.get_job(job_id)
+        dataset = Path(str(job["dataset_root"]))
+        rows = list(self.connection.execute(
+            "SELECT sample_id,relative_image_path,in_processing_scope,original_txt_state,original_json_state FROM samples WHERE job_id=? ORDER BY sample_id",
+            (job_id,),
+        ))
+        counts = {"preserved": 0, "processable": 0, "invalid": 0}
+        with self.transaction(immediate=True):
+            for row in rows:
+                preserve = False
+                reason: str | None = None
+                if overwrite_mode == "incremental" and int(row["in_processing_scope"]):
+                    image = dataset / Path(str(row["relative_image_path"]).replace("\\", os.sep))
+                    # Only replace the final image suffix.  A dotted stem such
+                    # as foo.bar.png maps to foo.bar.json/txt.
+                    txt = image.with_name(image.name.rsplit(".", 1)[0] + ".txt")
+                    js = image.with_name(image.name.rsplit(".", 1)[0] + ".json")
+                    # Explicit field overwrite takes precedence over an
+                    # otherwise preservable sibling.  JSON is checked first
+                    # because it is the canonical structured annotation.
+                    candidates: list[tuple[str, Path, bool]] = [
+                        ("json", js, overwrite_json or overwrite_count),
+                        ("txt", txt, overwrite_txt),
+                    ]
+                    invalid_kind: str | None = None
+                    for kind, path, overwrite in candidates:
+                        if overwrite or not path.is_file():
+                            continue
+                        try:
+                            raw = path.read_bytes()
+                            if not raw:
+                                continue
+                            text = raw.decode("utf-8-sig")
+                            # Whitespace-only files are equivalent to a
+                            # missing annotation and remain processable.
+                            if not text.strip():
+                                continue
+                            if "\x00" in text:
+                                raise ValueError("annotation text is invalid")
+                            if kind == "txt" and len(raw) > 262_144:
+                                raise ValueError("annotation TXT exceeds its limit")
+                            if kind == "json":
+                                # JSON has its own protocol size limit; do not
+                                # classify a large valid JSON as missing.
+                                parsed = json.loads(text)
+                                if not isinstance(parsed, dict):
+                                    raise ValueError("annotation JSON is invalid")
+                            preserve = True
+                            reason = f"existing_{kind}"
+                            break
+                        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                            reason = f"invalid_existing_{kind}"
+                            invalid_kind = kind
+                            counts["invalid"] += 1
+                            # A present but malformed annotation is still
+                            # user data.  Freeze it out of mutation and let
+                            # the normal issue/reporting path surface it.
+                            preserve = True
+                            break
+                    # An explicit overwrite must win over every sibling.  The
+                    # scheduler skips a whole sample, so preserving the other
+                    # format here would otherwise swallow overwriteJson or
+                    # overwriteCount and prevent the requested rebuild.
+                    if (overwrite_json or overwrite_txt or overwrite_count) and any(
+                        path.is_file() for _kind, path, _overwrite in candidates
+                    ):
+                        preserve = False
+                        reason = None
+                    if invalid_kind is not None and preserve:
+                        self.upsert_issue(SampleIssue(
+                            issueId=hashlib.sha256(
+                                f"{job_id}\0{row['sample_id']}\0incremental\0{invalid_kind}".encode("utf-8")
+                            ).hexdigest(),
+                            jobId=job_id,
+                            sampleId=int(row["sample_id"]),
+                            relativeImagePath=str(row["relative_image_path"]),
+                            moduleId="workspace",
+                            code="invalid_existing_annotation",
+                            severity="warning",
+                            blocking=False,
+                            retriable=False,
+                            message=f"existing {invalid_kind} annotation is invalid and was preserved",
+                            attempt=0,
+                            repairStartModule="classify",
+                        ))
+                self.connection.execute(
+                    "UPDATE samples SET incremental_preserve=?,incremental_preserve_reason=? WHERE job_id=? AND sample_id=?",
+                    (int(preserve), reason, job_id, int(row["sample_id"])),
+                )
+                if preserve:
+                    counts["preserved"] += 1
+                else:
+                    counts["processable"] += 1
+        # Seed the durable NL archive from every readable baseline JSON. This
+        # happens even when the NL module is disabled or the sample is
+        # incrementally preserved, so Dropout/recovery never depends on the
+        # short-lived job overlay. The archive operation is idempotent.
+        from .classify_overlay import parse_annotation_json
+        for row in rows:
+            if not int(row["in_processing_scope"]):
+                continue
+            image = dataset / Path(str(row["relative_image_path"]).replace("\\", os.sep))
+            json_path = image.with_name(image.name.rsplit(".", 1)[0] + ".json")
+            try:
+                projection = parse_annotation_json(json_path.read_bytes()) if json_path.is_file() else None
+            except (OSError, ValueError):
+                continue
+            text = projection.get("nl") if isinstance(projection, dict) else None
+            if isinstance(text, str) and text.strip():
+                self.archive_nl_for_sample(
+                    job_id, int(row["sample_id"]), source="original_json", text=text,
+                )
+        return counts
+
     def _insert_sample_batch(self, batch: list[tuple[Any, ...]]) -> int:
         with self.transaction():
             self.connection.executemany(
@@ -130,6 +344,12 @@ class JobDatabaseMixin:
     def clear_manifest_rows(self, job_id: str) -> None:
         """Remove a partial scan without touching the immutable job config."""
         with self.transaction(immediate=True):
+            # Workspace issues are generated from manifest rows during
+            # preflight.  They must not survive a cancelled/failed partial
+            # scan because their sample identities are removed below.
+            self.connection.execute(
+                "DELETE FROM issues WHERE job_id=? AND module_id='workspace'", (job_id,)
+            )
             self.connection.execute("DELETE FROM samples WHERE job_id=?", (job_id,))
             result = self.connection.execute(
                 "UPDATE jobs SET sample_count=0,manifest_generated_at=NULL WHERE job_id=?", (job_id,)
@@ -284,13 +504,23 @@ class JobDatabaseMixin:
         ))
 
     def count_unresolved_blocking_issues(self, job_id: str, *, exclude_module_id: str | None = None) -> int:
-        """Count the issue-review gate's open blocking issues."""
-        predicate = "" if exclude_module_id is None else " AND module_id<>?"
+        """Count open blockers that do not belong to terminally skipped samples.
+
+        A terminal sample failure is retained as an issue for the Failure
+        Workbench, but it no longer blocks the remaining samples from reaching
+        Export.  Non-sample/global blockers and blockers on active samples keep
+        their existing gate semantics.
+        """
+        predicate = "" if exclude_module_id is None else " AND i.module_id<>?"
         parameters: list[Any] = [job_id]
         if exclude_module_id is not None:
             parameters.append(exclude_module_id)
         return int(self.connection.execute(
-            "SELECT COUNT(*) FROM issues WHERE job_id=? AND resolved_at IS NULL AND blocking=1" + predicate,
+            """SELECT COUNT(*) FROM issues AS i
+                 LEFT JOIN sample_state AS st
+                   ON st.job_id=i.job_id AND st.sample_id=i.sample_id
+                WHERE i.job_id=? AND i.resolved_at IS NULL AND i.blocking=1
+                  AND (i.sample_id IS NULL OR st.status IS NULL OR st.status NOT IN ('failed','skipped'))""" + predicate,
             parameters,
         ).fetchone()[0])
 
@@ -330,13 +560,13 @@ class JobDatabaseMixin:
         ).fetchone()[0])
 
     def repair_candidate_summary(self, parent_job_id: str) -> tuple[int, int]:
-        """Return bounded UI counts from current, retriable parent issues only."""
+        """Return bounded UI counts from current repairable parent issues only."""
         row = self.connection.execute(
             """SELECT COUNT(DISTINCT sample_id) AS targets,
                       COUNT(DISTINCT CASE WHEN repair_start_module IN ('caption','classify','replace','ocr','nl')
                                           THEN sample_id END) AS reaches_nl
                  FROM issues
-                WHERE job_id=? AND resolved_at IS NULL AND retriable=1
+                WHERE job_id=? AND resolved_at IS NULL AND """ + REPAIRABLE_LEGACY_OCR_ISSUE_SQL + """
                   AND severity IN ('warning','error') AND sample_id IS NOT NULL
                   AND repair_start_module IN ('caption','classify','replace','ocr','nl','dropout','token_budget','export')""",
             (parent_job_id,),
@@ -379,6 +609,38 @@ class JobDatabaseMixin:
                     ),
                 )
             return resolved
+
+    def update_repair_parent_baselines(
+        self,
+        repair_job_id: str,
+        fingerprints: Mapping[int, tuple[str | None, str | None]],
+    ) -> int:
+        """Advance parent baselines for annotations committed by a child repair."""
+        parent = self.repair_parent_job_id(repair_job_id)
+        if parent is None or not fingerprints:
+            return 0
+        updated = 0
+        with self.transaction(immediate=True):
+            rows = self.connection.execute(
+                """SELECT DISTINCT parent_issue.sample_id
+                     FROM repair_target_issues AS link
+                     JOIN issues AS parent_issue ON parent_issue.issue_id=link.parent_issue_id
+                    WHERE link.repair_job_id=?""",
+                (repair_job_id,),
+            )
+            for row in rows:
+                sample_id = int(row["sample_id"])
+                values = fingerprints.get(sample_id)
+                if values is None:
+                    continue
+                self.connection.execute(
+                    """UPDATE samples
+                          SET original_txt_sha256=?, original_json_sha256=?
+                        WHERE job_id=? AND sample_id=?""",
+                    (values[0], values[1], parent, sample_id),
+                )
+                updated += 1
+        return updated
 
     def repair_parent_cursor(self, repair_job_id: str) -> int | None:
         row = self.connection.execute(
@@ -423,7 +685,7 @@ class JobDatabaseMixin:
                    AND parent_sample.sample_id=parent_issue.sample_id
                  JOIN samples AS repair_sample ON repair_sample.job_id=?
                    AND repair_sample.relative_image_path=parent_sample.relative_image_path
-                 WHERE parent_issue.job_id=? AND parent_issue.resolved_at IS NULL AND parent_issue.retriable=1
+                 WHERE parent_issue.job_id=? AND parent_issue.resolved_at IS NULL AND """ + REPAIRABLE_LEGACY_OCR_ISSUE_SQL.replace("module_id", "parent_issue.module_id").replace("code", "parent_issue.code").replace("retriable", "parent_issue.retriable") + """
                    AND parent_issue.severity IN ('warning','error') AND parent_issue.sample_id IS NOT NULL
                    AND parent_issue.repair_start_module IN (""" + eligible_sql + ")"
             + predicate + " GROUP BY repair_sample.sample_id,parent_issue.sample_id ORDER BY parent_issue.sample_id LIMIT ?",
@@ -443,7 +705,7 @@ class JobDatabaseMixin:
             )
             placeholders = ",".join("?" for _ in parent_sample_ids)
             issue_rows = self.connection.execute(
-                """SELECT sample_id,issue_id FROM issues WHERE job_id=? AND resolved_at IS NULL AND retriable=1
+                """SELECT sample_id,issue_id FROM issues WHERE job_id=? AND resolved_at IS NULL AND """ + REPAIRABLE_LEGACY_OCR_ISSUE_SQL + """
                    AND severity IN ('warning','error')
                    AND repair_start_module IN ('caption','classify','replace','ocr','nl','dropout','token_budget','export')
                    AND sample_id IN (""" + placeholders + ")",
@@ -493,7 +755,7 @@ class JobDatabaseMixin:
         """Drop claims left by successful jobs; recoverable tasks retain ownership."""
         result = self.connection.execute(
             """DELETE FROM dataset_claims WHERE job_id IN (
-                    SELECT job_id FROM jobs WHERE status='succeeded')""",
+                    SELECT job_id FROM jobs WHERE status IN ('succeeded','succeeded_with_issues'))""",
         )
         return result.rowcount
 

@@ -41,7 +41,7 @@ class RetentionManager:
     def candidates(self) -> list[RetentionCandidate]:
         rows = list(self.database.connection.execute(
             """SELECT job_id,overlay_root,commit_journal_path FROM jobs
-               WHERE status='succeeded' AND pinned=0
+               WHERE status IN ('succeeded','succeeded_with_issues') AND pinned=0
                ORDER BY COALESCE(finished_at,created_at) DESC, job_id DESC"""
         ))
         # A succeeded job with a journal pointer remains protected until its

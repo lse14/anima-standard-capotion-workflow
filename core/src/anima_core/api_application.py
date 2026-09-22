@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
+from pathlib import Path
 
 from .api_context import ControlPlaneContext, bad_request, not_found
 from .api_models import _ShutdownBody, parse_select_path_body
 from .db import StateDatabase
 from .native_path_picker import NativePathPickerBusyError, NativePathPickerUnavailableError
+from .launcher import WorkerLaunchError, WorkerLauncher
 from .pipeline import PipelineError
 from .resource_catalog import ResourceCatalogError
 from .scheduler import SchedulerError
@@ -23,7 +25,36 @@ def build_application_router(context: ControlPlaneContext) -> APIRouter:
     @router.get("/api/resources")
     def list_resources() -> dict[str, object]:
         try:
-            return context.resource_catalog.scan().api_dict()
+            snapshot = context.resource_catalog.scan()
+            payload = snapshot.api_dict()
+            if payload.get("resources"):
+                install_root = getattr(context.pipeline_service, "install_root", None)
+                policy = {"status": "missing", "runtimeId": "policy"}
+                if install_root is not None:
+                    try:
+                        WorkerLauncher.from_install_root(
+                            install_root,
+                            resource_root=context.resource_catalog.root,
+                        ).resolve("policy", expected_owner="policy", verify_interpreter=False)
+                    except (WorkerLaunchError, OSError):
+                        manifest = Path(install_root) / "manifests" / "runtimes" / "policy.json"
+                        policy["status"] = "invalid" if manifest.exists() else "missing"
+                    else:
+                        policy["status"] = "available"
+                quality = {"status": "missing", "resourceId": "lse14-scorer-5k-v1"}
+                try:
+                    snapshot.package("dropout-model", "lse14-scorer-5k-v1", verify_hashes=True)
+                except ResourceCatalogError:
+                    quality_paths = [item.relative_path.casefold() for item in snapshot.invalid]
+                    quality["status"] = (
+                        "invalid"
+                        if any("dropout-models\\lse14-scorer-5k-v1" in path for path in quality_paths)
+                        else "missing"
+                    )
+                else:
+                    quality["status"] = "available"
+                payload["capabilities"] = {"policy": policy, "qualityStack": quality}
+            return payload
         except ResourceCatalogError as exc:
             raise bad_request(exc) from exc
 

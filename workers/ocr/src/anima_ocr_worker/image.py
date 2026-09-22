@@ -12,6 +12,7 @@ from .protocol import OcrWorkItem
 
 MAX_PIXELS = 40_000_000
 MAX_SIDE = 16_384
+MAX_HEADER_BYTES = 16 * 1024 * 1024
 FORMATS = {
     ".jpg": "jpeg",
     ".jpeg": "jpeg",
@@ -52,8 +53,67 @@ class DecodedImage:
     sha256: str
 
 
+@dataclass(frozen=True)
+class ImageHeader:
+    image_format: str
+    encoded_width: int
+    encoded_height: int
+    visible_width: int
+    visible_height: int
+
+
+class _BoundedHeaderReader:
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+        self._read_bytes = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = MAX_HEADER_BYTES - self._read_bytes
+        if remaining < 0:
+            raise OcrImageDecodeError("OCR image header exceeds the safety limit")
+        requested = remaining + 1 if size < 0 else min(size, remaining + 1)
+        data = self._stream.read(requested)
+        self._read_bytes += len(data)
+        if self._read_bytes > MAX_HEADER_BYTES:
+            raise OcrImageDecodeError("OCR image header exceeds the safety limit")
+        return data
+
+    def readinto(self, buffer: object) -> int:
+        data = self.read(len(buffer))
+        buffer[: len(data)] = data
+        return len(data)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._stream.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+
 def image_exceeds_limits(width: int, height: int) -> bool:
     return width < 1 or height < 1 or width * height > MAX_PIXELS or width > MAX_SIDE or height > MAX_SIDE
+
+
+def scaled_dimensions(width: int, height: int) -> tuple[int, int]:
+    if width < 1 or height < 1:
+        raise ValueError("image dimensions must be positive")
+    if not image_exceeds_limits(width, height):
+        return width, height
+    scale = min((MAX_PIXELS / (width * height)) ** 0.5, MAX_SIDE / max(width, height))
+    scaled_width = max(1, math.floor(width * scale))
+    scaled_height = max(1, math.floor(height * scale))
+    while image_exceeds_limits(scaled_width, scaled_height):
+        if scaled_width >= scaled_height:
+            scaled_width -= 1
+        else:
+            scaled_height -= 1
+    return scaled_width, scaled_height
 
 
 def _is_reparse(path: Path) -> bool:
@@ -122,6 +182,56 @@ def _visible_dimensions(source: object) -> tuple[int, int]:
     return width, height
 
 
+def _inspect_header(source: object, expected_format: str) -> ImageHeader:
+    visible_width, visible_height = _visible_dimensions(source)
+    image_format = str(source.format or "").lower()
+    if image_format != expected_format:
+        raise OcrImageDecodeError(
+            "OCR image bytes do not match their extension",
+            width=visible_width,
+            height=visible_height,
+        )
+    if getattr(source, "n_frames", 1) != 1:
+        raise OcrImageDecodeError(
+            "OCR does not support multi-frame images",
+            width=visible_width,
+            height=visible_height,
+        )
+    try:
+        source.seek(1)
+    except EOFError:
+        source.seek(0)
+    else:
+        raise OcrImageDecodeError(
+            "OCR does not support multi-frame images",
+            width=visible_width,
+            height=visible_height,
+        )
+    return ImageHeader(
+        image_format=image_format,
+        encoded_width=source.width,
+        encoded_height=source.height,
+        visible_width=visible_width,
+        visible_height=visible_height,
+    )
+
+
+def _read_header(path: Path, Image: object, expected_format: str) -> ImageHeader:
+    with path.open("rb") as stream:
+        bounded = _BoundedHeaderReader(stream)
+        with Image.open(bounded) as source:
+            return _inspect_header(source, expected_format)
+
+
+def _jpeg_decoder_target(width: int, height: int, *, visible_width: int, visible_height: int) -> tuple[int, int]:
+    for divisor in (2, 4, 8):
+        decoded_width = math.ceil(width / divisor)
+        decoded_height = math.ceil(height / divisor)
+        if not image_exceeds_limits(decoded_width, decoded_height):
+            return max(1, width // divisor), max(1, height // divisor)
+    raise OcrImageTooLargeError(visible_width, visible_height)
+
+
 def decode_and_verify(item: OcrWorkItem) -> DecodedImage:
     path = verify_source_fingerprint(item)
     suffix = path.suffix.lower()
@@ -132,35 +242,38 @@ def decode_and_verify(item: OcrWorkItem) -> DecodedImage:
         from PIL import Image, ImageFile, ImageOps
     except ImportError as exc:
         raise OcrImageDecodeError("Pillow is unavailable in the OCR runtime") from exc
-    previous_max_pixels = Image.MAX_IMAGE_PIXELS
     try:
-        Image.MAX_IMAGE_PIXELS = None
+        header = _read_header(path, Image, expected_format)
+        decoder_target: tuple[int, int] | None = None
+        if image_exceeds_limits(header.encoded_width, header.encoded_height):
+            if header.image_format != "jpeg":
+                raise OcrImageTooLargeError(header.visible_width, header.visible_height)
+            decoder_target = _jpeg_decoder_target(
+                header.encoded_width,
+                header.encoded_height,
+                visible_width=header.visible_width,
+                visible_height=header.visible_height,
+            )
         with path.open("rb") as stream:
             ImageFile.LOAD_TRUNCATED_IMAGES = False
             with Image.open(stream) as source:
-                visible_width, visible_height = _visible_dimensions(source)
-                actual_format = str(source.format or "").lower()
-                if actual_format != expected_format:
+                decoded_header = _inspect_header(source, expected_format)
+                if decoded_header != header:
                     raise OcrImageDecodeError(
-                        "OCR image bytes do not match their extension",
-                        width=visible_width,
-                        height=visible_height,
+                        "OCR image header changed during decoding",
+                        width=decoded_header.visible_width,
+                        height=decoded_header.visible_height,
                     )
-                if getattr(source, "n_frames", 1) != 1:
-                    raise OcrImageDecodeError("OCR does not support multi-frame images", width=visible_width, height=visible_height)
-                try:
-                    source.seek(1)
-                except EOFError:
-                    source.seek(0)
-                else:
-                    raise OcrImageDecodeError("OCR does not support multi-frame images", width=visible_width, height=visible_height)
-                if image_exceeds_limits(visible_width, visible_height):
-                    raise OcrImageTooLargeError(visible_width, visible_height)
+                if decoder_target is not None:
+                    source.draft("RGB", decoder_target)
+                    if image_exceeds_limits(source.width, source.height):
+                        raise OcrImageTooLargeError(header.visible_width, header.visible_height)
                 source.load()
                 transposed = ImageOps.exif_transpose(source)
                 transposed.load()
-                if image_exceeds_limits(transposed.width, transposed.height):
-                    raise OcrImageTooLargeError(transposed.width, transposed.height)
+                target_width, target_height = scaled_dimensions(transposed.width, transposed.height)
+                if (target_width, target_height) != (transposed.width, transposed.height):
+                    transposed = transposed.resize((target_width, target_height), Image.Resampling.LANCZOS)
                 rgba = transposed.convert("RGBA")
                 white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
                 rgb = Image.alpha_composite(white, rgba).convert("RGB")
@@ -171,9 +284,7 @@ def decode_and_verify(item: OcrWorkItem) -> DecodedImage:
         raise
     except Exception as exc:
         raise OcrImageDecodeError("OCR image cannot be decoded under the frozen policy") from exc
-    finally:
-        Image.MAX_IMAGE_PIXELS = previous_max_pixels
     verify_source_fingerprint(item)
-    if rgb.width < 1 or rgb.height < 1 or not math.isfinite(float(rgb.width * rgb.height)):
+    if image_exceeds_limits(rgb.width, rgb.height) or not math.isfinite(float(rgb.width * rgb.height)):
         raise OcrImageDecodeError("OCR image dimensions are invalid")
     return DecodedImage(rgb, rgb.width, rgb.height, item.image_size, item.image_sha256)

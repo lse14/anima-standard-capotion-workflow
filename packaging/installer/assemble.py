@@ -27,19 +27,16 @@ MANDATORY_E621_COMPONENTS = frozenset(
         "classify-e621",
         "replace-e621",
         "nl",
-        "policy",
         "export",
         "token-budget",
-        "ocr-cpu",
         "e621-indexes",
         "e621-replacement-indexes",
         "e621-tagger",
         "qwen3-tokenizer",
-        "quality-stack",
     }
 )
 
-_DELAYED_LOCAL_COMPONENT_IDS = frozenset({"ocr-models"})
+_OPTIONAL_COMPONENT_IDS = frozenset({"ocr-cpu", "ocr-gpu", "ocr-models", "policy", "quality-stack"})
 
 
 def validate_mandatory_e621_components(manifest: InstallManifest) -> None:
@@ -47,6 +44,15 @@ def validate_mandatory_e621_components(manifest: InstallManifest) -> None:
     missing = sorted(MANDATORY_E621_COMPONENTS - present)
     if missing:
         raise ManifestError("mandatory E621 components are missing: " + ", ".join(missing))
+    invalid_optional = sorted(
+        component.component_id
+        for component in manifest.components
+        if component.component_id in _OPTIONAL_COMPONENT_IDS and component.required
+    )
+    if invalid_optional:
+        raise ManifestError(
+            "optional component must set required=false: " + ", ".join(invalid_optional)
+        )
 
 
 _VARIANT = Literal["cpu", "cuda", "shared"]
@@ -516,13 +522,21 @@ def _lock_name(component: Component, variant: _VARIANT) -> str | None:
         raise ManifestError(f"runtime lock mapping is invalid: {component.component_id}:{variant}") from exc
 
 
-def installation_plan(manifest: InstallManifest, *, accelerator: str) -> InstallationPlan:
+def installation_plan(
+    manifest: InstallManifest,
+    *,
+    accelerator: str,
+    optional_components: set[str] | frozenset[str] = frozenset(),
+) -> InstallationPlan:
     """Choose the exact CPU/NVIDIA component set without resolving dependencies."""
     if accelerator not in {"cpu", "nvidia"}:
         raise ManifestError("accelerator is invalid")
+    unknown_optional = set(optional_components) - _OPTIONAL_COMPONENT_IDS
+    if unknown_optional:
+        raise ManifestError("unknown optional component: " + ", ".join(sorted(unknown_optional)))
     selected: list[PlannedComponent] = []
     for component in manifest.components:
-        if component.component_id in _DELAYED_LOCAL_COMPONENT_IDS:
+        if component.component_id in _OPTIONAL_COMPONENT_IDS and not component.required and component.component_id not in optional_components:
             continue
         result = _select_variant(component, accelerator)
         if result is None:

@@ -6,6 +6,8 @@ import {
   makeSnapshot,
   mutationsFor,
   openApp,
+  openPrecheck,
+  openSetup,
   setJobSnapshot,
   test,
 } from "./mockApi";
@@ -117,6 +119,7 @@ test.describe("task status and issue characterization", () => {
     setJobSnapshot(api, snapshot);
     await installSnapshotFetchProbe(page, DEFAULT_JOB_ID);
     await openApp(page, { jobId: DEFAULT_JOB_ID, language: "en" });
+    await page.getByRole("button", { name: /Failures/ }).click();
     await expect(page.getByText("Review this sample")).toBeVisible();
     const issuePanel = page.locator(".issues-panel");
     await expect(issuePanel.locator(".issue-pagination")).toBeVisible();
@@ -137,7 +140,7 @@ test.describe("task status and issue characterization", () => {
     }
   });
 
-  test("submits task-only OCR execution tuning and shows the compact frozen runtime", async ({ page, api }) => {
+  test("submits task-only OCR execution tuning and shows the compact runtime recommendation", async ({ page, api }) => {
     await openApp(page, { language: "en" });
 
     await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
@@ -149,8 +152,9 @@ test.describe("task status and issue characterization", () => {
     await page.getByRole("radio", { name: "Manual text batch" }).check();
     await page.getByLabel("OCR text batch", { exact: true }).fill("4");
 
-    await page.locator(".workflow-rail").getByRole("button", { name: "Dataset and preflight" }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset" }).fill("E:\\datasets\\ocr-ui");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     expect(mutationsFor(api, "POST", "/api/jobs/preflight")[0]?.body).toMatchObject({
@@ -163,7 +167,7 @@ test.describe("task status and issue characterization", () => {
     await expect(page.getByLabel("OCR runtime")).toContainText("GPU 24 GiB");
     await expect(page.getByLabel("OCR runtime")).toContainText("2560 / 4");
     await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
-    await expect(page.getByLabel("OCR device", { exact: true })).toBeDisabled();
+    await expect(page.getByLabel("OCR device", { exact: true })).toBeEnabled();
   });
 
   test("shows the backend CUDA failure guidance in the OCR step", async ({ page, api }) => {
@@ -252,13 +256,16 @@ test.describe("task status and issue characterization", () => {
     api.snapshots.set(childJobId, child);
 
     await openApp(page, { jobId: DEFAULT_JOB_ID, language: "zh-CN" });
+    await page.getByRole("button", { name: /失败处理/ }).click();
 
     await expect(page.getByRole("heading", { name: "修复子任务", exact: true })).toBeVisible();
     await expect(page.getByText(`创建于 ${child.job.createdAt}`, { exact: true })).toBeVisible();
     await expect(page.getByLabel("最近任务").locator(`option[value="${childJobId}"]`)).toHaveCount(0);
+    await page.getByRole("button", { name: "任务", exact: true }).click();
     await expect(page.getByRole("button", { name: "固定任务" })).toHaveCount(0);
     await expect(page.locator(".task-monitor .task-actions").getByRole("button", { name: "删除任务并释放训练集占用" })).toBeDisabled();
     await expect(page.getByText("请先删除修复子任务")).toBeVisible();
+    await page.getByRole("button", { name: /失败处理/ }).click();
 
     await page.setViewportSize({ width: 390, height: 844 });
     await expect.poll(() => page.locator(".repair-tasks-panel").evaluate((element) => (
@@ -272,6 +279,7 @@ test.describe("task status and issue characterization", () => {
 
     await page.getByRole("button", { name: "返回父任务" }).click();
     await expect(page.getByLabel("最近任务")).toHaveValue(DEFAULT_JOB_ID);
+    await page.getByRole("button", { name: /失败处理/ }).click();
     await expect(page.getByRole("heading", { name: "修复子任务", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "打开修复任务" }).click();
 
@@ -287,6 +295,57 @@ test.describe("task status and issue characterization", () => {
     await expect(page.getByRole("heading", { name: "修复子任务", exact: true })).toHaveCount(0);
   });
 
+  test("deletes only the control record for a succeeded task", async ({ page, api }) => {
+    setJobSnapshot(api, makeSnapshot({ status: "succeeded", currentModuleId: "export" }));
+    await openTrackedJob(page, "succeeded");
+
+    const deleteHistory = page.getByRole("button", { name: "Delete completed history", exact: true });
+    await expect(deleteHistory).toBeEnabled();
+    page.once("dialog", (dialog) => {
+      expect(dialog.message()).toBe(
+        "Delete only this completed task record? Dataset annotations, exports, and the original backup will be preserved.",
+      );
+      dialog.accept();
+    });
+    await deleteHistory.click();
+
+    await expect.poll(() => mutationsFor(api, "POST", `/api/jobs/${DEFAULT_JOB_ID}/delete-history`).length).toBe(1);
+    await expect(page.getByLabel("Recent tasks")).toHaveValue("");
+    await expect(page.locator(".empty-state")).toBeVisible();
+  });
+
+  test("uses the completed-history action for a succeeded repair child", async ({ page, api }) => {
+    const parent = makeSnapshot({ status: "failed", currentModuleId: "export" });
+    const childJobId = `${DEFAULT_JOB_ID}-repair-succeeded`;
+    const child = makeSnapshot({ jobId: childJobId, status: "succeeded", currentModuleId: "export", parentJobId: DEFAULT_JOB_ID });
+    parent.repairChildren = [{
+      jobId: childJobId,
+      status: "succeeded",
+      currentModuleId: "export",
+      sampleCount: 2,
+      targetCount: 2,
+      createdAt: child.job.createdAt,
+      finishedAt: child.job.finishedAt,
+    }];
+    setJobSnapshot(api, parent);
+    api.snapshots.set(childJobId, child);
+    await openApp(page, { jobId: DEFAULT_JOB_ID, language: "en" });
+    await page.getByRole("button", { name: /Failures/ }).click();
+
+    const deleteHistory = page.locator(".repair-tasks-panel").getByRole("button", { name: "Delete completed history", exact: true });
+    await expect(deleteHistory).toBeEnabled();
+    page.once("dialog", (dialog) => {
+      expect(dialog.message()).toBe(
+        "Delete only this completed task record? Dataset annotations, exports, and the original backup will be preserved.",
+      );
+      dialog.accept();
+    });
+    await deleteHistory.click();
+
+    await expect.poll(() => mutationsFor(api, "POST", `/api/jobs/${childJobId}/delete-history`).length).toBe(1);
+    await expect(page.locator(".repair-tasks-panel")).toHaveCount(0);
+  });
+
   test("retries the selected current-page NL issues as one child after Export succeeds", async ({ page, api }) => {
     const snapshot = makeSnapshot({ status: "succeeded", currentModuleId: "export", schemaVersion: 10 });
     snapshot.issues = [
@@ -295,6 +354,7 @@ test.describe("task status and issue characterization", () => {
     ];
     setJobSnapshot(api, snapshot);
     await openApp(page, { jobId: DEFAULT_JOB_ID, language: "en" });
+    await page.getByRole("button", { name: /Failures/ }).click();
 
     const selectCurrentPage = page.getByRole("checkbox", { name: "Select NL issues on this page" });
     await expect(selectCurrentPage).toBeVisible();
@@ -321,6 +381,7 @@ test.describe("task status and issue characterization", () => {
     const releaseBatchRetry = holdRoute(api, `POST /api/jobs/${DEFAULT_JOB_ID}/nl/manual-retry-batch`);
     try {
       await openApp(page, { jobId: DEFAULT_JOB_ID, language: "en" });
+      await page.getByRole("button", { name: /Failures/ }).click();
       await page.getByRole("checkbox", { name: "Select NL issues on this page" }).check();
       page.once("dialog", (dialog) => dialog.accept());
       await page.getByRole("button", { name: "Retry selected NL" }).click();
@@ -477,6 +538,7 @@ test.describe("task status and issue characterization", () => {
     await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
     await expect(page.getByText("OCR summary")).toBeVisible();
     await expect(page.getByLabel("OCR summary").getByText("3", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: /Failures/ }).click();
     await expect(page.getByText("A test issue is available for repair.")).toBeVisible();
     await page.getByRole("button", { name: "Reprocess retriable samples", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", `/api/jobs/${DEFAULT_JOB_ID}/repair`).length).toBe(1);

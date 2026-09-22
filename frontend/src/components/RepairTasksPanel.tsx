@@ -9,11 +9,12 @@ export type RepairTasksPanelProps = {
     title: string;
     open: string;
     delete: string;
+    deleteCompletedHistory: string;
     targets: (sampleCount: number, targetCount: number) => string;
     createdAt: (createdAt: string) => string;
   };
   onOpen: (jobId: string) => void;
-  onDelete: (jobId: string) => void;
+  onDelete: (jobId: string, status: string) => void;
 };
 
 export function RepairTasksPanel({ tasks, pending, labels, onOpen, onDelete }: RepairTasksPanelProps) {
@@ -31,7 +32,7 @@ export function RepairTasksPanel({ tasks, pending, labels, onOpen, onDelete }: R
         </div>
         <div className="repair-task-actions">
           <button className="secondary" type="button" onClick={() => onOpen(task.jobId)}>{labels.open}</button>
-          <button className="danger-action" type="button" disabled={pending} aria-busy={pending} onClick={() => onDelete(task.jobId)}>{labels.delete}</button>
+          <button className="danger-action" type="button" disabled={pending} aria-busy={pending} onClick={() => onDelete(task.jobId, task.status)}>{task.status === "succeeded" ? labels.deleteCompletedHistory : labels.delete}</button>
         </div>
       </li>)}
     </ul>

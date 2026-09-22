@@ -164,15 +164,19 @@ def validate_evidence(component_id: str, variant: str, evidence: Mapping[str, ob
             raise ProbeError("GPU caption probe did not use CUDA")
         return True
     if component_id == "policy":
+        device = evidence.get("device")
+        if kind != "policy" or evidence.get("check") != "ok":
+            raise ProbeError("policy probe evidence is invalid")
+        if variant == "cpu" and not _device_is_cpu(device):
+            raise ProbeError("CPU policy probe used a CUDA device")
+        if variant == "cuda" and not _device_is_gpu(device):
+            raise ProbeError("GPU policy probe did not use CUDA")
+        return True
+    if component_id == "quality-stack":
         loaded = evidence.get("loaded")
         score = evidence.get("score")
-        device = evidence.get("device")
         if kind != "quality" or not isinstance(loaded, list) or set(loaded) != {"clip", "fusion", "jtp3", "waifu"} or not _finite(score):
-            raise ProbeError("quality probe evidence is invalid")
-        if variant == "cpu" and not _device_is_cpu(device):
-            raise ProbeError("CPU quality probe used a CUDA device")
-        if variant == "cuda" and not _device_is_gpu(device):
-            raise ProbeError("GPU quality probe did not use CUDA")
+            raise ProbeError("quality resource probe evidence is invalid")
         return True
     if component_id == "token-budget":
         counts = evidence.get("counts")
@@ -352,6 +356,47 @@ def _caption_cuda_dll_directories(runtime: Path, variant: str) -> tuple[Path, ..
     if not all(directory.is_dir() and not directory.is_symlink() for directory in directories):
         raise ProbeError("Caption CUDA runtime dependencies are incomplete")
     return directories
+
+
+def _probe_policy(runtime: Path, variant: str, *, runner: Runner | None) -> dict[str, object]:
+    script = """
+import json
+import sys
+from anima_policy_worker.policy import CoupledProbabilities, PolicyConfig, apply_policy
+
+config = PolicyConfig(
+    seed="offline-probe", artistEnabled=False, artistDropoutProbability=0.0,
+    qualityEnabled=False, qualityDropoutProbability=0.0, appearanceNlEnabled=False,
+    solo=CoupledProbabilities(0.0, 0.0), nonSolo=CoupledProbabilities(0.0, 0.0),
+    unknown=CoupledProbabilities(0.0, 0.0),
+)
+payload = {"quality": [], "count": "solo", "character": "", "series": "", "artist": "", "appearance": [], "tags": [], "environment": [], "nl": ""}
+result, _decision = apply_policy(payload, annotation_key="offline", relative_image_path="image.png", config=config, aesthetic_score=None)
+if result != payload:
+    raise RuntimeError("policy probe changed a disabled policy payload")
+try:
+    import torch
+except Exception as exc:
+    raise RuntimeError("policy runtime torch import failed") from exc
+if sys.argv[1] == "cuda":
+    if not torch.cuda.is_available():
+        raise RuntimeError("policy CUDA runtime is unavailable")
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+print(json.dumps({"kind": "policy", "check": "ok", "device": str(device)}, sort_keys=True))
+"""
+    return run_json_probe(
+        runtime / "python.exe",
+        script,
+        (variant,),
+        cwd=_runtime_root(runtime),
+        environment=offline_environment(
+            install_root=_runtime_root(runtime),
+            dll_directories=_caption_cuda_dll_directories(runtime, variant),
+        ),
+        runner=runner,
+    )
 
 
 def _probe_quality(runtime: Path, resource_target: Path, variant: str, *, runner: Runner | None) -> dict[str, object]:
@@ -596,15 +641,30 @@ def run_offline_probes(
         "caption-e621",
     )
     run_group(
-        ("policy", "quality-stack"),
-        lambda: _probe_quality(
+        ("policy",),
+        lambda: _probe_policy(
             _target(component_targets, "policy"),
-            _target(component_targets, "quality-stack"),
             variants["policy"],
             runner=runner,
         ),
         "policy",
     )
+    if "quality-stack" in selected:
+        if "policy" in selected:
+            run_group(
+                ("quality-stack",),
+                lambda: _probe_quality(
+                    _target(component_targets, "policy"),
+                    _target(component_targets, "quality-stack"),
+                    variants["policy"],
+                    runner=runner,
+                ),
+                "quality-stack",
+            )
+        else:
+            # The resource component is independently installable; its immutable
+            # manifest and file identities were already verified during assembly.
+            results["quality-stack"] = True
     run_group(
         ("token-budget", "qwen3-tokenizer"),
         lambda: _probe_tokenizer(

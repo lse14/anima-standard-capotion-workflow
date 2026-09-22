@@ -35,6 +35,7 @@ def main() -> int:
     parser.add_argument("--static-root", type=Path)
     parser.add_argument("--resource-root", type=Path)
     parser.add_argument("--shutdown-token")
+    parser.add_argument("--host-pid", type=int)
     args = parser.parse_args()
     try:
         verify_embedded_runtime()
@@ -62,6 +63,26 @@ def main() -> int:
             assert server is not None
             server.should_exit = True
         threading.Thread(target=stop, daemon=True, name="anima-control-shutdown").start()
+
+    if args.host_pid is not None:
+        def watch_host_process() -> None:
+            if sys.platform != "win32":
+                return
+            import ctypes
+
+            synchronize = 0x00100000
+            infinite = 0xFFFFFFFF
+            handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, int(args.host_pid))
+            if not handle:
+                request_shutdown()
+                return
+            try:
+                if ctypes.windll.kernel32.WaitForSingleObject(handle, infinite) == 0:
+                    request_shutdown()
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+
+        threading.Thread(target=watch_host_process, daemon=True, name="anima-webui-host-watch").start()
 
     app = build_control_app(
         pipeline_service=pipeline,

@@ -262,6 +262,17 @@ class PolicyRunner:
             raise self._fatal("policy_result_persistence_failed", "policy JSON cannot be validated") from exc
         if before is None or after is None or any(before.get(field) != after.get(field) for field in PROTECTED_FIELDS):
             raise self._fatal("policy_protocol_violation", "policy output changed a protected field")
+        previous_nl = before.get("nl")
+        next_nl = after.get("nl")
+        if isinstance(previous_nl, str) and previous_nl.strip() and previous_nl != next_nl:
+            # Dropout may clear the projection, but the prior text remains a
+            # durable, image-identity-bound NL revision.
+            self.database.archive_nl_for_sample(
+                self.job_id,
+                lease.sampleId,
+                source="dropout",
+                text=previous_nl,
+            )
         self.scheduler.stage_prepared(lease, relative_path=relative, sha256=digest)
         self.view.overlay.commit_prepared(relative, digest, str(row["annotation_key"]), ".json")
         quality = after.get("quality")

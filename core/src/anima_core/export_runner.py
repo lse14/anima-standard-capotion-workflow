@@ -81,7 +81,7 @@ class ExportRunner:
         errors=outcome.get("fieldErrors")
         if not isinstance(errors,list) or not errors or not all(isinstance(item,dict) and isinstance(item.get("code"),str) and (item.get("field") is None or isinstance(item.get("field"),str)) for item in errors): raise ExportRunnerError("export field errors are invalid")
         retriable,repair=self._repair(errors,config)
-        self.scheduler.fail_with_issue(lease,SampleIssue(issueId=hashlib.sha256(f"{self.job_id}\0{lease.sampleId}\0export\0final_json_invalid".encode()).hexdigest(),jobId=self.job_id,sampleId=lease.sampleId,relativeImagePath=str(row["relative_image_path"]),moduleId="export",code="final_json_invalid",severity="error",blocking=True,retriable=retriable,message="final JSON validation failed",attempt=lease.attempt,repairStartModule=repair,fieldErrors=tuple({key:value for key,value in item.items() if key in {"field","code"} and value is not None} for item in errors)))
+        self.scheduler.skip_export_with_issue(lease,SampleIssue(issueId=hashlib.sha256(f"{self.job_id}\0{lease.sampleId}\0export\0final_json_invalid".encode()).hexdigest(),jobId=self.job_id,sampleId=lease.sampleId,relativeImagePath=str(row["relative_image_path"]),moduleId="export",code="final_json_invalid",severity="error",blocking=True,retriable=retriable,message="final JSON validation failed",attempt=lease.attempt,repairStartModule=repair,fieldErrors=tuple({key:value for key,value in item.items() if key in {"field","code"} and value is not None} for item in errors)))
     def _prepared(self,lease:WorkLease,outcome:dict[str,object],config:dict[str,object])->None:
         artifacts=outcome.get("artifacts"); format_value=config["export"]["format"]
         expected={"json"} if format_value=="json" else ({"txt"} if format_value=="flat_txt" else {"json","txt"})
@@ -122,7 +122,7 @@ class ExportRunner:
                 active=self.scheduler.claim_batch(self.job_id,"export",self.worker_instance_id,config_hash)
                 if not active:
                     if self.database.count_module_unsettled(self.job_id,"export"): raise ExportRunnerError("export has unclaimable work")
-                    summary=self.database.module_summary(self.job_id,"export"); return self.scheduler.finish_module(self.job_id,"export",with_issues=int(summary["issue_count"])>0)
+                    return self.scheduler.finish_module(self.job_id,"export")
                 rows=[self.database.get_leased_sample(self.job_id,"export",lease.sampleId,lease_id=str(lease.leaseId),worker_instance_id=self.worker_instance_id) for lease in active]
                 if token_budget_writer is not None:
                     max_tokens = token_budget.get("maxTokens")

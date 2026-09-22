@@ -5,17 +5,28 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .annotation_backup import write_backup
-from .commit_journal import CommitJournal, CommitJournalError, load as load_journal, write as write_journal
+from .annotation_backup import verify_backup, write_backup
+from .dataset_workspace import DatasetWorkspace
+from .commit_journal import (
+    CommitJournal,
+    CommitJournalError,
+    CommitPhase,
+    JournalState,
+    load as load_journal,
+    write as write_journal,
+)
 from .db import StateDatabase
+from .db_primitives import repair_target_clause
 from .directory_commit import DirectoryCommitError, restore_rollback
 from .export_staging import StagingError, create_hardlink_staging, replace_business_annotation, replace_ocr_sidecar, reveal_staging
+from .export_summary import UNLABELED_IMAGES_CODE, unlabeled_output_folder
 from .overlay import OverlayLayout
 from .ocr_sidecar import OcrSidecarError, parse_ocr_sidecar
-from .path_safety import PathSafetyError, assert_no_reparse_tree, canonicalize, ensure_within, read_annotation_state, safe_relative_path, sha256_file
+from .path_safety import PathSafetyError, assert_no_reparse_tree, canonicalize, ensure_within, read_annotation_state, safe_relative_path, sha256_file, windows_paths_equal
 from .replace_overlay import ReplaceOverlayWriter
 from .replace_provenance import ReplaceProvenanceChange, apply_provenance_changes, provenance_database_path
 
@@ -32,6 +43,26 @@ class ExportCommitError(RuntimeError):
 class ExportCommitResult:
     exported: int
     backupZip: Path
+    unlabeled: int
+    unlabeledFolder: str
+
+
+def _advance_journal(
+    layout: OverlayLayout,
+    *,
+    job_id: str,
+    state: JournalState,
+    phase: CommitPhase,
+    dataset: Path,
+    staging: Path,
+    rollback: Path,
+    backup: Path,
+) -> CommitJournal:
+    journal = CommitJournal.v2(
+        job_id, state, dataset, staging, rollback, backup, phase=phase,
+    )
+    write_journal(layout, journal)
+    return journal
 
 
 class ExportCommitCoordinator:
@@ -65,6 +96,18 @@ class ExportCommitCoordinator:
     @staticmethod
     def _expected_kinds(format_value: str) -> set[str]:
         return {"json"} if format_value == "json" else ({"txt"} if format_value == "flat_txt" else {"json", "txt"})
+
+    @staticmethod
+    def _replace_directory_with_retry(source: Path, destination: Path) -> None:
+        """Retry short-lived Windows directory locks from sync/indexing tools."""
+        for attempt in range(20):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32} or attempt == 19:
+                    raise
+                time.sleep(0.5)
 
     def _artifacts(self, format_value: str):
         expected = self._expected_kinds(format_value)
@@ -103,34 +146,89 @@ class ExportCommitCoordinator:
             exported += 1
         return exported
 
+    def _scoped_samples(self):
+        """Yield only samples eligible for this task's Export projection."""
+        clause, clause_parameters = repair_target_clause(
+            self.database.connection, self.job_id, "export",
+        )
+        cursor: int | None = None
+        while True:
+            cursor_clause = "" if cursor is None else " AND s.sample_id>?"
+            parameters: list[object] = [self.job_id]
+            if cursor is not None:
+                parameters.append(cursor)
+            parameters.extend(clause_parameters)
+            parameters.append(500)
+            rows = list(self.database.connection.execute(
+                "SELECT s.* FROM samples AS s WHERE s.job_id=? AND s.in_processing_scope=1"
+                + cursor_clause + clause + " ORDER BY s.sample_id LIMIT ?",
+                parameters,
+            ))
+            if not rows:
+                return
+            yield from rows
+            cursor = int(rows[-1]["sample_id"])
+
+    @staticmethod
+    def _has_annotation(staging: Path, annotation_key: str) -> bool:
+        for suffix in (".txt", ".json"):
+            target = ExportCommitCoordinator._baseline_annotation(staging, annotation_key, suffix)
+            try:
+                if read_annotation_state(target) == "nonblank":
+                    return True
+            except PathSafetyError:
+                # An existing malformed annotation is still user data.  It is
+                # preserved and must not make the image look unannotated.
+                return True
+        return False
+
+    def _copy_unlabeled_images_to_staging(self, staging: Path) -> tuple[int, str]:
+        relative_root = safe_relative_path(unlabeled_output_folder(self.job_id))
+        output_root = ensure_within(staging, staging / Path(relative_root.replace("\\", os.sep)))
+        if output_root.exists():
+            raise ExportCommitError("task-scoped unlabeled output already exists")
+        copied = 0
+        for row in self._scoped_samples():
+            if self._has_annotation(staging, str(row["annotation_key"])):
+                continue
+            relative_image_path = safe_relative_path(str(row["relative_image_path"]))
+            source = ensure_within(staging, staging / Path(relative_image_path.replace("\\", os.sep)))
+            if not source.is_file():
+                raise ExportCommitError("unlabeled source image is missing")
+            target = ensure_within(output_root, output_root / Path(relative_image_path.replace("\\", os.sep)))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(source, target)
+            except OSError as link_error:
+                if target.exists() or target.is_symlink():
+                    raise ExportCommitError("unlabeled image target already exists") from link_error
+                try:
+                    shutil.copy2(source, target)
+                except OSError as exc:
+                    raise ExportCommitError("unlabeled image could not be staged") from exc
+            copied += 1
+        return copied, relative_root
+
     def _overlay_ocr_sidecars(self):
         """Yield only scoped, strict task-overlay sidecars in keyset pages."""
         try:
             assert_no_reparse_tree(self.layout.root / "ocr_annotations")
         except PathSafetyError as exc:
             raise ExportCommitError("OCR overlay contains a reparse point") from exc
-        cursor: int | None = None
-        while True:
-            page = self.database.page_samples(self.job_id, after_sample_id=cursor, limit=500)
-            if not page:
-                return
-            for row in page:
-                if not row["in_processing_scope"]:
+        for row in self._scoped_samples():
+            relative_image_path = str(row["relative_image_path"])
+            try:
+                source = self.layout.ocr_sidecar_path(relative_image_path)
+                if not source.exists():
+                    if source.is_symlink():
+                        raise PathSafetyError("OCR overlay sidecar is a symbolic link")
                     continue
-                relative_image_path = str(row["relative_image_path"])
-                try:
-                    source = self.layout.ocr_sidecar_path(relative_image_path)
-                    if not source.exists():
-                        if source.is_symlink():
-                            raise PathSafetyError("OCR overlay sidecar is a symbolic link")
-                        continue
-                    source = canonicalize(source, must_exist=True, directory=False).value
-                    raw = source.read_bytes()
-                    parse_ocr_sidecar(raw, expected_relative_image_path=relative_image_path)
-                except (OSError, OcrSidecarError, PathSafetyError) as exc:
-                    raise ExportCommitError("OCR overlay sidecar is invalid") from exc
-                yield relative_image_path, raw
-            cursor = int(page[-1]["sample_id"])
+                source = canonicalize(source, must_exist=True, directory=False).value
+                raw = source.read_bytes()
+                parse_ocr_sidecar(raw, expected_relative_image_path=relative_image_path)
+            except (OSError, OcrSidecarError, PathSafetyError) as exc:
+                raise ExportCommitError("OCR overlay sidecar is invalid") from exc
+            yield relative_image_path, raw
 
     def _copy_ocr_sidecars_to_staging(self, staging: Path) -> int:
         copied = 0
@@ -181,20 +279,21 @@ class ExportCommitCoordinator:
 
     def _verify_capacity(self, dataset: Path, parent: Path, *, ocr_enabled: bool) -> None:
         """ROADMAP.md:1051 — hard links still cost directory entries, new annotations and a backup."""
-        required, cursor = 0, None
+        required = 0
+        # The hard-link staging tree mirrors the complete dataset, while
+        # annotation replacements and unlabeled links are repair-target scoped.
+        cursor: int | None = None
         while True:
             page = self.database.page_samples(self.job_id, after_sample_id=cursor, limit=500)
             if not page:
                 break
-            for row in page:
-                required += STAGING_ENTRY_BYTES
-                if not row["in_processing_scope"]:
-                    continue
-                for suffix in (".txt", ".json"):
-                    baseline = self._baseline_annotation(dataset, str(row["annotation_key"]), suffix)
-                    if baseline.is_file():
-                        required += baseline.stat().st_size * 2
+            required += len(page) * STAGING_ENTRY_BYTES * 2
             cursor = int(page[-1]["sample_id"])
+        for row in self._scoped_samples():
+            for suffix in (".txt", ".json"):
+                baseline = self._baseline_annotation(dataset, str(row["annotation_key"]), suffix)
+                if baseline.is_file():
+                    required += baseline.stat().st_size * 2
         if ocr_enabled:
             for _, raw in self._overlay_ocr_sidecars():
                 required += STAGING_ENTRY_BYTES + len(raw)
@@ -209,23 +308,37 @@ class ExportCommitCoordinator:
 
     def _verify_baseline(self, dataset: Path) -> None:
         """ROADMAP.md:1058 — re-check the baseline annotations before any journal or directory switch."""
-        cursor: int | None = None
-        while True:
-            page = self.database.page_samples(self.job_id, after_sample_id=cursor, limit=500)
-            if not page:
-                return
-            for row in page:
-                if not row["in_processing_scope"]:
-                    continue
-                for suffix, recorded in ((".txt", row["original_txt_sha256"]), (".json", row["original_json_sha256"])):
-                    baseline = self._baseline_annotation(dataset, str(row["annotation_key"]), suffix)
-                    try:
-                        digest = sha256_file(baseline) if read_annotation_state(baseline) == "nonblank" else None
-                    except (OSError, PathSafetyError) as exc:
-                        raise ExportCommitError("baseline annotation cannot be re-checked") from exc
-                    if digest != recorded:
-                        raise ExportCommitError("baseline annotations changed since preflight; run preflight again")
-            cursor = int(page[-1]["sample_id"])
+        for row in self._scoped_samples():
+            for suffix, recorded in ((".txt", row["original_txt_sha256"]), (".json", row["original_json_sha256"])):
+                baseline = self._baseline_annotation(dataset, str(row["annotation_key"]), suffix)
+                try:
+                    digest = sha256_file(baseline) if read_annotation_state(baseline) == "nonblank" else None
+                except (OSError, PathSafetyError) as exc:
+                    raise ExportCommitError("baseline annotation cannot be re-checked") from exc
+                if digest != recorded:
+                    raise ExportCommitError("baseline annotations changed since preflight; run preflight again")
+
+    def _repair_parent_baselines(self, dataset: Path) -> dict[int, tuple[str | None, str | None]]:
+        """Record the post-commit baseline for direct parent repair targets."""
+        rows = self.database.connection.execute(
+            """SELECT DISTINCT parent_issue.sample_id,parent_sample.annotation_key
+                 FROM repair_target_issues AS link
+                 JOIN issues AS parent_issue ON parent_issue.issue_id=link.parent_issue_id
+                 JOIN samples AS parent_sample ON parent_sample.job_id=parent_issue.job_id
+                    AND parent_sample.sample_id=parent_issue.sample_id
+                WHERE link.repair_job_id=?""",
+            (self.job_id,),
+        )
+        fingerprints: dict[int, tuple[str | None, str | None]] = {}
+        for row in rows:
+            values: list[str | None] = []
+            for suffix in (".txt", ".json"):
+                path = self._baseline_annotation(dataset, str(row["annotation_key"]), suffix)
+                values.append(
+                    sha256_file(path) if read_annotation_state(path) == "nonblank" else None
+                )
+            fingerprints[int(row["sample_id"])] = (values[0], values[1])
+        return fingerprints
 
     def _backup(self, dataset: Path, backup_zip: Path) -> Path:
         return write_backup(
@@ -234,73 +347,167 @@ class ExportCommitCoordinator:
             lambda cursor: self.database.page_samples(self.job_id, after_sample_id=cursor, limit=500),
         )
 
-    def commit(self) -> ExportCommitResult:
+    def commit(self, *, reuse_verified_backup: bool = False) -> ExportCommitResult:
         format_value, dataset, ocr_enabled = self._configuration()
         summary = self.database.module_summary(self.job_id, "export")
-        if summary["status"] != "completed" or int(summary["issue_count"]) != 0:
-            raise ExportCommitError("all export validation must pass before staging")
-        parent = dataset.parent
+        if summary["status"] != "completed":
+            raise ExportCommitError("Export must settle every sample before staging")
         token = self.job_id.replace("-", "")[:24]
-        staging = parent / f".{dataset.name}.anima-stage-{token}"
-        rollback = parent / f".{dataset.name}.anima-rollback-{token}"
-        backup_dir = parent / f".{dataset.name}.anima-backups"
-        backup = backup_dir / f"{self.job_id}.zip"
-        if staging.exists() or rollback.exists() or backup.exists():
+        # Keep the journal's authenticated workspace paths for every recommit
+        # attempt.  A damaged backup is rebuilt in the same workspace; it must
+        # not silently switch to the new default layout.
+        existing_journal = load_journal(self.layout)
+        if existing_journal is not None and windows_paths_equal(existing_journal.dataset_root, dataset):
+            # Recommit must reuse the journal's exact, authenticated paths so
+            # legacy sibling layouts remain recoverable after new workspaces
+            # became the default.
+            staging = existing_journal.staging_root
+            rollback = existing_journal.rollback_root
+            backup = existing_journal.backup_zip
+            backup_dir = backup.parent
+            workspace_parent = staging.parent
+        elif DatasetWorkspace.is_new_overlay(self.layout.root, dataset, self.job_id):
+            workspace = DatasetWorkspace.for_dataset(dataset)
+            staging = workspace.stage_root(self.job_id)
+            rollback = workspace.rollback_root(self.job_id)
+            backup_dir = workspace.backup_root(self.job_id)
+            backup = workspace.backup_zip(self.job_id)
+            workspace.journal_root(self.job_id).mkdir(parents=True, exist_ok=True)
+            workspace_parent = workspace.root
+        else:
+            parent = dataset.parent
+            staging = parent / f".{dataset.name}.anima-stage-{token}"
+            rollback = parent / f".{dataset.name}.anima-rollback-{token}"
+            backup_dir = parent / f".{dataset.name}.anima-backups"
+            backup = backup_dir / f"{self.job_id}.zip"
+            workspace_parent = parent
+        if staging.exists() or rollback.exists() or (backup.exists() and not reuse_verified_backup):
             raise ExportCommitError("export commit workspace already exists")
-        self._probe_hardlink_support(parent)
-        self._verify_capacity(dataset, parent, ocr_enabled=ocr_enabled)
+        if reuse_verified_backup:
+            verify_backup(backup)
+        self._probe_hardlink_support(workspace_parent)
+        self._verify_capacity(dataset, workspace_parent, ocr_enabled=ocr_enabled)
         rollback_created = False
         staging_promoted = False
         try:
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="declared", phase="preparing",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
+            self.database.set_job_status(self.job_id, "committing", current_module_id="export")
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="declared", phase="creating_stage",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
             staging = create_hardlink_staging(dataset, staging)
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="staging", phase="writing_annotations",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
             exported = self._copy_to_staging(staging, format_value)
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="staging", phase="copying_unlabeled",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
+            unlabeled, unlabeled_folder = self._copy_unlabeled_images_to_staging(staging)
+            self.database.set_module_diagnostic_count(
+                self.job_id, "export", UNLABELED_IMAGES_CODE, severity="warning", count=unlabeled,
+            )
             if ocr_enabled:
+                _advance_journal(
+                    self.layout, job_id=self.job_id, state="staging", phase="copying_ocr",
+                    dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+                )
                 self._copy_ocr_sidecars_to_staging(staging)
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="staging", phase="applying_provenance",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
             apply_provenance_changes(staging, self._provenance_changes(staging, format_value))
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="staged", phase="verifying_baseline",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
             self._verify_baseline(dataset)
             backup_dir.mkdir(exist_ok=True)
-            self._backup(dataset, backup)
-            journal = CommitJournal(self.job_id, "prepared", dataset, staging, rollback, backup)
-            write_journal(self.layout, journal)
-            write_journal(self.layout, CommitJournal(self.job_id, "backup_verified", dataset, staging, rollback, backup))
-            self.database.set_job_status(self.job_id, "committing", current_module_id="export")
-            os.replace(dataset, rollback)
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="staged", phase="writing_backup",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
+            if reuse_verified_backup:
+                verify_backup(backup)
+            else:
+                self._backup(dataset, backup)
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="backup_verified", phase="switching_directories",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
+            self._replace_directory_with_retry(dataset, rollback)
             rollback_created = True
-            write_journal(self.layout, CommitJournal(self.job_id, "rollback_created", dataset, staging, rollback, backup))
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="rollback_created", phase="switching_directories",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
             reveal_staging(staging)
-            os.replace(staging, dataset)
+            self._replace_directory_with_retry(staging, dataset)
             staging_promoted = True
-            write_journal(self.layout, CommitJournal(self.job_id, "committed", dataset, staging, rollback, backup))
+            _advance_journal(
+                self.layout, job_id=self.job_id, state="committed", phase="cleanup",
+                dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+            )
             if not dataset.is_dir():
                 raise ExportCommitError("committed dataset is unavailable")
             shutil.rmtree(rollback)
+            self.database.update_repair_parent_baselines(
+                self.job_id,
+                self._repair_parent_baselines(dataset),
+            )
+            self.database.resolve_repaired_parent_issues(self.job_id)
             # A committed journal is resolved, so the task-local overlay is no longer needed for recovery.
             self.layout.discard()
             self.database.clear_workspace_metadata(self.job_id)
-            self.database.set_job_status(self.job_id, "succeeded", current_module_id="export")
-            return ExportCommitResult(exported, backup)
+            self.database.set_job_status(
+                self.job_id, "succeeded_with_issues" if unlabeled > 0 else "succeeded", current_module_id="export",
+            )
+            return ExportCommitResult(exported, backup, unlabeled, unlabeled_folder)
         except Exception as exc:
             restored = False
             journal_failure: Exception | None = None
             state: str | None = None
+            current_journal: CommitJournal | None = None
+            if self.layout.commit_journal_path().exists():
+                try:
+                    current_journal = load_journal(self.layout)
+                except CommitJournalError as journal_error:
+                    journal_failure = journal_error
+            if (
+                current_journal is not None
+                and current_journal.schema_version == 2
+                and current_journal.state in {"declared", "staging", "staged", "backup_verified"}
+                and not rollback_created
+                and dataset.is_dir()
+            ):
+                raise ExportCommitError("export directory commit stopped before directory switching") from exc
             try:
                 if not dataset.exists() and rollback.exists():
                     restored = restore_rollback(dataset, rollback)
             except (DirectoryCommitError, CommitJournalError, OSError):
                 pass
-            if self.layout.commit_journal_path().exists():
+            if current_journal is not None:
                 try:
-                    journal = load_journal(self.layout)
-                    if journal is not None:
-                        if staging_promoted:
-                            state = "committed"
-                        else:
-                            restored = restored or (
-                                rollback_created and dataset.is_dir()
-                                and not rollback.exists() and staging.is_dir()
-                            )
-                            state = "rolled_back" if restored else "rollback_required"
-                        write_journal(self.layout, CommitJournal(self.job_id, state, dataset, staging, rollback, backup))
+                    if staging_promoted:
+                        state = "committed"
+                    else:
+                        restored = restored or (
+                            rollback_created and dataset.is_dir()
+                            and not rollback.exists() and staging.is_dir()
+                        )
+                        state = "rolled_back" if restored else "rollback_required"
+                    phase: CommitPhase = "cleanup" if state in {"committed", "rolled_back"} else "switching_directories"
+                    _advance_journal(
+                        self.layout, job_id=self.job_id, state=state, phase=phase,
+                        dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+                    )
                 except (CommitJournalError, OSError) as journal_error:
                     journal_failure = journal_error
             # A failed commit must not leave a full hard-link mirror of the dataset behind;
@@ -333,23 +540,32 @@ class ExportCommitCoordinator:
                     restore_rollback(dataset, rollback)
                 if staging.exists():
                     shutil.rmtree(staging)
-                write_journal(layout, CommitJournal(journal.job_id, "rolled_back", dataset, staging, rollback, journal.backup_zip))
+                _advance_journal(
+                    layout, job_id=journal.job_id, state="rolled_back", phase="cleanup",
+                    dataset=dataset, staging=staging, rollback=rollback, backup=journal.backup_zip,
+                )
                 return "rolled_back"
             if journal.state == "rollback_created":
                 # A failed second rename can already have restored the old
                 # directory while the journal update itself was interrupted.
                 if dataset.is_dir() and not rollback.exists() and staging.is_dir():
                     shutil.rmtree(staging)
-                    write_journal(layout, CommitJournal(journal.job_id, "rolled_back", dataset, staging, rollback, journal.backup_zip))
+                    _advance_journal(
+                        layout, job_id=journal.job_id, state="rolled_back", phase="cleanup",
+                        dataset=dataset, staging=staging, rollback=rollback, backup=journal.backup_zip,
+                    )
                     return "rolled_back"
                 if not dataset.exists() and staging.is_dir():
                     reveal_staging(staging)
-                    os.replace(staging, dataset)
+                    ExportCommitCoordinator._replace_directory_with_retry(staging, dataset)
                 if not dataset.is_dir():
                     raise ExportCommitError("commit recovery has no consistent dataset directory")
                 if rollback.exists():
                     shutil.rmtree(rollback)
-                write_journal(layout, CommitJournal(journal.job_id, "committed", dataset, staging, rollback, journal.backup_zip))
+                _advance_journal(
+                    layout, job_id=journal.job_id, state="committed", phase="cleanup",
+                    dataset=dataset, staging=staging, rollback=rollback, backup=journal.backup_zip,
+                )
                 return "committed"
         except (OSError, DirectoryCommitError, CommitJournalError) as exc:
             raise ExportCommitError("export commit recovery failed") from exc

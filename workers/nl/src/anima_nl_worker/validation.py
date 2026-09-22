@@ -32,6 +32,7 @@ OBSERVATION_COUNTS = frozenset({"solo", "duo", "trio", "group", "unknown"})
 OBSERVATION_LAYOUTS = frozenset({"single_scene", "multi_view", "character_sheet", "multi_panel", "unknown"})
 # F25: weak prompts return the caption wrapped in code fences, labels, quotes or emphasis.
 CODE_FENCE = re.compile(r"^```[^\n`]*\n(?P<body>.*?)\n?```$", re.DOTALL)
+STRUCTURED_CODE_FENCE = re.compile(r"^```(?:json)?\s*\n(?P<body>.*?)\n?```$", re.IGNORECASE | re.DOTALL)
 LABEL_PREFIX = re.compile(r"^[*_#>\s]*(?:natural language caption|caption|description|output|answer|result|nl)[*_\s]*[:：][*_]*\s*", re.IGNORECASE)
 WRAPPERS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"), ("**", "**"), ("*", "*"), ("`", "`"))
 
@@ -81,9 +82,20 @@ def _content(value: object) -> str:
 def _completion_parts(body: bytes) -> tuple[str, str | None, dict[str, int]]:
     if len(body) > MAX_RESPONSE_BODY_BYTES:
         raise NlValidationError("API response exceeds 1 MiB")
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise NlValidationError("API response contains a duplicate JSON key")
+            result[key] = item
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise NlValidationError(f"API response contains non-finite number: {value}")
+
     try:
-        value = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json.loads(body.decode("utf-8-sig"), object_pairs_hook=object_pairs, parse_constant=reject_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, NlValidationError) as exc:
         raise NlValidationError("API response is not UTF-8 JSON") from exc
     if not isinstance(value, dict) or not isinstance(value.get("choices"), list) or not value["choices"]:
         raise NlValidationError("API response has no choices")
@@ -135,11 +147,16 @@ def _strict_object(text: str) -> dict[str, object]:
     return value
 
 
+def _strip_structured_code_fence(text: str) -> str:
+    match = STRUCTURED_CODE_FENCE.fullmatch(text.strip())
+    return match.group("body").strip() if match is not None else text.strip()
+
+
 def validate_completion_response_v2(
     body: bytes,
 ) -> tuple[str, dict[str, object], str | None, dict[str, int]]:
     content, request_id, summary = _completion_parts(body)
-    value = _strict_object(content)
+    value = _strict_object(_strip_structured_code_fence(content))
     # NL is independently valuable and is validated before the observation fields.
     raw_nl = value.get("nl")
     if raw_nl == NL_IMAGE_NOT_RECEIVED:

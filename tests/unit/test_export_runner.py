@@ -60,7 +60,7 @@ class ExportRunnerTests(unittest.TestCase):
  def _runner(self,root,bad,conversions=None,*,schema_version=None):
   dataset=root/'d';dataset.mkdir();Image.new('RGB',(2,2)).save(dataset/'a.png');(dataset/'a.json').write_bytes(serialize_annotation_json({'quality':[],'count':'solo','character':'','series':'','artist':'','appearance':[],'tags':['ok'],'environment':[],'nl':''}))
   config_kwargs={} if schema_version is None else {'schemaVersion':schema_version}
-  cfg=JobConfig(profile='e621',workMode='in_place',overwriteMode='incremental',sourceRoot=str(dataset),recursive=True,**config_kwargs);cfg.caption['enabled']=cfg.replace['enabled']=cfg.nl['enabled']=cfg.dropout['enabled']=False;cfg.classify['enabled']=True;cfg.export['format']='json';cfg.tokenBudget['enabled']=False
+  cfg=JobConfig(profile='e621',workMode='in_place',overwriteMode='incremental',sourceRoot=str(dataset),recursive=True,**config_kwargs);cfg.caption['enabled']=cfg.replace['enabled']=cfg.nl['enabled']=cfg.dropout['enabled']=False;cfg.classify['enabled']=True;cfg.classify['overwriteJson']=True;cfg.export['format']='json';cfg.tokenBudget['enabled']=False
   catalog, _ = _write_test_resource_library(root, include_ocr=False)
   cfg.caption['resourceId']='tagger-default'; cfg.classify['resourceId']='classify-default'; cfg.replace['resourceId']='replace-default'; cfg.dropout['quality']['resourceId']='dropout-default'
   prep=JobPreparationService(root/'s.db', resource_catalog=catalog);job=prep.preflight(cfg.to_dict()).jobId;prep.confirm_workspace(job,confirmed=True,confirmed_rebuild=False);db=StateDatabase.open(root/'s.db')
@@ -83,7 +83,9 @@ class ExportRunnerTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as t:
    db,p,j,r=self._runner(Path(t),True)
    try:
-    self.assertEqual('completed_with_issues',r.run());issues=db.page_issues(j,limit=10);self.assertEqual(1,len(issues));self.assertEqual('classify',issues[0]['repair_start_module']);self.assertEqual(2,len(json.loads(issues[0]['field_errors_json'])))
+    self.assertEqual('completed',r.run());issues=db.page_issues(j,limit=10);self.assertEqual(1,len(issues));self.assertEqual('classify',issues[0]['repair_start_module']);self.assertEqual(2,len(json.loads(issues[0]['field_errors_json'])))
+    self.assertEqual(('export','skipped'),tuple(db.get_sample_state(j,1)[key] for key in ('current_module_id','status')))
+    summary=db.module_summary(j,'export');self.assertEqual((0,1,0,1),(summary['completed'],summary['failed'],summary['skipped'],summary['issue_count']))
    finally:db.close();p.close()
  def test_bad_artifact_digest_fails_module(self):
   with tempfile.TemporaryDirectory() as t:
@@ -144,7 +146,7 @@ class ExportRunnerTests(unittest.TestCase):
      (dataset/f'{name}.json').write_bytes(serialize_annotation_json(source))
     cfg=JobConfig(profile='e621',workMode='in_place',overwriteMode='incremental',sourceRoot=str(dataset),recursive=True)
     cfg.caption['enabled']=cfg.replace['enabled']=cfg.nl['enabled']=cfg.dropout['enabled']=False
-    cfg.classify['enabled']=True; cfg.export['format']='both'; cfg.tokenBudget['enabled']=False
+    cfg.classify['enabled']=True; cfg.classify['overwriteJson']=True; cfg.export['format']='both'; cfg.tokenBudget['enabled']=False
     cfg.moduleBatchSize['export']=2
     catalog, _ = _write_test_resource_library(root, include_ocr=False)
     cfg.caption['resourceId']='tagger-default'; cfg.classify['resourceId']='classify-default'; cfg.replace['resourceId']='replace-default'; cfg.dropout['quality']['resourceId']='dropout-default'

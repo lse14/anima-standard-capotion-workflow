@@ -1,12 +1,14 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ProjectRoot
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ProjectRoot,
+    [switch]$IncludePolicy,
+    [switch]$IncludeQualityStack
 )
 
 $ErrorActionPreference = 'Stop'
 
 # The release build replaces this only after publishing the exact matching inventory.
-$ExpectedInstallManifestSha256 = 'dfe7c9240c6df087702a3dff555bfb57a2d8cc870b00185d223c9228a8af2281'
+$ExpectedInstallManifestSha256 = 'd46ef0719184b6ae9710119850940ed46a11d9259c212634b681fc7a8c05f738'
 $script:projectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
 $script:runtimeBuildRoot = Join-Path $script:projectRoot '.runtime-build'
 $script:logPath = $null
@@ -295,11 +297,14 @@ function Test-NvidiaAvailable {
     return $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($result -join ''))
 }
 
-function Get-RequiredPeakBytes([object]$Manifest, [bool]$NvidiaAvailable) {
+function Get-RequiredPeakBytes([object]$Manifest, [bool]$NvidiaAvailable, [bool]$IncludePolicy, [bool]$IncludeQualityStack) {
     $bootstrap = Get-RequiredProperty $Manifest 'bootstrap'
     $total = [Int64](Get-RequiredProperty $bootstrap 'peakBytes') + [Int64](Get-RequiredProperty (Get-RequiredProperty $bootstrap 'artifact') 'sizeBytes')
     foreach ($component in @((Get-RequiredProperty $Manifest 'components'))) {
-        if ([string]$component.componentId -eq 'ocr-models') { continue }
+        $componentId = [string]$component.componentId
+        if ($componentId -in @('ocr-cpu', 'ocr-gpu', 'ocr-models')) { continue }
+        if ($componentId -eq 'policy' -and -not $IncludePolicy) { continue }
+        if ($componentId -eq 'quality-stack' -and -not $IncludeQualityStack) { continue }
         $variants = Get-RequiredProperty $component 'variants'
         $variantName = if ($NvidiaAvailable -and $null -ne $variants.PSObject.Properties['cuda']) {
             'cuda'
@@ -390,7 +395,7 @@ try {
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $nvidiaAvailable = Test-NvidiaAvailable
     $accelerator = if ($nvidiaAvailable) { 'nvidia' } else { 'cpu' }
-    $requiredBytes = Get-RequiredPeakBytes $manifest $nvidiaAvailable
+    $requiredBytes = Get-RequiredPeakBytes $manifest $nvidiaAvailable $IncludePolicy.IsPresent $IncludeQualityStack.IsPresent
     Assert-FreeSpace $requiredBytes
     Write-InstallLog ("Selected accelerator route: {0}; required peak space: {1} bytes" -f $accelerator, $requiredBytes)
 
@@ -407,7 +412,10 @@ try {
     $installerScript = Get-ProjectPath (Join-Path $script:projectRoot 'packaging\installer\install.py')
     if (-not (Test-Path -LiteralPath $installerScript -PathType Leaf)) { throw "Source bootstrap installer is missing: $installerScript" }
     Write-InstallLog 'Starting the standard-library installer.'
-    & $bootstrapPython -B -I -u $installerScript --project-root $script:projectRoot --manifest $manifestPath --manifest-sha256 $actualManifestSha256 --accelerator $accelerator --bootstrap-runtime $script:bootstrapStage 2>&1 |
+    $installerArguments = @('--project-root', $script:projectRoot, '--manifest', $manifestPath, '--manifest-sha256', $actualManifestSha256, '--accelerator', $accelerator, '--bootstrap-runtime', $script:bootstrapStage)
+    if ($IncludePolicy) { $installerArguments += '--include-policy' }
+    if ($IncludeQualityStack) { $installerArguments += '--include-quality-stack' }
+    & $bootstrapPython -B -I -u $installerScript @installerArguments 2>&1 |
         ForEach-Object { Write-InstallLog ([string]$_) }
     $installerExitCode = $LASTEXITCODE
     if ($installerExitCode -ne 0) { throw "Standard-library installer failed with exit code $installerExitCode" }

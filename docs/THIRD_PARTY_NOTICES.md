@@ -111,8 +111,9 @@ PaddleOCR 模型权重不包含在源码、缓存或项目 Release 中，也不�
 `Install-WebUI.bat` 自动下载或镜像。OCR 默认关闭；只有 OCR-enabled job 在本地模型
 缺失或 SHA-256 不符时被预检阻止。用户必须使用
 [OCR_MODEL_DOWNLOAD.md](../OCR_MODEL_DOWNLOAD.md) 中不变的三个官方 URL、文件名、大小和
-SHA-256，将原始归档放入项目根 `ocr-model-archives`，再双击 `Install-WebUI.bat`。该入口
-没有 `-OcrMode` 参数，且只在项目内离线探测成功后发布 OCR 资源。
+SHA-256，将原始归档放入项目根 `ocr-model-archives`，再使用 `Install-Ocr.bat`；需要 GPU
+时在 CPU fallback 完整后使用 `Install-OcrGpu.bat`。这些可选入口只在项目内离线探测成功
+后发布 OCR 资源，且 `Install-WebUI.bat` 没有 `-OcrMode` 参数。
 
 在逐项核对许可证、版本、来源和适用限制前，不得把上述模型镜像到项目 Release；
 `Validate-SourceBootstrapRelease.ps1` 会拒绝包含未解决许可证状态的公开门禁。

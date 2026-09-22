@@ -199,8 +199,7 @@ def _tag_values(payload: Mapping[str, object]) -> list[tuple[str, str]]:
 
 def _semantic_errors(payload: Mapping[str, object], policy: CaptionDisplayPolicy, display_checks: bool) -> list[FieldError]:
     errors: list[FieldError] = []
-    raw_seen: dict[str, str] = {}
-    formatted_seen: dict[str, str] = {}
+    formatted_seen: dict[str, tuple[str, str]] = {}
     tags = _tag_values(payload)
     for field, value in tags:
         if _contains_control(value):
@@ -208,12 +207,6 @@ def _semantic_errors(payload: Mapping[str, object], policy: CaptionDisplayPolicy
             continue
         if field in COLLISION_EXEMPT_FIELDS:
             continue
-        key = value.casefold()
-        previous = raw_seen.get(key)
-        if previous is not None and previous != field:
-            errors.append(FieldError("cross_field_tag_collision", field))
-        else:
-            raw_seen.setdefault(key, field)
         if not display_checks:
             continue
         formatted = display_tag(value, policy)
@@ -221,10 +214,10 @@ def _semantic_errors(payload: Mapping[str, object], policy: CaptionDisplayPolicy
             errors.append(FieldError("tag_not_flat_txt_representable", field))
         display = formatted.casefold()
         previous_display = formatted_seen.get(display)
-        if previous_display is not None and previous_display != field:
+        if previous_display is not None and previous_display[1] != value:
             errors.append(FieldError("formatted_tag_collision", field))
         else:
-            formatted_seen.setdefault(display, field)
+            formatted_seen.setdefault(display, (field, value))
     if display_checks and policy.triggers_enabled:
         for trigger in policy.trigger_terms:
             display = display_tag(trigger, policy).casefold()
@@ -268,6 +261,20 @@ def normalize_json_bytes(raw: bytes, caption_policy: CaptionDisplayPolicy, *, ex
     if len(normalized) != len(FIELDS):
         return NormalizationResult(None, None, tuple(errors), conversions)
     normalized["character"] = _normalize_character(str(normalized["character"]), conversions)
+    # Exact cross-field duplicates are resolved only from the generic tags
+    # array. Non-tags fields remain byte-for-byte and positionally unchanged.
+    non_tag_values = {
+        value
+        for field, value in _tag_values(normalized)
+        if field not in ARRAY_FIELDS and field != "tags" and field not in COLLISION_EXEMPT_FIELDS
+    }
+    if non_tag_values and isinstance(normalized.get("tags"), list):
+        original_tags = normalized["tags"]
+        kept_tags = [item for item in original_tags if item not in non_tag_values]
+        removed = len(original_tags) - len(kept_tags)
+        if removed:
+            conversions["cross_field_duplicate_removed"] = removed
+            normalized["tags"] = kept_tags
     nl = str(normalized["nl"])
     if _contains_control(nl):
         # Newlines and tabs are permitted whitespace; all other controls are not.

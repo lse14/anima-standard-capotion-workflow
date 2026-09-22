@@ -12,7 +12,7 @@ from .contracts import utc_now
 from .path_safety import canonicalize, windows_compare, windows_path_is_within
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_EVENT_RING = 10_000
 DEFAULT_PAGE_SIZE = 200
 MAX_PAGE_SIZE = 1_000
@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS preflight_progress (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'preflighting', 'completed', 'failed', 'cancelled')),
+    checked_files INTEGER NOT NULL DEFAULT 0 CHECK(checked_files >= 0),
+    total_files INTEGER NOT NULL DEFAULT 0 CHECK(total_files >= 0),
+    error TEXT,
+    summary_json TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dataset_claims (
     dataset_root TEXT COLLATE WIN_ORDINAL_NOCASE PRIMARY KEY,
     dataset_root_key TEXT NOT NULL,
@@ -81,6 +91,8 @@ CREATE TABLE IF NOT EXISTS samples (
     image_mtime_ns INTEGER,
     original_txt_sha256 TEXT,
     original_json_sha256 TEXT,
+    incremental_preserve INTEGER NOT NULL DEFAULT 0 CHECK(incremental_preserve IN (0, 1)),
+    incremental_preserve_reason TEXT,
     PRIMARY KEY(job_id, sample_id),
     UNIQUE(job_id, annotation_key)
 );
@@ -250,6 +262,38 @@ CREATE TABLE IF NOT EXISTS nl_outcome_window (
     succeeded INTEGER NOT NULL CHECK(succeeded IN (0, 1))
 );
 
+-- Durable NL business archive.  It intentionally has no foreign key to jobs:
+-- deleting task control history must not destroy the only verified caption.
+CREATE TABLE IF NOT EXISTS nl_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_root_key TEXT NOT NULL,
+    dataset_root TEXT NOT NULL,
+    sample_identity TEXT NOT NULL,
+    relative_image_path TEXT NOT NULL,
+    annotation_key TEXT NOT NULL,
+    image_file_id TEXT,
+    image_sha256 TEXT,
+    job_id TEXT,
+    sample_id INTEGER,
+    source TEXT NOT NULL CHECK(source IN ('api','original_json','nl_txt','manual','dropout','unknown')),
+    text TEXT NOT NULL CHECK(length(CAST(text AS BLOB)) <= 16384),
+    text_sha256 TEXT NOT NULL,
+    source_sha256 TEXT,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_nl_history_identity
+    ON nl_history(dataset_root_key, sample_identity, created_at DESC, history_id DESC);
+CREATE INDEX IF NOT EXISTS idx_nl_history_text
+    ON nl_history(dataset_root_key, text_sha256);
+
+CREATE TABLE IF NOT EXISTS nl_format_outcome_window (
+    outcome_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    format_failed INTEGER NOT NULL CHECK(format_failed IN (0, 1))
+);
+
 -- Repair jobs use a fresh overlay and current sample state while retaining a
 -- stable link to the original task's retriable issue history.
 CREATE TABLE IF NOT EXISTS repair_jobs (
@@ -285,14 +329,14 @@ CREATE INDEX IF NOT EXISTS idx_repair_targets_page ON repair_targets(repair_job_
 """
 
 
-TERMINAL_JOB_STATUSES = ("succeeded", "failed", "discarded", "cancelled_recoverable")
+TERMINAL_JOB_STATUSES = ("succeeded", "succeeded_with_issues", "failed", "discarded", "cancelled_recoverable")
 # Startup recovery freezes everything else; cancellation drains on its own and a
 # job that is already interrupted must keep its original resume_status.
 NON_INTERRUPTIBLE_JOB_STATUSES = (
     "draft", "ready", "interrupted", "cancelling", *TERMINAL_JOB_STATUSES,
 )
 STARTED_JOB_STATUSES = frozenset({"preparing_workspace", "running", "reviewing", "exporting", "committing"})
-FINISHED_JOB_STATUSES = frozenset({"succeeded", "failed", "discarded"})
+FINISHED_JOB_STATUSES = frozenset({"succeeded", "succeeded_with_issues", "failed", "discarded"})
 
 
 def _ordinal_nocase(left: str, right: str) -> int:

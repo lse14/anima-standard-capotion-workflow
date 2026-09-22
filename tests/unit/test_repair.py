@@ -41,6 +41,53 @@ def _count_evidence(value: str = "solo") -> CountEvidenceV1:
 
 
 class RepairPreparationTests(unittest.TestCase):
+    def test_repair_inherits_parent_annotations_for_target_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            Image.new("RGB", (3, 3), "white").save(dataset / "target.png")
+            config = JobConfig(workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
+            config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = False
+            config.ocr["enabled"] = config.nl["enabled"] = False
+            config.countReview["enabled"] = False  # type: ignore[index]
+            config.dropout["enabled"] = False
+            assert config.tokenBudget is not None
+            config.tokenBudget["enabled"] = False
+            preparation = JobPreparationService(root / "state.db")
+            repair = RepairPreparationService(root / "state.db")
+            try:
+                parent_id = preparation.preflight(config.to_dict()).jobId
+                preparation.confirm_workspace(parent_id, confirmed=True, confirmed_rebuild=False)
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    sample = database.page_samples(parent_id, limit=1)[0]
+                    parent = database.get_job(parent_id)
+                    parent_layout = Path(str(parent["overlay_root"]))
+                    expected = serialize_annotation_json({
+                        "quality": [], "count": "solo", "character": "", "series": "", "artist": "",
+                        "appearance": [], "tags": ["smile"], "environment": [], "nl": "A person smiles.",
+                    })
+                    (parent_layout / "annotations").mkdir(parents=True, exist_ok=True)
+                    (parent_layout / "annotations" / "target.json").write_bytes(expected)
+                    database.set_job_status(parent_id, "running", current_module_id="caption")
+                    database.set_job_status(parent_id, "reviewing", current_module_id="export")
+                    database.upsert_issue(SampleIssue(
+                        issueId="repair-annotation", jobId=parent_id, sampleId=int(sample["sample_id"]),
+                        relativeImagePath="target.png", moduleId="caption", code="retry_json",
+                        severity="error", blocking=False, retriable=True, repairStartModule="caption",
+                        message="retry", attempt=1,
+                    ))
+                finally:
+                    database.close()
+                self.assertTrue(preparation.release_lock_for_repair(parent_id))
+                result = repair.prepare(parent_id)
+                child_annotation = Path(result.overlayRoot) / "annotations" / "target.json"
+                self.assertEqual(expected, child_annotation.read_bytes())
+            finally:
+                repair.close()
+                preparation.close()
+
     def test_profileless_repair_inherits_frozen_custom_classification_resource(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -214,6 +261,7 @@ class RepairPreparationTests(unittest.TestCase):
                 try:
                     self.assertEqual(parent_id, database.repair_parent_job_id(result.repairJobId))
                     self.assertEqual(2, database.count_processing_samples(result.repairJobId))
+                    self.assertEqual(1, database.count_module_samples(result.repairJobId, "export"))
                     target_row = database.connection.execute(
                         "SELECT sample_id,repair_start_module FROM repair_targets WHERE repair_job_id=?",
                         (result.repairJobId,),
@@ -482,8 +530,8 @@ class RepairPreparationTests(unittest.TestCase):
                 database.set_job_status(parent_id, "reviewing", current_module_id="export")
                 database.upsert_issue(SampleIssue(
                     issueId="legacy-repair", jobId=parent_id, sampleId=int(sample["sample_id"]),
-                    relativeImagePath="target.png", moduleId="nl", code="retry_nl", severity="error",
-                    blocking=True, retriable=True, repairStartModule="nl", message="retry", attempt=1,
+                    relativeImagePath="target.png", moduleId="ocr", code="retry_ocr", severity="error",
+                    blocking=True, retriable=True, repairStartModule="ocr", message="retry", attempt=1,
                 ))
                 parent = database.get_job(parent_id)
             finally:
@@ -513,7 +561,7 @@ class RepairPreparationTests(unittest.TestCase):
                 repair.close()
                 preparation.close()
 
-    def test_v10_ocr_repair_targets_only_retriable_inference_failures(self) -> None:
+    def test_v10_ocr_repair_targets_retriable_inference_and_legacy_oversize_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dataset = root / "dataset"
@@ -557,16 +605,22 @@ class RepairPreparationTests(unittest.TestCase):
                     result = repair.prepare(parent_id)
                 except Exception as exc:
                     self.fail(f"retriable OCR inference issue must create an OCR-only repair target: {exc}")
-                self.assertEqual(1, result.targetCount)
+                self.assertEqual(2, result.targetCount)
                 database = StateDatabase.open(root / "state.db")
                 try:
-                    target = database.connection.execute(
-                        "SELECT sample_id,repair_start_module FROM repair_targets WHERE repair_job_id=?",
+                    targets = database.connection.execute(
+                        """SELECT repair_targets.sample_id,repair_targets.repair_start_module,
+                                  samples.relative_image_path
+                             FROM repair_targets
+                             JOIN samples ON samples.job_id=repair_targets.repair_job_id
+                                AND samples.sample_id=repair_targets.sample_id
+                            WHERE repair_job_id=? ORDER BY samples.relative_image_path""",
                         (result.repairJobId,),
-                    ).fetchone()
-                    self.assertEqual(("ocr",), (target["repair_start_module"],))
-                    mapped = database.get_sample_with_state(result.repairJobId, int(target["sample_id"]))
-                    self.assertEqual("retry.png", mapped["relative_image_path"])
+                    ).fetchall()
+                    self.assertEqual(
+                        [("ocr", "oversize.png"), ("ocr", "retry.png")],
+                        [(row["repair_start_module"], row["relative_image_path"]) for row in targets],
+                    )
                 finally:
                     database.close()
             finally:

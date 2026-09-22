@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,6 +269,17 @@ def file_fingerprint(path: str | Path) -> dict[str, int | str]:
     }
 
 
+def replace_with_sharing_retry(source: str | Path, destination: str | Path) -> None:
+    for attempt in range(5):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) != 32 or attempt == 4:
+                raise
+            time.sleep(0.05)
+
+
 def atomic_write_bytes(root: str | Path, relative_path: str, data: bytes) -> Path:
     root_path = canonicalize(root, must_exist=True, directory=True).value
     safe = safe_relative_path(relative_path)
@@ -281,7 +293,7 @@ def atomic_write_bytes(root: str | Path, relative_path: str, data: bytes) -> Pat
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
+        replace_with_sharing_retry(temporary, destination)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

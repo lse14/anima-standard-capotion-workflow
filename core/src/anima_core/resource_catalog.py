@@ -271,7 +271,12 @@ class ResourceCatalog:
             raise ResourceCatalogError("default resource IDs must be unique")
         return 3, normalized
 
-    def scan(self, *, include_tokenizers: bool = True) -> ResourceCatalogSnapshot:
+    def scan(
+        self,
+        *,
+        include_tokenizers: bool = True,
+        require_quality_stack: bool = False,
+    ) -> ResourceCatalogSnapshot:
         defaults_schema_version, defaults = self._defaults()
         loaded: list[ResourcePackage] = []
         invalid: list[InvalidResource] = []
@@ -338,7 +343,11 @@ class ResourceCatalog:
                     invalid.append(InvalidResource(package.manifest_relative_path, f"duplicate resourceId: {package.resource_id}"))
             loaded = [package for package in loaded if package.resource_id not in duplicates]
         snapshot = ResourceCatalogSnapshot(defaults_schema_version, defaults, tuple(loaded), tuple(invalid))
-        missing_required = [record["resourceId"] for record in snapshot.missing_defaults()]
+        missing_required = [
+            record["resourceId"]
+            for record in snapshot.missing_defaults()
+            if require_quality_stack or record["kind"] != "dropoutModel"
+        ]
         if missing_required:
             raise ResourceCatalogError("default resources are unavailable: " + ", ".join(sorted(missing_required)))
         return snapshot

@@ -390,6 +390,20 @@ class ResourceCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceCatalogError, "default resources are unavailable"):
             ResourceCatalog(self.root).scan()
 
+    def test_missing_quality_stack_is_allowed_unless_explicitly_required(self) -> None:
+        (self.root / "dropout-models" / "default").rename(self.root / "dropout-models" / "removed")
+        defaults = json.loads((self.root / "defaults.json").read_text(encoding="utf-8"))
+        defaults["defaults"]["dropoutModel"] = "missing-quality"
+        (self.root / "defaults.json").write_text(json.dumps(defaults), encoding="utf-8")
+
+        snapshot = ResourceCatalog(self.root).scan()
+        self.assertEqual(
+            [{"kind": "dropoutModel", "resourceId": "missing-quality"}],
+            list(snapshot.missing_defaults()),
+        )
+        with self.assertRaisesRegex(ResourceCatalogError, "default resources are unavailable"):
+            ResourceCatalog(self.root).scan(require_quality_stack=True)
+
     def test_schema3_api_publishes_optional_danbooru_placeholders_without_profiles(self) -> None:
         self._use_current_defaults()
         snapshot = ResourceCatalog(self.root).scan()

@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import json
 import os
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +88,15 @@ def _close_windows_handle(handle: int) -> None:
         ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
 
 
+def _remove_dataset_lock_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise DatasetLockError(f"cannot remove dataset lock file: {path}") from exc
+
+
 @dataclass
 class DatasetLock:
     database: StateDatabase
@@ -95,6 +105,7 @@ class DatasetLock:
     lock_path: Path
     handle: int
     released: bool = False
+    handle_closed: bool = False
 
     @classmethod
     def acquire(cls, database: StateDatabase, dataset_root: str | Path, job_id: str) -> "DatasetLock":
@@ -146,17 +157,16 @@ class DatasetLock:
             return
         if not recovery_complete:
             raise DatasetLockError("dataset lock cannot be released before recovery is complete")
+        if not self.handle_closed:
+            _close_windows_handle(self.handle)
+            self.handle_closed = True
+        _remove_dataset_lock_file(self.lock_path)
         with self.database.transaction(immediate=True):
             self.database.connection.execute(
                 "DELETE FROM dataset_claims WHERE dataset_root=? AND job_id=?",
                 (str(self.dataset_root), self.job_id),
             )
-        _close_windows_handle(self.handle)
         self.released = True
-        try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
     def __enter__(self) -> "DatasetLock":
         return self
@@ -167,5 +177,40 @@ class DatasetLock:
             return
         # Preserve the database claim after an exception.  The next startup
         # must inspect the job/journal before it can release this dataset.
-        _close_windows_handle(self.handle)
+        if not self.handle_closed:
+            _close_windows_handle(self.handle)
+            self.handle_closed = True
         self.released = True
+
+
+def release_completed_dataset_lock(
+    locks: MutableMapping[str, DatasetLock],
+    database_path: str | Path,
+    job_id: str,
+) -> bool:
+    """Release a successful task's process and durable dataset lock before history deletion."""
+    lock = locks.get(job_id)
+    if lock is not None:
+        if lock.database.get_job(job_id)["status"] not in {"succeeded", "succeeded_with_issues"}:
+            raise DatasetLockError("only a completed task can release its lock for history deletion")
+        lock.release(recovery_complete=True)
+        lock.database.close()
+        del locks[job_id]
+        return True
+
+    database = StateDatabase.open(database_path)
+    try:
+        if database.get_job(job_id)["status"] not in {"succeeded", "succeeded_with_issues"}:
+            raise DatasetLockError("only a completed task can release its lock for history deletion")
+        claim = database.connection.execute(
+            "SELECT lock_path FROM dataset_claims WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if claim is None:
+            return False
+        lock_path = claim["lock_path"]
+        if isinstance(lock_path, str) and lock_path:
+            _remove_dataset_lock_file(Path(lock_path))
+        database.release_dataset_claim(job_id)
+    finally:
+        database.close()
+    return True

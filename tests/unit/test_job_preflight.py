@@ -8,8 +8,11 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +23,7 @@ from PIL import Image
 from anima_core.contracts import JobConfig, sha256_json, validate_job_config
 from anima_core.db import StateDatabase
 from anima_core.job_preflight import JobPreflightError, JobPreparationService, config_from_dict
+from anima_core.manifest import ManifestCancelled
 from anima_core.locks import DatasetLockError
 from anima_core.overlay import OverlayLayout
 from anima_core.path_safety import file_fingerprint, windows_key
@@ -188,6 +192,41 @@ def _write_test_resource_library(root: Path, *, include_ocr: bool) -> tuple[Reso
 
 
 class JobPreflightTests(unittest.TestCase):
+    def test_repair_releases_durable_claim_after_service_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            Image.new("RGB", (3, 3), "white").save(dataset / "image.png")
+            catalog, _ = _write_test_resource_library(root, include_ocr=False)
+            service = JobPreparationService(root / "state.db", resource_catalog=catalog)
+            try:
+                summary = service.preflight(self._ocr_config(dataset, enabled=False))
+                service.confirm_workspace(summary.jobId, confirmed=True, confirmed_rebuild=False)
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    database.set_job_status(summary.jobId, "running", current_module_id="caption")
+                    database.set_job_status(summary.jobId, "failed", current_module_id="caption")
+                finally:
+                    database.close()
+
+                lock = service._locks.pop(summary.jobId)
+                lock.__exit__(RuntimeError, RuntimeError("simulated service restart"), None)
+                lock.database.close()
+
+                self.assertTrue(service.release_lock_for_repair(summary.jobId))
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    self.assertEqual(
+                        0,
+                        database.connection.execute(
+                            "SELECT COUNT(*) FROM dataset_claims WHERE job_id=?", (summary.jobId,)
+                        ).fetchone()[0],
+                    )
+                finally:
+                    database.close()
+            finally:
+                service.close()
     def test_count_review_allows_nl_disabled_with_classify_enabled(self) -> None:
         for schema_version in range(3, 10):
             with self.subTest(schema_version=schema_version):
@@ -963,6 +1002,27 @@ class JobPreflightTests(unittest.TestCase):
             finally:
                 tampered_service.close()
 
+    def test_ocr_enabled_requires_the_selected_optional_runtime_during_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            Image.new("RGB", (3, 3), "white").save(source / "image.png")
+            catalog, _ = _write_test_resource_library(root, include_ocr=True)
+            service = JobPreparationService(
+                root / "state.db",
+                resource_catalog=catalog,
+                install_root=root / "install",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    JobPreflightError,
+                    r"ocr_runtime_install_required.*ocr-paddle",
+                ):
+                    service.preflight(self._ocr_config(source, enabled=True))
+            finally:
+                service.close()
+
     def test_client_cannot_supply_ocr_frozen_resource_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1149,6 +1209,244 @@ class JobPreflightTests(unittest.TestCase):
                 self.assertEqual(summary.configHash, job["config_hash"])
             finally:
                 database.close()
+
+    def test_async_preflight_persists_independent_progress_until_summary_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            Image.new("RGB", (3, 3), "white").save(source / "one.png")
+            Image.new("RGB", (3, 3), "black").save(source / "two.png")
+            (source / "one.txt").write_text("tags", encoding="utf-8")
+            service = JobPreparationService(root / "state.db")
+            try:
+                job_id = service.start_preflight(self._config(source))
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    progress = database.get_preflight_progress(job_id)
+                    self.assertIn(progress["status"], {"queued", "preflighting", "completed"})
+                    self.assertIn(int(progress["total_files"]), {0, 2})
+                finally:
+                    database.close()
+                deadline = time.monotonic() + 10
+                while True:
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        progress = database.get_preflight_progress(job_id)
+                    finally:
+                        database.close()
+                    if progress["status"] in {"completed", "failed"}:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("async preflight did not finish")
+                    time.sleep(0.01)
+                self.assertEqual("completed", progress["status"])
+                self.assertEqual((2, 2), (progress["checked_files"], progress["total_files"]))
+                self.assertIsInstance(progress["summary_json"], str)
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    self.assertEqual(0, int(database.get_job(job_id)["last_event_id"]))
+                finally:
+                    database.close()
+            finally:
+                service.close()
+
+    def test_async_preflight_returns_before_candidate_count_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            Image.new("RGB", (3, 3), "white").save(source / "one.png")
+            entered = threading.Event()
+            release = threading.Event()
+
+            def slow_count(_builder: object, **_kwargs: object) -> int:
+                entered.set()
+                release.wait(2)
+                return 1
+
+            service = JobPreparationService(root / "state.db")
+            try:
+                validated = service._validate_preflight_input(self._config(source))
+                with patch.object(service, "_validate_preflight_input", return_value=validated), patch("anima_core.job_preflight.ManifestBuilder.count_candidate_images", slow_count):
+                    started = time.monotonic()
+                    job_id = service.start_preflight(self._config(source))
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 0.5)
+                    self.assertTrue(entered.wait(1))
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        progress = database.get_preflight_progress(job_id)
+                    finally:
+                        database.close()
+                    self.assertEqual(("queued", 0, 0), (progress["status"], progress["checked_files"], progress["total_files"]))
+                    release.set()
+                deadline = time.monotonic() + 10
+                while True:
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        progress = database.get_preflight_progress(job_id)
+                    finally:
+                        database.close()
+                    if progress["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("async preflight did not finish")
+                    time.sleep(0.01)
+            finally:
+                release.set()
+                service.close()
+
+    def test_async_preflight_cancel_persists_cancelled_state_and_clears_partial_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            Image.new("RGB", (3, 3), "white").save(source / "one.png")
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_count(_builder: object, **_kwargs: object) -> int:
+                entered.set()
+                release.wait(2)
+                return 1
+
+            service = JobPreparationService(root / "state.db")
+            try:
+                with patch("anima_core.job_preflight.ManifestBuilder.count_candidate_images", blocked_count):
+                    job_id = service.start_preflight(self._config(source))
+                    self.assertTrue(entered.wait(1))
+                    self.assertTrue(service.cancel_preflight(job_id))
+                    release.set()
+                deadline = time.monotonic() + 10
+                while True:
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        progress = database.get_preflight_progress(job_id)
+                        job = database.get_job(job_id)
+                        samples = database.connection.execute("SELECT COUNT(*) FROM samples WHERE job_id=?", (job_id,)).fetchone()[0]
+                    finally:
+                        database.close()
+                    if progress["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("cancelled async preflight did not finish")
+                    time.sleep(0.01)
+                self.assertEqual("cancelled", progress["status"])
+                self.assertEqual("draft", job["status"])
+                self.assertEqual(0, samples)
+            finally:
+                release.set()
+                service.close()
+
+    def test_async_preflight_cancel_waits_for_worker_cleanup_before_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_count(_builder: object, **_kwargs: object) -> int:
+                entered.set()
+                release.wait(2)
+                return 0
+
+            service = JobPreparationService(root / "state.db")
+            try:
+                with patch("anima_core.job_preflight.ManifestBuilder.count_candidate_images", blocked_count):
+                    job_id = service.start_preflight(self._config(source))
+                    self.assertTrue(entered.wait(1))
+                    self.assertTrue(service.cancel_preflight(job_id))
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        # The request only signals the worker; cleanup and the
+                        # terminal transition are serialized by that worker.
+                        self.assertIn(
+                            database.get_preflight_progress(job_id)["status"],
+                            {"queued", "preflighting"},
+                        )
+                    finally:
+                        database.close()
+                    release.set()
+                deadline = time.monotonic() + 10
+                while True:
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        status = database.get_preflight_progress(job_id)["status"]
+                    finally:
+                        database.close()
+                    if status == "cancelled":
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("cancelled async preflight did not reach terminal state")
+                    time.sleep(0.01)
+            finally:
+                release.set()
+                service.close()
+
+    def test_close_requests_async_preflight_cancellation_and_joins_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            entered = threading.Event()
+
+            def cancellable_count(_builder: object, *, cancel_check: object = None) -> int:
+                entered.set()
+                while cancel_check is None or not cancel_check():
+                    time.sleep(0.01)
+                raise ManifestCancelled()
+
+            service = JobPreparationService(root / "state.db")
+            with patch("anima_core.job_preflight.ManifestBuilder.count_candidate_images", cancellable_count):
+                job_id = service.start_preflight(self._config(source))
+                self.assertTrue(entered.wait(1))
+                service.close()
+            database = StateDatabase.open(root / "state.db")
+            try:
+                self.assertEqual("cancelled", database.get_preflight_progress(job_id)["status"])
+            finally:
+                database.close()
+
+    def test_async_preflight_unexpected_worker_exception_is_persisted_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "dataset"
+            source.mkdir()
+            service = JobPreparationService(root / "state.db")
+            try:
+                entered = threading.Event()
+                release = threading.Event()
+
+                def fail_after_start(*_args: object, **_kwargs: object) -> None:
+                    entered.set()
+                    release.wait(2)
+                    raise RuntimeError("forced async fault")
+
+                with patch.object(service, "_execute_preflight", side_effect=fail_after_start):
+                    job_id = service.start_preflight(self._config(source))
+                    self.assertTrue(entered.wait(2))
+                    release.set()
+                deadline = time.monotonic() + 10
+                while True:
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        progress = database.get_preflight_progress(job_id)
+                        job = database.get_job(job_id)
+                    finally:
+                        database.close()
+                    if progress["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail("unexpected async preflight exception was not persisted")
+                    time.sleep(0.01)
+                self.assertEqual("failed", progress["status"])
+                self.assertIn("forced async fault", str(progress["error"]))
+                self.assertEqual("failed", job["status"])
+            finally:
+                release.set()
+                service.close()
 
     def test_confirm_creates_overlay_only_after_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

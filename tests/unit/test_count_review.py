@@ -258,6 +258,46 @@ class CountReviewFixture:
 
 
 class CountReviewTests(unittest.TestCase):
+    def test_pipeline_confirmation_waits_for_the_review_initializer_to_unregister(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CountReviewFixture(
+                Path(temporary),
+                ((_evidence("solo"), _observation("observed", "duo")),),
+            )
+            pipeline = PipelineService(fixture.database_path, install_root=ROOT / ".runtime-build")
+
+            class SettlingThread:
+                joined = False
+
+                def join(self, timeout: float | None = None) -> None:
+                    self.joined = True
+                    with pipeline._lock:
+                        pipeline._threads.pop("job-review", None)
+
+            settling = SettlingThread()
+            try:
+                self.assertEqual("reviewing", fixture.runner().run())
+                CountReviewService(fixture.database, "job-review").resolve(
+                    1, expected_version=1, source="vlm"
+                )
+                pipeline._run = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+                pipeline._threads["job-review"] = settling  # type: ignore[assignment]
+
+                self.assertTrue(pipeline.confirm_count_review("job-review", confirmed=True))
+                pipeline.close()
+                self.assertTrue(settling.joined)
+                self.assertEqual(
+                    ("running", "count_review"),
+                    (
+                        fixture.database.get_job("job-review")["status"],
+                        fixture.database.get_job("job-review")["current_module_id"],
+                    ),
+                )
+            finally:
+                pipeline._threads.pop("job-review", None)
+                pipeline.close()
+                fixture.close()
+
     def test_nl_disabled_count_review_runs_from_classify_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CountReviewFixture(

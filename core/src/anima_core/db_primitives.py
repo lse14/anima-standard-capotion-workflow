@@ -47,7 +47,7 @@ def repair_target_clause(
     *,
     sample_alias: str = "s",
 ) -> tuple[str, list[Any]]:
-    """Restrict non-export modules to their versioned repair start point."""
+    """Restrict pipeline modules to their versioned repair start point."""
     row = connection.execute(
         "SELECT config_schema_version FROM jobs WHERE job_id=?", (job_id,)
     ).fetchone()
@@ -62,7 +62,7 @@ def repair_target_clause(
     parent = connection.execute(
         "SELECT parent_job_id FROM repair_jobs WHERE repair_job_id=?", (job_id,)
     ).fetchone()
-    if module_id == "export" or parent is None:
+    if parent is None:
         return "", []
     allowed_starts = module_order[: module_order.index(module_id) + 1]
     placeholders = ",".join("?" for _ in allowed_starts)

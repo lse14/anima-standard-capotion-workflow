@@ -10,17 +10,16 @@ type ExportSummary = {
   exported: number;
   issueCount: number;
   convertedSamples: number;
+  unlabeled: number;
+  unlabeledFolder: string | null;
 } | null;
 
 export type ExportStepProps = {
   draft: Pick<Draft, "export" | "captionFormat">;
   defaults: Pick<Draft, "export" | "captionFormat">;
   taskLocked: boolean;
-  workspaceReady: boolean;
-  startPending: boolean;
   exportSummary: ExportSummary;
   t: Translate;
-  automatic: string;
   guidanceCopy: FieldGuidanceCopy;
   onExportChange: (patch: Partial<Draft["export"]>) => void;
   onCaptionFormatChange: (patch: Partial<Draft["captionFormat"]>) => void;
@@ -28,11 +27,10 @@ export type ExportStepProps = {
   batchRecommended?: number;
   batchReason?: string;
   onBatchSizeChange: (value: number) => void;
-  onStartPipeline: () => void;
 };
 
 export function ExportStep({
-  draft, defaults, taskLocked, workspaceReady, startPending, exportSummary, t, automatic, guidanceCopy, onExportChange, onCaptionFormatChange, onStartPipeline,
+  draft, defaults, taskLocked, exportSummary, t, guidanceCopy, onExportChange, onCaptionFormatChange,
   batchSize, batchRecommended, batchReason, onBatchSizeChange,
 }: ExportStepProps) {
   return <>
@@ -41,7 +39,6 @@ export function ExportStep({
       <FormField id="export-format" label={t("format")} copy={guidanceCopy} guidance={{ description: t("fieldHelp_exportFormat"), defaultValue: t("both") }}><select id="export-format" disabled={taskLocked} value={draft.export.format} onChange={(event) => onExportChange({ format: event.target.value as Draft["export"]["format"] })}><option value="both">{t("both")}</option><option value="json">{t("jsonOnly")}</option><option value="flat_txt">{t("flatTxtOnly")}</option></select></FormField>
       <FormField id="flat-txt-layout" label={t("flatTxtLayout")} copy={guidanceCopy} guidance={{ description: t("fieldHelp_flatTxtLayout"), defaultValue: defaults.captionFormat.flatTxtLayout === "single_line" ? t("singleLine") : t("nlNewline") }}><select id="flat-txt-layout" disabled={taskLocked} value={draft.captionFormat.flatTxtLayout} onChange={(event) => onCaptionFormatChange({ flatTxtLayout: event.target.value as Draft["captionFormat"]["flatTxtLayout"] })}><option value="nl_newline">{t("nlNewline")}</option><option value="single_line">{t("singleLine")}</option></select></FormField>
     </div>
-    <div className="launch-area" aria-busy={startPending}><p>{automatic}</p><button type="button" disabled={!workspaceReady || startPending} aria-busy={startPending} onClick={onStartPipeline}>{t("startPipeline")}</button></div>
-    {exportSummary && <dl className="facts"><div><dt>{t("validInvalid")}</dt><dd>{exportSummary.valid} / {exportSummary.invalid}</dd></div><div><dt>{t("committed")}</dt><dd>{exportSummary.exported}</dd></div><div><dt>{t("issues")}</dt><dd>{exportSummary.issueCount}</dd></div><div><dt>{t("converted")}</dt><dd>{exportSummary.convertedSamples}</dd></div></dl>}
+    {exportSummary && <dl className="facts"><div><dt>{t("validInvalid")}</dt><dd>{exportSummary.valid} / {exportSummary.invalid}</dd></div><div><dt>{t("committed")}</dt><dd>{exportSummary.exported}</dd></div><div><dt>{t("issues")}</dt><dd>{exportSummary.issueCount}</dd></div><div><dt>{t("converted")}</dt><dd>{exportSummary.convertedSamples}</dd></div><div><dt>{t("unlabeledImages")}</dt><dd>{exportSummary.unlabeled}</dd></div>{exportSummary.unlabeledFolder && <div className="wide"><dt>{t("unlabeledFolder")}</dt><dd><code>{exportSummary.unlabeledFolder}</code></dd></div>}</dl>}
   </>;
 }

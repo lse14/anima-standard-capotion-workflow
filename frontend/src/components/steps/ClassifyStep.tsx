@@ -54,7 +54,18 @@ export function ClassifyStep({
       <PathPicker id="classify-custom-resource" purpose="classification_resource_json" disabled={taskLocked || !classificationResourceActive} value={draft.classify.customResourcePath ?? ""} onChange={(customResourcePath) => onClassifyChange({ customResourcePath })} placeholder={t("absoluteWindowsPath")} copy={pathPickerCopy} />
     </FormField>}
     <small>{copy.anthroReplacementNote}</small>
-    <ToggleField id="classify-overwrite-json" label={t("overwriteJson")} checked={draft.classify.overwriteJson} disabled={taskLocked || rebuild || !classifyEnabled} onChange={(overwriteJson) => onClassifyChange({ overwriteJson })} copy={guidanceCopy} guidance={{ description: t("fieldHelp_overwriteJson"), defaultValue: draft.classify.overwriteJson ? t("fieldEnabled") : t("fieldDisabled") }} />
-    <ToggleField id="classify-overwrite-count" label={t("overwriteCount")} checked={draft.classify.overwriteCount} disabled={taskLocked || rebuild || !classifyEnabled} onChange={(overwriteCount) => onClassifyChange({ overwriteCount })} copy={guidanceCopy} guidance={{ description: t("fieldHelp_overwriteCount"), defaultValue: draft.classify.overwriteCount ? t("fieldEnabled") : t("fieldDisabled") }} />
+    {rebuild ? <>
+      <div className="readonly-setting" data-classify-overwrite-mode="rebuild">
+        <ToggleField id="classify-overwrite-json" label={t("overwriteJson")} checked disabled onChange={() => undefined} copy={guidanceCopy} guidance={{ description: t("rebuildOverwriteHelp"), defaultValue: t("fieldEnabled") }} />
+        <small>{t("rebuildOverwriteHelp")}</small>
+      </div>
+      <div className="readonly-setting">
+        <ToggleField id="classify-overwrite-count" label={t("overwriteCount")} checked disabled onChange={() => undefined} copy={guidanceCopy} guidance={{ description: t("rebuildOverwriteHelp"), defaultValue: t("fieldEnabled") }} />
+        <small>{t("rebuildOverwriteHelp")}</small>
+      </div>
+    </> : <>
+      <ToggleField id="classify-overwrite-json" label={t("overwriteJson")} checked={draft.classify.overwriteJson} disabled={taskLocked || !classifyEnabled} onChange={(overwriteJson) => onClassifyChange({ overwriteJson })} copy={guidanceCopy} guidance={{ description: t("fieldHelp_overwriteJson"), defaultValue: draft.classify.overwriteJson ? t("fieldEnabled") : t("fieldDisabled") }} />
+      <ToggleField id="classify-overwrite-count" label={t("overwriteCount")} checked={draft.classify.overwriteCount} disabled={taskLocked || !classifyEnabled} onChange={(overwriteCount) => onClassifyChange({ overwriteCount })} copy={guidanceCopy} guidance={{ description: t("fieldHelp_overwriteCount"), defaultValue: draft.classify.overwriteCount ? t("fieldEnabled") : t("fieldDisabled") }} />
+    </>}
   </div>;
 }

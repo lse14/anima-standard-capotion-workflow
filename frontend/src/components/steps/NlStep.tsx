@@ -9,11 +9,13 @@ type NlPresetType = "general" | "style" | "character";
 
 type NlProfileForm = {
   profileId: string;
+  name?: string;
   endpoint: string;
   model: string;
   backupModel: string | null;
   apiCredentialRef: string;
   hasCredential: boolean;
+  revision?: number;
 };
 
 export type NlStepProps = {
@@ -23,9 +25,13 @@ export type NlStepProps = {
   attemptBudget: string;
   profile: NlProfileForm;
   profiles: readonly NlProfileForm[];
+  defaultProfileId: string | null;
   secret: string;
   profileSavePending: boolean;
   credentialDeletePending: boolean;
+  runtimeEditable: boolean;
+  runtimeTaskRevision: number;
+  runtimePending: boolean;
   diagnosticResetToken: number;
   t: Translate;
   guidanceCopy: FieldGuidanceCopy;
@@ -39,6 +45,10 @@ export type NlStepProps = {
   onProfileChange: (profile: NlProfileForm) => void;
   onSecretChange: (value: string) => void;
   onSaveProfile: () => void;
+  onApplyRuntime: () => void;
+  onSetDefault: () => void;
+  onCopyProfile: () => void;
+  onDeleteProfile: () => void;
   onClearSecret: () => void;
   batchSize: number;
   batchRecommended?: number;
@@ -53,12 +63,13 @@ function distributionError(distribution: Draft["nl"]["lengthDistribution"]): boo
 }
 
 export function NlStep({
-  draft, defaults, taskLocked, attemptBudget, profile, profiles, secret, profileSavePending, credentialDeletePending, t,
+  draft, defaults, taskLocked, attemptBudget, profile, profiles, defaultProfileId, secret, profileSavePending, credentialDeletePending, runtimeEditable, runtimeTaskRevision, runtimePending, t,
   onNlChange, onApiPolicyChange, onRequestsPerMinuteChange,
-  onUnlimitedRpmChange, onAttemptBudgetChange, onProfileSelect, onProfileChange, onSecretChange, onSaveProfile, onClearSecret, guidanceCopy, profileHelp, diagnosticResetToken,
+  onUnlimitedRpmChange, onAttemptBudgetChange, onProfileSelect, onProfileChange, onSecretChange, onSaveProfile, onApplyRuntime, onSetDefault, onCopyProfile, onDeleteProfile, onClearSecret, guidanceCopy, profileHelp, diagnosticResetToken,
   batchSize, batchRecommended, batchReason, onBatchSizeChange,
 }: NlStepProps) {
-  const apiDisabled = taskLocked || !draft.nl.enabled || !draft.nl.apiEnabled;
+  const apiDisabled = !draft.nl.enabled || !draft.nl.apiEnabled;
+  const apiControlsDisabled = apiDisabled || (taskLocked && !runtimeEditable);
   const apiCollapsed = !draft.nl.enabled || !draft.nl.apiEnabled;
   const unlimitedRpm = draft.nl.apiPolicy.maxRequestsPerMinute === "unlimited";
   const invalidDistribution = distributionError(draft.nl.lengthDistribution);
@@ -112,14 +123,18 @@ export function NlStep({
           <p className="hint">{profileHelp}</p>
           <div className="form-grid">
             <FormField label={t("profileId")} id="nl-profile-select" copy={guidanceCopy} guidance={{ description: t("fieldHelp_profileId") }}>
-              <select id="nl-profile-select" disabled={taskLocked} value={profile.profileId} onChange={(event) => onProfileSelect(event.target.value)}>
+              <select id="nl-profile-select" disabled={apiControlsDisabled || profileSavePending} value={profile.profileId} onChange={(event) => onProfileSelect(event.target.value)}>
                 <option value={profile.profileId}>{profile.profileId}</option>
                 {profileOptions.map((item) => <option key={item.profileId} value={item.profileId}>{item.profileId}</option>)}
               </select>
             </FormField>
           </div>
-          <NlApiTools
-            disabled={apiDisabled}
+          <div className="nl-profile-meta" aria-live="polite">
+            <span>{t("profileRevision")}: {profile.revision ?? 1}</span>
+            <span>{profile.profileId === defaultProfileId ? t("defaultProfile") : t("notDefaultProfile")}</span>
+          </div>
+            <NlApiTools
+            disabled={apiControlsDisabled}
             profileId={profile.profileId}
             endpoint={profile.endpoint}
             model={profile.model}
@@ -139,22 +154,23 @@ export function NlStep({
             <div className="form-grid nl-api-secret-grid">
               <FormField label={t("apiKey")} id="nl-api-key" wide copy={guidanceCopy} guidance={{ description: t("fieldHelp_apiKey") }}>
                 <div className="secret-input-control">
-                  <input id="nl-api-key" disabled={taskLocked || !draft.nl.enabled || !draft.nl.apiEnabled} type={keyVisible ? "text" : "password"} value={secret} autoComplete="off" onChange={(event) => onSecretChange(event.target.value)} placeholder={profile.hasCredential ? t("savedKey") : t("dpapiKey")} />
+                <input id="nl-api-key" disabled={apiControlsDisabled} type={keyVisible ? "text" : "password"} value={secret} autoComplete="off" onChange={(event) => onSecretChange(event.target.value)} placeholder={profile.hasCredential ? t("savedKey") : t("dpapiKey")} />
                   <button className="icon-button secondary" type="button" disabled={taskLocked || apiDisabled || !secret} aria-label={t(keyVisible ? "hideApiKey" : "showApiKey")} title={t(keyVisible ? "hideApiKey" : "showApiKey")} onClick={() => setKeyVisible((visible) => !visible)}><span aria-hidden="true">&#128065;</span></button>
                 </div>
               </FormField>
             </div>
-            <div className="step-actions"><button disabled={taskLocked || profileSavePending} aria-busy={profileSavePending} type="button" onClick={onSaveProfile}>{t("saveProfile")}</button><button className="secondary" disabled={taskLocked || credentialDeletePending || (!profile.hasCredential && !profile.apiCredentialRef)} aria-busy={credentialDeletePending} type="button" onClick={onClearSecret}>{t("clearKey")}</button></div>
+            <div className="step-actions"><button disabled={apiControlsDisabled || profileSavePending} aria-busy={profileSavePending} type="button" onClick={runtimeEditable ? onApplyRuntime : onSaveProfile}>{t(runtimeEditable ? "applyRuntimeApi" : "saveProfile")}</button><button className="secondary" disabled={taskLocked || profileSavePending || profile.profileId === defaultProfileId} type="button" onClick={onSetDefault}>{t("setDefaultProfile")}</button><button className="secondary" disabled={taskLocked || profileSavePending} type="button" onClick={onCopyProfile}>{t("copyProfile")}</button><button className="danger-action" disabled={taskLocked || profileSavePending || profile.profileId === defaultProfileId || profiles.length <= 1} type="button" onClick={onDeleteProfile}>{t("deleteProfile")}</button><button className="secondary" disabled={taskLocked || credentialDeletePending || (!profile.hasCredential && !profile.apiCredentialRef)} aria-busy={credentialDeletePending} type="button" onClick={onClearSecret}>{t("clearKey")}</button></div>
+            {runtimeEditable && <p className="hint" role="status">{runtimePending ? t("runtimeApiPending", { revision: runtimeTaskRevision + 1 }) : t("runtimeApiHint", { revision: runtimeTaskRevision })}</p>}
 
             <div className="form-grid nl-request-limits">
               <FormField label={t("requestsPerMinute")} id="nl-rpm" copy={guidanceCopy} guidance={{ description: t("fieldHelp_requestsPerMinute"), defaultValue: String(defaults.nl.apiPolicy.maxRequestsPerMinute === "unlimited" ? 60 : defaults.nl.apiPolicy.maxRequestsPerMinute), range: "1-100000" }}>
-                <input id="nl-rpm" disabled={apiDisabled || unlimitedRpm} type="number" min="1" max="100000" step="1" value={unlimitedRpm ? 60 : draft.nl.apiPolicy.maxRequestsPerMinute} onChange={(event) => onRequestsPerMinuteChange(event.target.value)} />
+                <input id="nl-rpm" disabled={apiControlsDisabled || unlimitedRpm} type="number" min="1" max="100000" step="1" value={unlimitedRpm ? 60 : draft.nl.apiPolicy.maxRequestsPerMinute} onChange={(event) => onRequestsPerMinuteChange(event.target.value)} />
               </FormField>
-              <ToggleField id="nl-unlimited-rpm" label={t("unlimitedRpm")} checked={unlimitedRpm} disabled={apiDisabled} guidance={{ description: t("fieldHelp_unlimitedRpm"), defaultValue: t("fieldDisabled") }} copy={guidanceCopy} onChange={onUnlimitedRpmChange} />
+              <ToggleField id="nl-unlimited-rpm" label={t("unlimitedRpm")} checked={unlimitedRpm} disabled={apiControlsDisabled} guidance={{ description: t("fieldHelp_unlimitedRpm"), defaultValue: t("fieldDisabled") }} copy={guidanceCopy} onChange={onUnlimitedRpmChange} />
               <FormField label={t("attemptBudget")} id="nl-attempt-budget" copy={guidanceCopy} guidance={{ description: t("fieldHelp_attemptBudget") }}>
-                <input id="nl-attempt-budget" disabled={apiDisabled} inputMode="numeric" value={attemptBudget} onChange={(event) => onAttemptBudgetChange(event.target.value)} /><small className="field-help">{t("attemptBudgetHelp")}</small>
+                <input id="nl-attempt-budget" disabled={apiControlsDisabled} inputMode="numeric" value={attemptBudget} onChange={(event) => onAttemptBudgetChange(event.target.value)} /><small className="field-help">{t("attemptBudgetHelp")}</small>
               </FormField>
-              <ToggleField id="nl-backup-enabled" label={t("enableBackupModel")} checked={draft.nl.apiPolicy.backupEnabled} disabled={apiDisabled} guidance={{ description: t("fieldHelp_backupModel"), defaultValue: t("fieldDisabled") }} copy={guidanceCopy} onChange={(backupEnabled) => onApiPolicyChange({ backupEnabled })} />
+              <ToggleField id="nl-backup-enabled" label={t("enableBackupModel")} checked={draft.nl.apiPolicy.backupEnabled} disabled={apiControlsDisabled} guidance={{ description: t("fieldHelp_backupModel"), defaultValue: t("fieldDisabled") }} copy={guidanceCopy} onChange={(backupEnabled) => onApiPolicyChange({ backupEnabled })} />
             </div>
           </NlApiTools>
         </div>

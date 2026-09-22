@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,8 +18,10 @@ sys.path.insert(0, str(ROOT / "core" / "src"))
 
 from anima_core.annotation_backup import write_backup as write_backup_impl
 from anima_core.contracts import JobConfig, SampleRunState
+from anima_core.commit_journal import CommitJournal, CommitJournalError, load as load_journal
 from anima_core.db import StateDatabase
 from anima_core.export_commit import ExportCommitCoordinator, ExportCommitError
+from anima_core.export_staging import create_hardlink_staging
 from anima_core.job_preflight import JobPreparationService
 from anima_core.overlay import OverlayLayout
 from anima_core.pipeline import PipelineService
@@ -59,19 +62,149 @@ def _ocr_sidecar(relative_image_path: str, *, status: str = "success") -> bytes:
 
 
 class ExportCommitTests(unittest.TestCase):
-    def _prepared_job(self, root: Path, *, format_value: str = "both", extra_images: tuple[str, ...] = (), ocr_enabled: bool = False):
+    def test_commit_journal_reads_v1_and_strict_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            staging = root / ".dataset.anima-stage-job"
+            rollback = root / ".dataset.anima-rollback-job"
+            backup = root / ".dataset.anima-backups" / "job.zip"
+            shared = {
+                "jobId": "job",
+                "datasetRoot": str(dataset),
+                "stagingRoot": str(staging),
+                "rollbackRoot": str(rollback),
+                "backupZip": str(backup),
+            }
+
+            for state in (
+                "prepared", "backup_verified", "rollback_created",
+                "committed", "rollback_required", "rolled_back",
+            ):
+                journal = CommitJournal.from_value(
+                    {"schemaVersion": 1, "state": state, **shared}, job_id="job",
+                )
+                self.assertEqual((1, state, None, None), (
+                    journal.schema_version, journal.state, journal.phase, journal.updated_at,
+                ))
+
+            value = {
+                "schemaVersion": 2,
+                "state": "declared",
+                "phase": "creating_stage",
+                "updatedAt": "2026-09-16T00:00:00Z",
+                **shared,
+            }
+            journal = CommitJournal.from_value(value, job_id="job")
+            self.assertEqual((2, "declared", "creating_stage", value["updatedAt"]), (
+                journal.schema_version, journal.state, journal.phase, journal.updated_at,
+            ))
+            self.assertEqual(value, journal.to_value())
+
+            invalid_values = (
+                {**value, "phase": "unknown"},
+                {**value, "state": "committed", "phase": "creating_stage"},
+                {key: item for key, item in value.items() if key != "updatedAt"},
+                {**value, "unexpected": True},
+                {**value, "jobId": "another-job"},
+                {**value, "stagingRoot": str(root / "elsewhere" / "stage")},
+            )
+            for invalid in invalid_values:
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(CommitJournalError):
+                        CommitJournal.from_value(invalid, job_id="job")
+
+    def test_commit_declares_journal_before_stage_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, _dataset, layout = self._prepared_job(Path(temporary))
+            try:
+                self._complete_export(database, job_id, layout, format_value="both")
+                observed: list[tuple[int, str, str | None, str]] = []
+
+                def fail_stage_creation(*_args, **_kwargs):
+                    journal = load_journal(layout)
+                    self.assertIsNotNone(journal)
+                    assert journal is not None
+                    observed.append((
+                        journal.schema_version,
+                        journal.state,
+                        journal.phase,
+                        str(database.get_job(job_id)["status"]),
+                    ))
+                    raise OSError("injected stage creation failure")
+
+                with patch("anima_core.export_commit.create_hardlink_staging", side_effect=fail_stage_creation):
+                    with self.assertRaises(ExportCommitError):
+                        ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+
+                self.assertEqual([(2, "declared", "creating_stage", "committing")], observed)
+                journal = load_journal(layout)
+                self.assertIsNotNone(journal)
+                assert journal is not None
+                self.assertEqual((2, "declared", "creating_stage"), (
+                    journal.schema_version, journal.state, journal.phase,
+                ))
+                self.assertEqual("committing", database.get_job(job_id)["status"])
+            finally:
+                database.close()
+                service.close()
+
+    def test_commit_persists_ordered_v2_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, _dataset, layout = self._prepared_job(
+                Path(temporary), ocr_enabled=True,
+            )
+            try:
+                layout.write_ocr_sidecar("sample.png", _ocr_sidecar("sample.png"))
+                self._complete_export(database, job_id, layout, format_value="both")
+                real_write = __import__("anima_core.export_commit", fromlist=["write_journal"]).write_journal
+                observed: list[tuple[int, str, str | None]] = []
+
+                def record_phase(current_layout, journal):
+                    observed.append((journal.schema_version, journal.state, journal.phase))
+                    return real_write(current_layout, journal)
+
+                with patch("anima_core.export_commit.write_journal", side_effect=record_phase):
+                    ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+
+                self.assertEqual([
+                    (2, "declared", "preparing"),
+                    (2, "declared", "creating_stage"),
+                    (2, "staging", "writing_annotations"),
+                    (2, "staging", "copying_unlabeled"),
+                    (2, "staging", "copying_ocr"),
+                    (2, "staging", "applying_provenance"),
+                    (2, "staged", "verifying_baseline"),
+                    (2, "staged", "writing_backup"),
+                    (2, "backup_verified", "switching_directories"),
+                    (2, "rollback_created", "switching_directories"),
+                    (2, "committed", "cleanup"),
+                ], observed)
+            finally:
+                database.close()
+                service.close()
+
+    def _prepared_job(self, root: Path, *, format_value: str = "both", extra_images: tuple[str, ...] = (), unlabeled_images: tuple[str, ...] = (), ocr_enabled: bool = False):
         dataset = root / "dataset"
         dataset.mkdir()
         Image.new("RGB", (2, 2), (20, 30, 40)).save(dataset / "sample.png")
         (dataset / "sample.json").write_bytes(b'{"legacy":true}\n')
         (dataset / "sample.txt").write_bytes(b"legacy\n")
         for image_name in extra_images:
-            Image.new("RGB", (2, 2), (50, 60, 70)).save(dataset / image_name)
+            image_path = dataset / image_name
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (2, 2), (50, 60, 70)).save(image_path)
             annotation = Path(image_name).with_suffix("")
+            (dataset / annotation).parent.mkdir(parents=True, exist_ok=True)
             (dataset / f"{annotation}.json").write_bytes(b'{"legacy":true}\n')
             (dataset / f"{annotation}.txt").write_bytes(b"legacy\n")
+        for image_name in unlabeled_images:
+            image_path = dataset / image_name
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (2, 2), (80, 90, 100)).save(image_path)
         config = JobConfig(workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset), recursive=True, schemaVersion=10)
         config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+        config.classify["overwriteJson"] = True
         config.ocr["enabled"] = ocr_enabled
         config.countReview["enabled"] = False  # type: ignore[index]
         assert config.tokenBudget is not None
@@ -116,11 +249,35 @@ class ExportCommitTests(unittest.TestCase):
 
     @staticmethod
     def _staging_residue(dataset: Path) -> list[Path]:
-        return [entry for entry in dataset.parent.iterdir() if ".anima-stage-" in entry.name]
+        legacy = [entry for entry in dataset.parent.iterdir() if ".anima-stage-" in entry.name]
+        dedicated = list((dataset.parent / ".anima-dataset-tool").glob("*/jobs/*/stage")) if (dataset.parent / ".anima-dataset-tool").is_dir() else []
+        return legacy + dedicated
 
     @staticmethod
     def _rollback_residue(dataset: Path) -> list[Path]:
-        return [entry for entry in dataset.parent.iterdir() if ".anima-rollback-" in entry.name]
+        legacy = [entry for entry in dataset.parent.iterdir() if ".anima-rollback-" in entry.name]
+        dedicated = list((dataset.parent / ".anima-dataset-tool").glob("*/jobs/*/rollback")) if (dataset.parent / ".anima-dataset-tool").is_dir() else []
+        return legacy + dedicated
+
+    def _assert_preserved_pre_swap(
+        self,
+        database: StateDatabase,
+        job_id: str,
+        dataset: Path,
+        layout: OverlayLayout,
+        *,
+        state: str,
+        phase: str,
+    ) -> None:
+        journal = load_journal(layout)
+        self.assertIsNotNone(journal)
+        assert journal is not None
+        self.assertEqual((2, state, phase), (
+            journal.schema_version, journal.state, journal.phase,
+        ))
+        self.assertEqual("committing", database.get_job(job_id)["status"])
+        self.assertEqual([journal.staging_root], self._staging_residue(dataset))
+        self.assertEqual([], self._rollback_residue(dataset))
 
     @staticmethod
     def _business_bytes(dataset: Path) -> dict[str, bytes]:
@@ -154,7 +311,246 @@ class ExportCommitTests(unittest.TestCase):
                 database.close()
                 service.close()
 
-    def test_incomplete_artifact_index_never_touches_dataset(self) -> None:
+    def test_commit_uses_partial_success_and_idempotent_unlabeled_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, _dataset, layout = self._prepared_job(
+                Path(temporary), unlabeled_images=("nested/no-label.png",),
+            )
+            try:
+                self._complete_export(database, job_id, layout, format_value="both")
+                unlabeled = next(
+                    row for row in database.page_samples(job_id, limit=500)
+                    if row["relative_image_path"] == "nested\\no-label.png"
+                )
+                database.connection.execute(
+                    "DELETE FROM export_artifacts WHERE job_id=? AND sample_id=?",
+                    (job_id, int(unlabeled["sample_id"])),
+                )
+                database.set_sample_state(job_id, int(unlabeled["sample_id"]), SampleRunState(
+                    sampleId=int(unlabeled["sample_id"]), currentModuleId="export", status="skipped", attempt=1,
+                ))
+                database.set_module_summary(job_id, "export", status="completed", completed=1, skipped=1, finished=True)
+                setter = database.set_module_diagnostic_count
+                with patch.object(database, "increment_module_diagnostic", side_effect=AssertionError("increment is not idempotent")):
+                    with patch.object(database, "set_module_diagnostic_count", wraps=setter) as set_count:
+                        result = ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+
+                self.assertEqual(1, result.unlabeled)
+                self.assertEqual("succeeded_with_issues", database.get_job(job_id)["status"])
+                set_count.assert_called_once_with(
+                    job_id, "export", "unlabeled_images", severity="warning", count=1,
+                )
+                self.assertEqual(1, database.module_diagnostic_count(job_id, "export", "unlabeled_images"))
+                database.set_module_diagnostic_count(
+                    job_id, "export", "unlabeled_images", severity="warning", count=186,
+                )
+                database.set_module_diagnostic_count(
+                    job_id, "export", "unlabeled_images", severity="warning", count=186,
+                )
+                self.assertEqual(186, database.module_diagnostic_count(job_id, "export", "unlabeled_images"))
+            finally:
+                database.close()
+                service.close()
+
+    def test_ocr_warning_and_conversion_diagnostic_do_not_make_partial_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, _dataset, layout = self._prepared_job(Path(temporary), ocr_enabled=True)
+            try:
+                database.increment_module_diagnostic(job_id, "ocr", "ocr_failed", severity="warning", amount=1)
+                database.increment_module_diagnostic(job_id, "export", "samples_converted", severity="info", amount=2)
+                self._complete_export(database, job_id, layout, format_value="both")
+                ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+                self.assertEqual("succeeded", database.get_job(job_id)["status"])
+            finally:
+                database.close()
+                service.close()
+
+    def test_repair_export_artifact_groups_only_include_repair_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(
+                Path(temporary), extra_images=("untargeted.jpg",), format_value="json",
+            )
+            try:
+                samples = database.page_samples(job_id, limit=500)
+                target = next(row for row in samples if row["relative_image_path"] == "sample.png")
+                untargeted = next(row for row in samples if row["relative_image_path"] == "untargeted.jpg")
+                database.connection.execute(
+                    "INSERT INTO repair_jobs(repair_job_id,parent_job_id,created_at) VALUES (?,?,?)",
+                    (job_id, job_id, "now"),
+                )
+                database.connection.execute(
+                    "INSERT INTO repair_targets(repair_job_id,sample_id,repair_start_module) VALUES (?,?,?)",
+                    (job_id, int(target["sample_id"]), "export"),
+                )
+                prepared, digest = layout.write_prepared("export", "lease", ".json", b'{"ok":true}\n')
+                database.connection.execute(
+                    "INSERT INTO export_artifacts(job_id,sample_id,kind,relative_path,sha256) VALUES (?,?,?,?,?)",
+                    (job_id, int(target["sample_id"]), "json", str(prepared.relative_to(layout.root)).replace("/", "\\"), digest),
+                )
+                rows = database.page_export_artifact_groups(job_id, limit=500)
+                self.assertEqual([int(target["sample_id"])], sorted({int(row["sample_id"]) for row in rows}))
+                self.assertNotIn(int(untargeted["sample_id"]), {int(row["sample_id"]) for row in rows})
+            finally:
+                database.close()
+                service.close()
+
+    def test_repair_unlabeled_projection_only_includes_repair_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(
+                Path(temporary), extra_images=("untargeted.jpg",), format_value="json",
+            )
+            staging = dataset.parent / "staging"
+            try:
+                samples = database.page_samples(job_id, limit=500)
+                target = next(row for row in samples if row["relative_image_path"] == "sample.png")
+                untargeted = next(row for row in samples if row["relative_image_path"] == "untargeted.jpg")
+                database.connection.execute(
+                    "INSERT INTO repair_jobs(repair_job_id,parent_job_id,created_at) VALUES (?,?,?)",
+                    (job_id, job_id, "now"),
+                )
+                database.connection.execute(
+                    "INSERT INTO repair_targets(repair_job_id,sample_id,repair_start_module) VALUES (?,?,?)",
+                    (job_id, int(target["sample_id"]), "export"),
+                )
+                for row in (target, untargeted):
+                    for suffix in (".json", ".txt"):
+                        path = dataset / (str(row["annotation_key"]) + suffix)
+                        if path.exists():
+                            path.unlink()
+                staging = create_hardlink_staging(dataset, staging)
+                copied, relative_root = ExportCommitCoordinator(
+                    database, layout, job_id=job_id,
+                )._copy_unlabeled_images_to_staging(staging)
+                self.assertEqual(1, copied)
+                self.assertTrue((staging / relative_root / "sample.png").exists())
+                self.assertFalse((staging / relative_root / "untargeted.jpg").exists())
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+                database.close()
+                service.close()
+
+    def test_unlabeled_projection_falls_back_to_copy_when_link_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(
+                Path(temporary), format_value="json", unlabeled_images=("nested/no-label.png",),
+            )
+            staging = dataset.parent / "staging"
+            try:
+                staging = create_hardlink_staging(dataset, staging)
+                expected = (staging / "nested" / "no-label.png").read_bytes()
+                with patch("anima_core.export_commit.os.link", side_effect=OSError("link unavailable")), patch(
+                    "anima_core.export_commit.shutil.copy2", wraps=shutil.copy2,
+                ) as copy2:
+                    copied, relative_root = ExportCommitCoordinator(
+                        database, layout, job_id=job_id,
+                    )._copy_unlabeled_images_to_staging(staging)
+
+                target = staging / relative_root / "nested" / "no-label.png"
+                self.assertEqual(1, copied)
+                self.assertEqual(expected, target.read_bytes())
+                copy2.assert_called_once_with(staging / "nested" / "no-label.png", target)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+                database.close()
+                service.close()
+
+    def test_unlabeled_projection_fails_when_link_and_copy_both_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(
+                Path(temporary), format_value="json", unlabeled_images=("no-label.png",),
+            )
+            staging = dataset.parent / "staging"
+            try:
+                staging = create_hardlink_staging(dataset, staging)
+                with patch("anima_core.export_commit.os.link", side_effect=OSError("link unavailable")), patch(
+                    "anima_core.export_commit.shutil.copy2", side_effect=OSError("copy unavailable"),
+                ), self.assertRaisesRegex(ExportCommitError, "could not be staged"):
+                    ExportCommitCoordinator(
+                        database, layout, job_id=job_id,
+                    )._copy_unlabeled_images_to_staging(staging)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+                database.close()
+                service.close()
+
+    def test_directory_rename_retries_transient_windows_access_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            destination = Path(temporary) / "destination"
+            source.mkdir()
+            access_error = PermissionError(5, "access denied")
+            access_error.winerror = 5
+            with patch("anima_core.export_commit.os.replace", side_effect=[access_error, None]) as replace, patch(
+                "time.sleep",
+            ) as sleep:
+                ExportCommitCoordinator._replace_directory_with_retry(source, destination)
+            self.assertEqual(2, replace.call_count)
+            sleep.assert_called_once()
+
+    def test_commit_copies_unannotated_skips_to_a_task_scoped_parallel_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(
+                Path(temporary), format_value="json", unlabeled_images=("nested/no-label.png",),
+            )
+            try:
+                samples = database.page_samples(job_id, limit=500)
+                labeled = next(row for row in samples if row["relative_image_path"] == "sample.png")
+                unlabeled = next(row for row in samples if row["relative_image_path"] == "nested\\no-label.png")
+                lease = "lease-labeled"
+                prepared, digest = layout.write_prepared("export", lease, ".json", b'{"tags":["verified"]}\n')
+                database.connection.execute(
+                    "INSERT INTO export_artifacts(job_id,sample_id,kind,relative_path,sha256) VALUES (?,?,?,?,?)",
+                    (job_id, labeled["sample_id"], "json", str(prepared.relative_to(layout.root)).replace("/", "\\"), digest),
+                )
+                database.set_sample_state(job_id, int(labeled["sample_id"]), SampleRunState(
+                    sampleId=int(labeled["sample_id"]), currentModuleId="export", status="completed", attempt=1,
+                ))
+                database.set_sample_state(job_id, int(unlabeled["sample_id"]), SampleRunState(
+                    sampleId=int(unlabeled["sample_id"]), currentModuleId="export", status="skipped", attempt=1,
+                ))
+                database.set_module_summary(job_id, "export", status="completed", completed=1, skipped=1, finished=True)
+
+                source_bytes = (dataset / "nested" / "no-label.png").read_bytes()
+                result = ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+
+                expected = dataset / result.unlabeledFolder / "nested" / "no-label.png"
+                self.assertEqual(1, result.unlabeled)
+                self.assertEqual(source_bytes, expected.read_bytes())
+                self.assertFalse((dataset / result.unlabeledFolder / "sample.png").exists())
+                self.assertFalse((dataset / "nested" / "no-label.json").exists())
+                self.assertFalse((dataset / "nested" / "no-label.txt").exists())
+            finally:
+                database.close()
+                service.close()
+
+    def test_commit_preserves_existing_txt_and_json_for_a_skipped_failed_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(Path(temporary))
+            try:
+                original_json = (dataset / "sample.json").read_bytes()
+                original_txt = (dataset / "sample.txt").read_bytes()
+                database.set_sample_state(job_id, 1, SampleRunState(
+                    sampleId=1, currentModuleId="export", status="skipped", attempt=1,
+                ))
+                database.set_module_summary(
+                    job_id, "export", status="completed", completed=0, skipped=1, finished=True,
+                )
+
+                result = ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+
+                self.assertEqual(0, result.exported)
+                self.assertEqual(0, result.unlabeled)
+                self.assertEqual(original_json, (dataset / "sample.json").read_bytes())
+                self.assertEqual(original_txt, (dataset / "sample.txt").read_bytes())
+                self.assertFalse((dataset / result.unlabeledFolder).exists())
+            finally:
+                database.close()
+                service.close()
+
+    def test_incomplete_artifact_index_preserves_owned_pre_swap_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database, service, job_id, dataset, layout = self._prepared_job(Path(temporary))
             try:
@@ -163,7 +559,10 @@ class ExportCommitTests(unittest.TestCase):
                 with self.assertRaises(ExportCommitError):
                     ExportCommitCoordinator(database, layout, job_id=job_id).commit()
                 self.assertEqual(original, (dataset / "sample.json").read_bytes())
-                self.assertFalse(layout.commit_journal_path().exists())
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staging", phase="writing_annotations",
+                )
             finally:
                 database.close()
                 service.close()
@@ -177,7 +576,7 @@ class ExportCommitTests(unittest.TestCase):
                 self._complete_export(database, job_id, layout, format_value="both")
                 real_replace = __import__("os").replace
                 def fail_second_replace(source, target):
-                    if ".anima-stage-" in Path(source).name and Path(target) == dataset:
+                    if (".anima-stage-" in Path(source).name or Path(source).name == "stage") and Path(target) == dataset:
                         raise OSError("injected staging rename failure")
                     return real_replace(source, target)
 
@@ -258,7 +657,7 @@ class ExportCommitTests(unittest.TestCase):
                 database.close()
                 service.close()
 
-    def test_staging_write_failure_never_changes_dataset_or_creates_journal(self) -> None:
+    def test_staging_write_failure_preserves_owned_pre_swap_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database, service, job_id, dataset, layout = self._prepared_job(Path(temporary))
             try:
@@ -268,14 +667,15 @@ class ExportCommitTests(unittest.TestCase):
                     with self.assertRaises(ExportCommitError):
                         ExportCommitCoordinator(database, layout, job_id=job_id).commit()
                 self.assertEqual(original, (dataset / "sample.json").read_bytes())
-                self.assertFalse(layout.commit_journal_path().exists())
-                self.assertEqual("failed", database.get_job(job_id)["status"])
-                self.assertEqual([], self._staging_residue(dataset))
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staging", phase="writing_annotations",
+                )
             finally:
                 database.close()
                 service.close()
 
-    def test_backup_failure_never_creates_journal_or_renames_dataset(self) -> None:
+    def test_backup_failure_preserves_owned_pre_swap_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database, service, job_id, dataset, layout = self._prepared_job(Path(temporary))
             try:
@@ -285,9 +685,10 @@ class ExportCommitTests(unittest.TestCase):
                     with self.assertRaises(ExportCommitError):
                         ExportCommitCoordinator(database, layout, job_id=job_id).commit()
                 self.assertEqual(original, (dataset / "sample.json").read_bytes())
-                self.assertFalse(layout.commit_journal_path().exists())
-                self.assertEqual("failed", database.get_job(job_id)["status"])
-                self.assertEqual([], self._staging_residue(dataset))
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staged", phase="writing_backup",
+                )
             finally:
                 database.close()
                 service.close()
@@ -307,7 +708,10 @@ class ExportCommitTests(unittest.TestCase):
                         ExportCommitCoordinator(database, layout, job_id=job_id).commit()
                 self.assertFalse((dataset / "ocr_annotations" / "sample.png.ocr.json").exists())
                 self.assertEqual(b'{"legacy":true}\n', (dataset / "sample.json").read_bytes())
-                self.assertEqual([], self._staging_residue(dataset))
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staged", phase="writing_backup",
+                )
             finally:
                 database.close()
                 service.close()
@@ -323,8 +727,10 @@ class ExportCommitTests(unittest.TestCase):
                     ExportCommitCoordinator(database, layout, job_id=job_id).commit()
                 self.assertEqual(external, (dataset / "sample.txt").read_bytes())
                 self.assertEqual(b'{"legacy":true}\n', (dataset / "sample.json").read_bytes())
-                self.assertFalse(layout.commit_journal_path().exists())
-                self.assertEqual([], self._staging_residue(dataset))
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staged", phase="verifying_baseline",
+                )
             finally:
                 database.close()
                 service.close()
@@ -462,7 +868,10 @@ class ExportCommitTests(unittest.TestCase):
                         ExportCommitCoordinator(database, layout, job_id=job_id).commit()
                 copied.assert_called_once()
                 self.assertFalse((dataset / "ocr_annotations" / "sample.png.ocr.json").exists())
-                self.assertEqual([], self._staging_residue(dataset))
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staged", phase="writing_backup",
+                )
             finally:
                 database.close()
                 service.close()
@@ -483,8 +892,10 @@ class ExportCommitTests(unittest.TestCase):
                 copied.assert_called_once()
                 self.assertEqual(original, (dataset / "sample.json").read_bytes())
                 self.assertFalse((dataset / "ocr_annotations" / "sample.png.ocr.json").exists())
-                self.assertFalse(layout.commit_journal_path().exists())
-                self.assertEqual([], self._staging_residue(dataset))
+                self._assert_preserved_pre_swap(
+                    database, job_id, dataset, layout,
+                    state="staging", phase="copying_ocr",
+                )
             finally:
                 database.close()
                 service.close()

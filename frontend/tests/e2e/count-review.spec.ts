@@ -12,8 +12,8 @@ import {
 
 async function openCountReview(page: Parameters<typeof openApp>[0]) {
   await openApp(page, { jobId: DEFAULT_JOB_ID, language: "en" });
-  await expect(page.locator(".task-monitor > .monitor-heading > .status")).toHaveText("reviewing");
-  await page.locator(".workflow-rail").getByRole("button", { name: /Count Review/ }).click();
+  await expect(page.getByRole("button", { name: /Count Review/ }).filter({ has: page.locator(".workspace-badge") })).toBeVisible();
+  await expect(page.locator(".count-review-workspace")).toBeVisible();
   await expect(page.getByText("sample-a.png")).toBeVisible();
 }
 
@@ -22,6 +22,7 @@ test.describe("count review characterization", () => {
     setJobSnapshot(api, makeSnapshot({ status: "reviewing", currentModuleId: "count_review" }));
     await openCountReview(page);
 
+    await page.getByRole("button", { name: "Task", exact: true }).click();
     const countModule = page.locator(".module-progress .module-row").filter({ hasText: "Count Review" });
     await expect(countModule.locator(".status")).toHaveText("Waiting for human review");
     await expect(countModule.locator("small")).toHaveText("Waiting for human review");
@@ -52,7 +53,6 @@ test.describe("count review characterization", () => {
     setJobSnapshot(api, makeSnapshot({ status: "reviewing", currentModuleId: "count_review" }));
     failRoute(api, `GET /api/jobs/${DEFAULT_JOB_ID}/count-review`, "count review unavailable");
     await openApp(page, { jobId: DEFAULT_JOB_ID, language: "en" });
-    await page.locator(".workflow-rail").getByRole("button", { name: /count review/i }).click();
 
     const panel = page.locator(".count-review-panel");
     await expect(panel.getByRole("alert")).toHaveText("count review unavailable");
@@ -95,6 +95,15 @@ test.describe("count review characterization", () => {
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Confirm and continue" }).click();
     await expect.poll(() => mutationsFor(api, "POST", `/api/jobs/${DEFAULT_JOB_ID}/count-review/confirm`).length).toBe(1);
+    await page.getByRole("button", { name: "Task", exact: true }).click();
     await expect(page.locator(".task-monitor > .monitor-heading > .status")).toHaveText("running");
+  });
+
+  test("keeps the continue blocker visible while decisions remain", async ({ page, api }) => {
+    setJobSnapshot(api, makeSnapshot({ status: "reviewing", currentModuleId: "count_review" }));
+    await openCountReview(page);
+
+    await expect(page.getByText("Resolve 2 pending decisions before continuing.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Confirm and continue" })).toBeDisabled();
   });
 });

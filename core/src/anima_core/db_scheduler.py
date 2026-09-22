@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping
@@ -320,6 +321,51 @@ class SchedulerDatabaseMixin:
             )
             return sample_ids
 
+    def skip_incremental_preserved_page(
+        self,
+        job_id: str,
+        module_id: str,
+        *,
+        after_sample_id: int | None = None,
+        limit: int = 1_000,
+    ) -> list[int]:
+        """Settle samples frozen as existing-annotation preserves for a module.
+
+        Export is included: it commits the untouched baseline bytes without
+        claiming a worker lease. All business-mutating modules are skipped so
+        a preserved annotation cannot consume API/token budget or be rewritten.
+        """
+        if module_id not in {"caption", "classify", "replace", "ocr", "nl", "count_review", "dropout", "token_budget", "export"}:
+            raise ValueError("invalid preservation module")
+        limit = validate_page_limit(limit)
+        with self.transaction(immediate=True):
+            query = """SELECT s.sample_id FROM samples AS s JOIN sample_state AS st
+                       ON st.job_id=s.job_id AND st.sample_id=s.sample_id
+                       WHERE s.job_id=? AND s.in_processing_scope=1
+                         AND s.incremental_preserve=1 AND st.status='pending'
+                         AND (st.current_module_id=? OR (?='caption' AND st.current_module_id IS NULL))"""
+            params: list[Any] = [job_id, module_id, module_id]
+            if after_sample_id is not None:
+                query += " AND s.sample_id>?"
+                params.append(after_sample_id)
+            query += " ORDER BY s.sample_id LIMIT ?"
+            params.append(limit)
+            sample_ids = [int(row[0]) for row in self.connection.execute(query, params)]
+            if not sample_ids:
+                return []
+            placeholders = ",".join("?" for _ in sample_ids)
+            self.connection.execute(
+                f"""UPDATE sample_state SET current_module_id=?,status='skipped',
+                    txt_provenance=CASE WHEN txt_provenance='missing' AND EXISTS(
+                        SELECT 1 FROM samples WHERE job_id=? AND sample_id IN ({placeholders})
+                        AND original_txt_state='nonblank') THEN 'original_preserved' ELSE txt_provenance END,
+                    lease_id=NULL,worker_instance_id=NULL,lease_expires_at=NULL,updated_at=?
+                    WHERE job_id=? AND sample_id IN ({placeholders}) AND status='pending'""",
+                (module_id, job_id, *sample_ids, utc_now(), job_id, *sample_ids),
+            )
+            increment_module_counts(self.connection, job_id, module_id, skipped=len(sample_ids))
+            return sample_ids
+
     def heartbeat(
         self,
         job_id: str,
@@ -363,6 +409,83 @@ class SchedulerDatabaseMixin:
             (utc_now(), job_id, module_id),
         )
         return result.rowcount
+
+    def fail_unsettled_module_samples_page(
+        self,
+        job_id: str,
+        module_id: str,
+        *,
+        after_sample_id: int | None = None,
+        limit: int = 1_000,
+    ) -> list[int]:
+        """Settle one page after a module exhausts its worker restart budget."""
+        limit = validate_page_limit(limit)
+        with self.transaction(immediate=True):
+            job = self.connection.execute(
+                "SELECT status,current_module_id FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise KeyError(f"job does not exist: {job_id}")
+            expected_job_status = "exporting" if module_id == "export" else "running"
+            if job["status"] != expected_job_status or job["current_module_id"] != module_id:
+                raise ValueError("only an active module can settle an unavailable worker")
+            repair_clause, repair_parameters = repair_target_clause(
+                self.connection, job_id, module_id,
+            )
+            query = """SELECT s.sample_id,s.relative_image_path,st.attempt
+                       FROM samples AS s JOIN sample_state AS st
+                         ON st.job_id=s.job_id AND st.sample_id=s.sample_id
+                       WHERE s.job_id=? AND s.in_processing_scope=1
+                         AND st.status IN ('pending','leased','prepared','request_started','response_staged')
+                         AND (st.current_module_id=? OR (?='caption' AND st.current_module_id IS NULL))""" + repair_clause
+            parameters: list[Any] = [job_id, module_id, module_id, *repair_parameters]
+            if after_sample_id is not None:
+                query += " AND s.sample_id>?"
+                parameters.append(after_sample_id)
+            query += " ORDER BY s.sample_id LIMIT ?"
+            parameters.append(limit)
+            rows = list(self.connection.execute(query, parameters))
+            if not rows:
+                return []
+            sample_ids = [int(row["sample_id"]) for row in rows]
+            placeholders = ",".join("?" for _ in sample_ids)
+            sample_status = "skipped" if module_id == "export" else "failed"
+            self.connection.execute(
+                f"""UPDATE sample_state SET current_module_id=?,status=?,lease_id=NULL,
+                    worker_instance_id=NULL,lease_expires_at=NULL,
+                    prepared_artifact_relative_path=NULL,prepared_artifact_sha256=NULL,updated_at=?
+                    WHERE job_id=? AND sample_id IN ({placeholders})""",
+                (module_id, sample_status, utc_now(), job_id, *sample_ids),
+            )
+            issue_delta = 0
+            for row in rows:
+                sample_id = int(row["sample_id"])
+                code = "module_worker_unavailable"
+                previous = self.connection.execute(
+                    """SELECT resolved_at FROM issues
+                       WHERE job_id=? AND sample_id=? AND module_id=? AND code=?""",
+                    (job_id, sample_id, module_id, code),
+                ).fetchone()
+                upsert_issue(self.connection, SampleIssue(
+                    issueId=hashlib.sha256(
+                        f"{job_id}\0{sample_id}\0{module_id}\0{code}".encode("utf-8")
+                    ).hexdigest(),
+                    jobId=job_id,
+                    sampleId=sample_id,
+                    relativeImagePath=str(row["relative_image_path"]),
+                    moduleId=module_id,  # type: ignore[arg-type]
+                    code=code,
+                    severity="error",
+                    blocking=True,
+                    retriable=False,
+                    message="Module worker remained unavailable after repeated abnormal exits; the sample was skipped.",
+                    attempt=int(row["attempt"]),
+                ))
+                issue_delta += int(previous is None or previous["resolved_at"] is not None)
+            increment_module_counts(
+                self.connection, job_id, module_id, failed=len(rows), issues=issue_delta,
+            )
+            return sample_ids
 
     def count_in_flight(self, job_id: str) -> int:
         return int(self.connection.execute(
@@ -624,6 +747,47 @@ class SchedulerDatabaseMixin:
                 self.connection, job_id, module_id, failed=1, issues=issue_delta,
             )
 
+    def skip_leased_sample_with_issue(
+        self,
+        job_id: str,
+        module_id: str,
+        sample_id: int,
+        *,
+        lease_id: str,
+        issue: SampleIssue,
+    ) -> None:
+        """Retain an Export validation failure while omitting its new artifacts."""
+        if (
+            module_id != "export"
+            or issue.jobId != job_id
+            or issue.sampleId != sample_id
+            or issue.moduleId != module_id
+        ):
+            raise ValueError("issue identity does not match the skipped Export lease")
+        with self.transaction(immediate=True):
+            previous = self.connection.execute(
+                """SELECT resolved_at FROM issues
+                   WHERE job_id=? AND sample_id=? AND module_id=? AND code=?""",
+                (job_id, sample_id, module_id, issue.code),
+            ).fetchone()
+            result = self.connection.execute(
+                """UPDATE sample_state SET status='skipped',lease_id=NULL,worker_instance_id=NULL,
+                   lease_expires_at=NULL,prepared_artifact_relative_path=NULL,
+                   prepared_artifact_sha256=NULL,updated_at=?
+                   WHERE job_id=? AND sample_id=? AND current_module_id='export'
+                     AND status='leased' AND lease_id=?""",
+                (utc_now(), job_id, sample_id, lease_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("Export skip does not belong to an active lease")
+            upsert_issue(self.connection, issue)
+            issue_delta = int(previous is None or previous["resolved_at"] is not None)
+            # `failed` reports invalid Export inputs; the sample state is
+            # `skipped` so commit does not expect an artifact for it.
+            increment_module_counts(
+                self.connection, job_id, module_id, failed=1, issues=issue_delta,
+            )
+
     def return_lease_to_pending(self, job_id: str, sample_id: int, *, lease_id: str) -> None:
         result = self.connection.execute(
             """UPDATE sample_state SET status='pending',lease_id=NULL,worker_instance_id=NULL,lease_expires_at=NULL,
@@ -648,21 +812,25 @@ class SchedulerDatabaseMixin:
         params.append(limit)
         return list(self.connection.execute(query, params))
 
-    def mark_interrupted(self, job_id: str) -> None:
+    def mark_interrupted(self, job_id: str, *, allow_failed: bool = False) -> None:
         """Freeze one active job for manual recovery, preserving its resume target.
 
         `cancelling` keeps draining and an already interrupted job must not
         overwrite `resume_status` with 'interrupted' on a second startup pass;
         both are excluded here to match `decide_startup_recovery`.
         """
-        placeholders = ",".join("?" for _ in NON_INTERRUPTIBLE_JOB_STATUSES)
+        non_interruptible = tuple(
+            status for status in NON_INTERRUPTIBLE_JOB_STATUSES
+            if not allow_failed or status != "failed"
+        )
+        placeholders = ",".join("?" for _ in non_interruptible)
         self.connection.execute(
             f"""UPDATE jobs SET resume_status=CASE
                     WHEN status='paused' THEN COALESCE(resume_status,'running')
                     ELSE status
                 END,status='interrupted'
                 WHERE job_id=? AND status NOT IN ({placeholders})""",
-            (job_id, *NON_INTERRUPTIBLE_JOB_STATUSES),
+            (job_id, *non_interruptible),
         )
 
     def pause_active_module(self, job_id: str, module_id: str, *, active_status: str) -> None:

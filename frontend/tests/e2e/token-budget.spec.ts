@@ -1,4 +1,4 @@
-import { clearRouteFailure, expect, failRoute, holdRoute, makeSnapshot, mutationsFor, openApp, setJobSnapshot, test } from "./mockApi";
+import { clearRouteFailure, expect, failRoute, holdRoute, makeSnapshot, mutationsFor, openApp, openPrecheck, openSetup, setJobSnapshot, test } from "./mockApi";
 
 test.describe("v10 Token Budget configuration", () => {
   test("starts a v10 draft with the default tokenizer budget and prompt route", async ({ page, api }) => {
@@ -22,8 +22,9 @@ test.describe("v10 Token Budget configuration", () => {
     await page.getByLabel("Short (%)", { exact: true }).fill("20");
     await page.getByLabel("Medium (%)", { exact: true }).fill("30");
     await page.getByLabel("Long (%)", { exact: true }).fill("50");
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\v10-budget");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
 
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
@@ -44,8 +45,9 @@ test.describe("v10 Token Budget configuration", () => {
     await page.locator(".workflow-rail").getByRole("button", { name: /Token Budget/ }).click();
     await page.getByRole("checkbox", { name: "Enable Token Budget" }).uncheck();
     await expect(page.getByLabel("Maximum training tokens", { exact: true })).toBeDisabled();
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\disabled-budget");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     expect((mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: { tokenBudget: unknown } }).config.tokenBudget).toEqual({ enabled: false, maxTokens: 512, resourceId: "tokenizer-qwen3-0.6b-anima-v1" });
@@ -59,8 +61,9 @@ test.describe("v10 Token Budget configuration", () => {
     const maximum = page.getByLabel("Maximum training tokens", { exact: true });
     await expect(maximum).toHaveAttribute("max", "262144");
     await maximum.fill("50000");
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\krea-budget");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     expect((mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: { tokenBudget: unknown } }).config.tokenBudget).toEqual({ enabled: true, maxTokens: 50000, resourceId: "tokenizer-qwen3-vl-4b-krea2-v1" });

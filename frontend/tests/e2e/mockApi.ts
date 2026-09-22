@@ -58,6 +58,7 @@ export type ApiScenario = {
   jobs: JobListPage;
   snapshots: Map<string, JobSnapshot>;
   preflight: PreflightSummary;
+  preflightCancelled: boolean;
   countReview: CountReviewPage;
   countReviewRequests: number[];
   recommendationRequests: number;
@@ -379,6 +380,7 @@ export function createApiScenario(): ApiScenario {
     jobs: { jobs: [], nextAfterCreatedAt: null, nextAfterJobId: null },
     snapshots: new Map([[DEFAULT_JOB_ID, makeSnapshot()]]),
     preflight: makePreflight(),
+    preflightCancelled: false,
     countReview: makeCountReview(),
     countReviewRequests: [],
     recommendationRequests: 0,
@@ -518,9 +520,16 @@ async function handleApiRequest(scenario: ApiScenario, route: Route, pathname: s
   const method = route.request().method();
   const key = routeKey(method, pathname);
   const body = method === "GET" ? undefined : recordMutation(scenario, route, pathname);
-  const hold = scenario.holds.get(key);
+  // Keep legacy preflight assertions/fixtures working while the production UI
+  // uses the asynchronous endpoint.  The actual request remains observable
+  // under its new path as well.
+  const legacyPreflightPath = pathname === "/api/jobs/preflight/async" ? "/api/jobs/preflight" : pathname;
+  if (method === "POST" && pathname === "/api/jobs/preflight/async") {
+    scenario.mutations.push({ method, path: legacyPreflightPath, body });
+  }
+  const hold = scenario.holds.get(key) ?? scenario.holds.get(routeKey(method, legacyPreflightPath));
   if (hold) await hold.promise;
-  const failure = scenario.failures.get(key);
+  const failure = scenario.failures.get(key) ?? scenario.failures.get(routeKey(method, legacyPreflightPath));
   if (failure) {
     await fulfillJson(route, { detail: failure.detail }, failure.status);
     return;
@@ -631,7 +640,7 @@ async function handleApiRequest(scenario: ApiScenario, route: Route, pathname: s
   }
   if (method === "GET" && pathname === "/api/jobs") return fulfillJson(route, scenario.jobs);
 
-  if (method === "POST" && pathname === "/api/jobs/preflight") {
+  if (method === "POST" && (pathname === "/api/jobs/preflight" || pathname === "/api/jobs/preflight/async")) {
     const config = (body as { config?: { ocr?: { enabled?: boolean } } } | undefined)?.config;
     const ocr = scenario.resources.resources.find((item) => item.kind === "ocr-model" && item.resourceId === "ocr-ppocrv5-server-paddle-v1");
     if (config?.ocr?.enabled === true && !ocr?.available) {
@@ -653,7 +662,54 @@ async function handleApiRequest(scenario: ApiScenario, route: Route, pathname: s
       : snapshotFor(scenario, scenario.preflight.jobId);
     scenario.snapshots.set(scenario.preflight.jobId, snapshot);
     updateJobState(snapshot, "ready");
+    if (pathname === "/api/jobs/preflight/async") {
+      return fulfillJson(route, {
+        jobId: scenario.preflight.jobId,
+        status: "queued",
+        checkedFiles: 0,
+        totalFiles: scenario.preflight.sampleCount,
+        error: null,
+        summary: null,
+        updatedAt: TIMESTAMP,
+        lastEventId: 0,
+      });
+    }
     return fulfillJson(route, scenario.preflight);
+  }
+
+  const preflightProgressMatch = pathname.match(/^\/api\/jobs\/preflight\/([^/]+)\/progress$/);
+  const preflightCancelMatch = pathname.match(/^\/api\/jobs\/preflight\/([^/]+)\/cancel$/);
+  if (method === "POST" && preflightCancelMatch) {
+    scenario.preflightCancelled = true;
+    return fulfillJson(route, { jobId: decodeURIComponent(preflightCancelMatch[1]), cancelled: true });
+  }
+  if (method === "GET" && preflightProgressMatch) {
+    const jobId = decodeURIComponent(preflightProgressMatch[1]);
+    const snapshot = snapshotFor(scenario, jobId);
+    if (scenario.preflightCancelled) {
+      updateJobState(snapshot, "draft");
+      return fulfillJson(route, {
+        jobId,
+        status: "cancelled",
+        checkedFiles: 0,
+        totalFiles: scenario.preflight.sampleCount,
+        error: "preflight cancelled",
+        summary: null,
+        updatedAt: TIMESTAMP,
+        lastEventId: 0,
+      });
+    }
+    updateJobState(snapshot, "ready");
+    return fulfillJson(route, {
+      jobId,
+      status: "completed",
+      checkedFiles: scenario.preflight.sampleCount,
+      totalFiles: scenario.preflight.sampleCount,
+      error: null,
+      summary: { ...scenario.preflight, jobId },
+      updatedAt: TIMESTAMP,
+      lastEventId: 0,
+    });
   }
 
   const tokenBudgetReviewMatch = pathname.match(/^\/api\/jobs\/([^/]+)\/token-budget\/reviews$/);
@@ -890,6 +946,26 @@ async function handleApiRequest(scenario: ApiScenario, route: Route, pathname: s
     return fulfillJson(route, { pinned: snapshot.job.pinned });
   }
 
+  const deleteHistoryMatch = pathname.match(/^\/api\/jobs\/([^/]+)\/delete-history$/);
+  if (deleteHistoryMatch && method === "POST") {
+    const jobId = decodeURIComponent(deleteHistoryMatch[1]);
+    const target = scenario.snapshots.get(jobId);
+    scenario.snapshots.delete(jobId);
+    scenario.jobs = {
+      ...scenario.jobs,
+      jobs: scenario.jobs.jobs.filter((item) => item.jobId !== jobId),
+    };
+    if (target?.job.parentJobId) {
+      const parent = scenario.snapshots.get(target.job.parentJobId);
+      if (parent) parent.repairChildren = parent.repairChildren.filter((child) => child.jobId !== jobId);
+    }
+    return fulfillJson(route, {
+      jobId,
+      deletedControlRecord: true,
+      preserved: { dataset: true, exports: true, backup: true },
+    });
+  }
+
   const discardMatch = pathname.match(/^\/api\/jobs\/([^/]+)\/discard$/);
   if (discardMatch && method === "POST") {
     const jobId = decodeURIComponent(discardMatch[1]);
@@ -957,6 +1033,14 @@ export async function openApp(page: Page, options: OpenAppOptions = {}): Promise
   }
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Anima Dataset Tool" })).toBeVisible();
+}
+
+export async function openPrecheck(page: Page): Promise<void> {
+  await page.locator(".workflow-rail").getByRole("button", { name: /Submission checks/ }).click();
+}
+
+export async function openSetup(page: Page): Promise<void> {
+  await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and configuration/ }).click();
 }
 
 export const test = base.extend<{ api: ApiScenario }>({

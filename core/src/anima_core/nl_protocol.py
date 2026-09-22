@@ -53,6 +53,7 @@ class NlOutcomeV1:
     retriable: bool
     httpAttempts: int
     observation: CountObservationV1 | None = None
+    message: str | None = None
 
 
 def _valid_usage(value: object) -> bool:
@@ -112,14 +113,14 @@ def parse_outcomes(
                     raise NlProtocolError("requested NL observation status is invalid")
             outcomes.append(NlOutcomeV1(
                 item["sampleId"], item["leaseId"], item["relativeImagePath"],
-                validate_nl(item["nl"]), None, False, item["httpAttempts"], observation,
+                validate_nl(item["nl"]), None, False, item["httpAttempts"], observation, None,
             ))
         elif item["payloadType"] == "nl_issue":
             if set(item) != common | {"code", "severity", "blocking", "retriable", "message", "httpAttempts"} or not isinstance(item["code"], str) or item["severity"] != "error" or item["blocking"] is not True or type(item["retriable"]) is not bool or not isinstance(item["message"], str) or type(item["httpAttempts"]) is not int or not 0 <= item["httpAttempts"] <= 5:
                 raise NlProtocolError("NL issue fields are invalid")
             outcomes.append(NlOutcomeV1(
                 item["sampleId"], item["leaseId"], item["relativeImagePath"],
-                None, item["code"], item["retriable"], item["httpAttempts"], None,
+                None, item["code"], item["retriable"], item["httpAttempts"], None, item["message"],
             ))
         else:
             raise NlProtocolError("NL outcome type is invalid")

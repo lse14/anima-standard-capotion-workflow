@@ -51,6 +51,10 @@ export type JobSnapshot = {
     configSchemaVersion: number;
     apiBudgetRevision: number; pinned: boolean; configHash: string; manifestSchemaVersion: number;
     parentJobId: string | null; createdAt: string; startedAt: string | null; cancelRequestedAt: string | null; finishedAt: string | null;
+    frozenConfig?: Record<string, unknown>;
+    apiRuntime?: { revision: number; providerLabel: string; endpoint: string; model: string; backupModel: string | null; jsonMode: string; credentialRef: string; policy: Record<string, unknown>; appliedAt: string } | null;
+    apiRuntimePending?: { revision: number; providerLabel: string; endpoint: string; model: string; backupModel: string | null; jsonMode: string; credentialRef: string; policy: Record<string, unknown>; appliedAt: string } | null;
+    apiConfigRevision?: number;
   };
   moduleOrder: ReadonlyArray<PipelineModuleId>;
   modules: ReadonlyArray<{ module_id: string; status: string; completed: number; failed: number; skipped: number; total: number; issue_count: number }>;
@@ -58,8 +62,8 @@ export type JobSnapshot = {
   captionDiagnostics: ReadonlyArray<{ code: string; severity: string; count: number }>;
   ocrDiagnostics: ReadonlyArray<{ code: string; severity: string; count: number }>;
   events: ReadonlyArray<{ event_id: number; module_id: string; status: string; completed: number; total: number; attempt: number; message: string | null }>;
-  issues: ReadonlyArray<{ issue_id: string; sample_id: number; module_id: string; code: string; severity: string; message: string; retriable: number; attempt: number; repair_start_module?: string; field_errors_json?: string }>;
-  exportSummary: null | { format: "json" | "flat_txt" | "both"; commitStatus: string; scanned: number; valid: number; invalid: number; exported: number; skipped: number; issueCount: number; issuesPageEndpoint: string; convertedSamples: number; conversions: Record<string, number> };
+  issues: ReadonlyArray<{ issue_id: string; sample_id: number; relative_image_path?: string; module_id: string; code: string; severity: string; message: string; retriable: number; attempt: number; repair_start_module?: string; field_errors_json?: string }>;
+  exportSummary: null | { format: "json" | "flat_txt" | "both"; commitStatus: string; scanned: number; valid: number; invalid: number; exported: number; skipped: number; issueCount: number; issuesPageEndpoint: string; convertedSamples: number; conversions: Record<string, number>; unlabeled: number; unlabeledFolder: string | null };
   repairPreview: { eligibleTargetCount: number; estimatedApiRequests: number } | null;
   repairChildren: ReadonlyArray<{
     jobId: string; status: string; currentModuleId: string | null; sampleCount: number;
@@ -118,11 +122,30 @@ export type ResourceCatalogResponse = {
   defaults: ResourceDefaults;
   resources: ResourceEntry[];
   invalidResources: ReadonlyArray<{ relativePath: string; reason: string }>;
+  capabilities?: {
+    policy: { status: "available" | "missing" | "invalid"; runtimeId: string };
+    qualityStack: { status: "available" | "missing" | "invalid"; resourceId: string };
+  };
 };
 
 export type NlProfile = {
   profileId: string; endpoint: string; model: string; backupModel: string | null;
-  apiCredentialRef: string; systemPrompt: string; apiPolicy: Record<string, unknown>; hasCredential: boolean;
+  apiCredentialRef: string; credentialRef?: string; systemPrompt: string; apiPolicy: Record<string, unknown>;
+  name?: string; protocol?: "openai_chat_completions"; providerLabel?: string; jsonMode?: "prompt_only" | "json_object";
+  policy?: Record<string, unknown>; revision?: number; updatedAt?: string; hasCredential: boolean;
+};
+export type NlApiConfigUpdate = {
+  expectedTaskRevision: number;
+  expectedProfileRevision: number;
+  profileId: string;
+  protocol?: "openai_chat_completions";
+  providerLabel?: string;
+  endpoint: string;
+  model: string;
+  backupModel: string | null;
+  credentialRef: string;
+  jsonMode?: "prompt_only" | "json_object";
+  policy: Record<string, unknown>;
 };
 export type NlPresetType = "general" | "style" | "character";
 export type NlPromptPresetSummary = {
@@ -162,6 +185,18 @@ export type PreflightSummary = {
   projection: { format?: string; inScopeSamples?: number; retainedSamples?: number; jsonCreate?: number; jsonOverwrite?: number; jsonDelete?: number; txtCreate?: number; txtOverwrite?: number; txtDelete?: number };
   estimate: { existingAnnotationFiles?: number; existingAnnotationBytes?: number; averageAnnotationBytes?: number; backupUpperBoundBytes?: number; incrementalWriteBytes?: number };
   api: { candidateCount?: number; minRequests?: number; maxPrimaryRequests?: number; maxWithBackupRequests?: number; httpAttemptBudget?: number; estimatedUploadBytes?: number };
+};
+
+export type PreflightProgressStatus = "queued" | "preflighting" | "completed" | "failed" | "cancelled";
+export type PreflightProgress = {
+  jobId: string;
+  status: PreflightProgressStatus;
+  checkedFiles: number;
+  totalFiles: number;
+  error: string | null;
+  summary: PreflightSummary | null;
+  updatedAt: string;
+  lastEventId: number;
 };
 
 export type CountValue = "solo" | "duo" | "trio" | "group";
@@ -288,7 +323,7 @@ export function fetchDefaultNlPrompt(promptVersion?: string): Promise<DefaultNlP
   return request(`/api/nl/default-prompt${query}`);
 }
 
-export function listNlProfiles(): Promise<{ profiles: NlProfile[] }> { return request("/api/nl/profiles"); }
+export function listNlProfiles(): Promise<{ defaultProfileId: string | null; profiles: NlProfile[] }> { return request("/api/nl/profiles"); }
 export function listNlPromptPresets(): Promise<{ presets: NlPromptPresetSummary[] }> { return request("/api/nl/prompt-presets"); }
 export function getNlPromptPreset(presetId: string): Promise<NlPromptPresetDetail> {
   return request(`/api/nl/prompt-presets/${encodeURIComponent(presetId)}`);
@@ -324,6 +359,24 @@ export function selectLocalPath(purpose: PathPickerPurpose, currentPath: string 
 export function saveNlProfile(profile: NlProfile): Promise<NlProfile> {
   const { profileId, hasCredential: _hasCredential, ...body } = profile;
   return request(`/api/nl/profiles/${encodeURIComponent(profileId)}`, { method: "PUT", body: JSON.stringify(body) });
+}
+export function setNlProfileDefault(profileId: string, revision?: number): Promise<{ defaultProfileId: string }> {
+  return request(`/api/nl/profiles/${encodeURIComponent(profileId)}/default`, {
+    method: "POST", body: JSON.stringify(revision === undefined ? {} : { revision }),
+  });
+}
+export function copyNlProfile(profileId: string, targetProfileId: string, name?: string): Promise<NlProfile> {
+  return request(`/api/nl/profiles/${encodeURIComponent(profileId)}/copy`, {
+    method: "POST", body: JSON.stringify({ profileId: targetProfileId, ...(name ? { name } : {}) }),
+  });
+}
+export function deleteNlProfile(profileId: string): Promise<{ deleted: boolean }> {
+  return request(`/api/nl/profiles/${encodeURIComponent(profileId)}`, { method: "DELETE" });
+}
+export function updateRunningNlApiConfig(jobId: string, body: NlApiConfigUpdate): Promise<{
+  taskRevision: number; profileRevision: number; apiRuntime: NonNullable<JobSnapshot["job"]["apiRuntime"]>; effective: "next_batch";
+}> {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/nl/api-config`, { method: "PUT", body: JSON.stringify(body) });
 }
 export function saveNlSecret(reference: string, secret: string): Promise<{ stored: boolean }> {
   return request(`/api/nl/credentials/${encodeURIComponent(reference)}`, { method: "PUT", body: JSON.stringify({ secret }) });
@@ -367,6 +420,15 @@ export function manualNlWrite(jobId: string, body: ManualNlSelector & { nl: stri
   });
 }
 export function preflightJob(body: CreateJobRequest): Promise<PreflightSummary> { return request("/api/jobs/preflight", { method: "POST", body: JSON.stringify(body) }); }
+export function startPreflight(body: CreateJobRequest): Promise<PreflightProgress> {
+  return request("/api/jobs/preflight/async", { method: "POST", body: JSON.stringify(body) });
+}
+export function getPreflightProgress(jobId: string, signal?: AbortSignal): Promise<PreflightProgress> {
+  return request(`/api/jobs/preflight/${encodeURIComponent(jobId)}/progress`, { signal });
+}
+export function cancelPreflight(jobId: string): Promise<{ jobId: string; cancelled: boolean }> {
+  return request(`/api/jobs/preflight/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+}
 export function confirmWorkspace(jobId: string, confirmedRebuild: boolean): Promise<{ jobId: string; status: string; datasetRoot: string; overlayRoot: string }> {
   return request(`/api/jobs/${encodeURIComponent(jobId)}/confirm-workspace`, { method: "POST", body: JSON.stringify({ confirmed: true, confirmedRebuild }) });
 }
@@ -385,6 +447,13 @@ export function restoreOriginalAnnotations(jobId: string): Promise<{ jobId: stri
 export function cancelJob(jobId: string): Promise<{ status: string }> { return request(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }); }
 export function setJobPin(jobId: string, pinned: boolean): Promise<{ pinned: boolean }> { return request(`/api/jobs/${encodeURIComponent(jobId)}/pin`, { method: "PUT", body: JSON.stringify({ pinned }) }); }
 export function discardJob(jobId: string): Promise<{ jobId: string; overlayDeleted: boolean }> { return request(`/api/jobs/${encodeURIComponent(jobId)}/discard`, { method: "POST", body: JSON.stringify({ confirmed: true }) }); }
+export function deleteCompletedHistory(jobId: string): Promise<{
+  jobId: string;
+  deletedControlRecord: boolean;
+  preserved: { dataset: boolean; exports: boolean; backup: boolean };
+}> {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/delete-history`, { method: "POST", body: JSON.stringify({ confirmed: true }) });
+}
 
 export function listCountReview(
   jobId: string,

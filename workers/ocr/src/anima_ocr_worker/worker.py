@@ -16,6 +16,7 @@ from .image import (
     OcrImageTooLargeError,
     OcrSourceFingerprintError,
     decode_and_verify,
+    image_exceeds_limits,
     verify_source_fingerprint,
 )
 from .model import ModelFactory, OcrModelError, PaddleOcrModel, create_paddle_engine, set_offline_environment
@@ -291,6 +292,24 @@ def _oversize_failure(item: OcrWorkItem, width: int, height: int) -> dict[str, o
     }
 
 
+def _decode_failure(item: OcrWorkItem, error: OcrImageDecodeError) -> dict[str, object]:
+    """Preserve an oversize classification when header parsing reports dimensions."""
+    if (
+        type(error.width) is int
+        and type(error.height) is int
+        and error.width > 0
+        and error.height > 0
+        and image_exceeds_limits(error.width, error.height)
+    ):
+        return _oversize_failure(item, error.width, error.height)
+    return _inference_failure(
+        item,
+        error.width or 1,
+        error.height or 1,
+        message=IMAGE_DECODE_FAILURE_MESSAGE,
+    )
+
+
 class OcrWorker:
     def __init__(self, *, model_factory: ModelFactory = create_paddle_engine) -> None:
         self._model_factory = model_factory
@@ -356,12 +375,7 @@ class OcrWorker:
         except OcrImageTooLargeError as exc:
             return _oversize_failure(item, exc.width, exc.height)
         except OcrImageDecodeError as exc:
-            return _inference_failure(
-                item,
-                exc.width or 1,
-                exc.height or 1,
-                message=IMAGE_DECODE_FAILURE_MESSAGE,
-            )
+            return _decode_failure(item, exc)
         try:
             results = self.model.predict(decoded.image)
             if len(results) != 1:
@@ -460,12 +474,7 @@ class OcrWorker:
             except OcrImageTooLargeError as exc:
                 outcomes_by_identity[(item.sample_id, item.lease_id)] = _oversize_failure(item, exc.width, exc.height)
             except OcrImageDecodeError as exc:
-                outcomes_by_identity[(item.sample_id, item.lease_id)] = _inference_failure(
-                    item,
-                    exc.width or 1,
-                    exc.height or 1,
-                    message=IMAGE_DECODE_FAILURE_MESSAGE,
-                )
+                outcomes_by_identity[(item.sample_id, item.lease_id)] = _decode_failure(item, exc)
 
         predictions: list[object | None] = []
         if decoded_items:

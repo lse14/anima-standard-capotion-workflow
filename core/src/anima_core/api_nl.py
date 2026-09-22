@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter
@@ -13,7 +14,9 @@ from .api_models import (
     _NlManualWriteBody,
     _NlModelDiscoveryBody,
     _NlPromptPresetBody,
+    _ProfileCopyBody,
     _NlTestMessageBody,
+    _NlApiConfigBody,
     _ProfileBody,
     _SecretBody,
 )
@@ -41,12 +44,22 @@ def _profile_response(profile: NlApiProfile, *, credentials: DpapiCredentialStor
         has_credential = False
     return {
         "profileId": profile.profileId,
+        "name": profile.name or profile.profileId,
+        "protocol": profile.protocol,
+        "providerLabel": profile.providerLabel,
         "endpoint": profile.endpoint,
         "model": profile.model,
         "backupModel": profile.backupModel,
+        "credentialRef": profile.apiCredentialRef,
+        # Legacy aliases remain response-only so existing local clients can
+        # migrate without reintroducing prompt data into the profile file.
         "apiCredentialRef": profile.apiCredentialRef,
-        "systemPrompt": profile.systemPrompt,
-        "apiPolicy": profile.apiPolicy,
+        "jsonMode": profile.jsonMode,
+        "policy": profile.policy,
+        "apiPolicy": profile.policy,
+        "revision": profile.revision,
+        "updatedAt": profile.updatedAt,
+        "systemPrompt": "",
         "hasCredential": has_credential,
     }
 
@@ -210,23 +223,89 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
             profiles = context.profile_store.load_all()
         except NlProfileError as exc:
             raise bad_request(exc) from exc
-        return {"profiles": [_profile_response(profile, credentials=context.credential_store) for profile in profiles]}
+        return {
+            "defaultProfileId": context.profile_store.default_profile_id(),
+            "profiles": [_profile_response(profile, credentials=context.credential_store) for profile in profiles],
+        }
 
     @router.put("/api/nl/profiles/{profile_id}")
     def save_nl_profile(profile_id: str, body: _ProfileBody) -> dict[str, object]:
         try:
-            profile = NlApiProfile.from_dict({"profileId": profile_id, **body.model_dump()})
-            context.profile_store.save(profile)
-            return _profile_response(profile, credentials=context.credential_store)
+            raw = body.model_dump(exclude_none=True)
+            credential = raw.get("credentialRef") or raw.get("apiCredentialRef")
+            policy = raw.get("policy") if raw.get("policy") is not None else raw.get("apiPolicy", {})
+            # Normalize legacy aliases before NlApiProfile.from_dict().  The
+            # Pydantic body keeps compatibility defaults, but those defaults
+            # must not make a schema-2 request look like a legacy profile.
+            payload = {
+                key: value for key, value in raw.items()
+                if key not in {"apiCredentialRef", "apiPolicy", "systemPrompt"}
+            }
+            payload.update({"credentialRef": credential, "policy": policy})
+            expected = payload.pop("revision", None)
+            profile = NlApiProfile.from_dict({"profileId": profile_id, **payload})
+            saved = context.profile_store.save(profile, expected_revision=expected)
+            return _profile_response(saved, credentials=context.credential_store)
+        except NlProfileError as exc:
+            if str(exc) == "profile_revision_conflict":
+                raise conflict(exc) from exc
+            raise bad_request(exc) from exc
+
+    @router.post("/api/nl/profiles/{profile_id}/default")
+    def set_default_nl_profile(profile_id: str, body: _ProfileBody | None = None) -> dict[str, object]:
+        expected = body.revision if body is not None else None
+        try:
+            context.profile_store.set_default(profile_id, expected_revision=expected)
+            return {"defaultProfileId": profile_id}
+        except NlProfileError as exc:
+            if str(exc) == "profile_revision_conflict":
+                raise conflict(exc) from exc
+            raise bad_request(exc) from exc
+
+    @router.post("/api/nl/profiles/{profile_id}/copy")
+    def copy_nl_profile(profile_id: str, body: _ProfileCopyBody) -> dict[str, object]:
+        try:
+            source = next(item for item in context.profile_store.load_all() if item.profileId == profile_id)
+            copied = NlApiProfile(
+                body.profileId, source.endpoint, source.model, source.backupModel,
+                source.apiCredentialRef, "", source.policy,
+                body.name or f"{source.name or source.profileId} copy", source.protocol,
+                source.providerLabel, source.jsonMode, 1, "",
+            )
+            saved = context.profile_store.save(copied)
+            return _profile_response(saved, credentials=context.credential_store)
+        except StopIteration as exc:
+            raise not_found(exc) from exc
         except NlProfileError as exc:
             raise bad_request(exc) from exc
 
     @router.delete("/api/nl/profiles/{profile_id}")
     def delete_nl_profile(profile_id: str) -> dict[str, bool]:
         try:
+            database = StateDatabase.open(context.database_path)
+            try:
+                profiles = {item.profileId: item for item in context.profile_store.load_all()}
+                if profile_id in profiles and len(profiles) > 1 and context.profile_store.default_profile_id() != profile_id:
+                    rows = database.connection.execute(
+                        "SELECT job_id,status FROM jobs WHERE status NOT IN ('succeeded','succeeded_with_issues','discarded','cancelled_recoverable') "
+                        "AND instr(config_json, ?) > 0 ORDER BY job_id LIMIT 50",
+                        (f'\"apiProfileId\": \"{profile_id}\"',),
+                    ).fetchall()
+                    if rows:
+                        detail = {
+                            "code": "profile_in_use", "profileId": profile_id,
+                            "tasks": [{"jobId": str(row["job_id"]), "status": str(row["status"])} for row in rows],
+                        }
+                        raise RuntimeError(json.dumps(detail, separators=(",", ":")))
+            finally:
+                database.close()
             context.profile_store.delete(profile_id)
         except NlProfileError as exc:
+            if str(exc) in {"profile_last_one", "profile_default_in_use"}:
+                raise conflict(exc) from exc
             raise bad_request(exc) from exc
+        except RuntimeError as exc:
+            raise conflict(exc) from exc
         return {"deleted": True}
 
     @router.put("/api/nl/credentials/{reference}")
@@ -244,6 +323,17 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
         except CredentialStoreError as exc:
             raise bad_request(exc) from exc
         return {"deleted": True}
+
+    @router.put("/api/jobs/{job_id}/nl/api-config")
+    def update_running_nl_api_config(job_id: str, body: _NlApiConfigBody) -> dict[str, object]:
+        try:
+            return context.pipeline_service.update_nl_api_config(job_id, body.model_dump())
+        except KeyError as exc:
+            raise not_found(exc) from exc
+        except PipelineError as exc:
+            if str(exc) in {"api_task_revision_conflict", "profile_revision_conflict"}:
+                raise conflict(exc) from exc
+            raise bad_request(exc) from exc
 
     def nl_control(job_id: str, action: str, body: _AmountBody | _ConfirmBody | None = None) -> dict[str, Any]:
         if action in {"pause", "resume"}:
@@ -293,9 +383,9 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
     def manual_nl_retry(job_id: str, body: _NlManualRetryBody) -> dict[str, Any]:
         if not body.confirmed:
             raise bad_request(ValueError("manual NL retry requires explicit confirmation"))
-        released_parent_lock = False
+        released_parent_lock: str | None = None
         try:
-            released_parent_lock = context.preparation_service.release_lock_for_repair(job_id)
+            released_parent_lock = context.release_lock_for_repair(job_id)
             result = context.repair_service.prepare_manual_nl(
                 job_id, sample_id=body.sampleId, issue_id=body.issueId, confirmed=body.confirmed,
             )
@@ -312,16 +402,16 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
             raise not_found(exc) from exc
         except (RepairPreparationError, PipelineError, SchedulerError, ValueError) as exc:
             if released_parent_lock:
-                context.preparation_service.restore_lock_after_repair_failure(job_id)
+                context.restore_lock_after_repair_failure(job_id, released_parent_lock)
             raise bad_request(exc) from exc
 
     @router.post("/api/jobs/{job_id}/nl/manual-retry-batch")
     def manual_nl_retry_batch(job_id: str, body: _NlManualRetryBatchBody) -> dict[str, Any]:
         if not body.confirmed:
             raise bad_request(ValueError("manual NL retry requires explicit confirmation"))
-        released_parent_lock = False
+        released_parent_lock: str | None = None
         try:
-            released_parent_lock = context.preparation_service.release_lock_for_repair(job_id)
+            released_parent_lock = context.release_lock_for_repair(job_id)
             result = context.repair_service.prepare_manual_nl_batch(
                 job_id, issue_ids=body.issueIds, confirmed=body.confirmed,
             )
@@ -337,7 +427,7 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
             raise not_found(exc) from exc
         except (RepairPreparationError, PipelineError, SchedulerError, ValueError) as exc:
             if released_parent_lock:
-                context.preparation_service.restore_lock_after_repair_failure(job_id)
+                context.restore_lock_after_repair_failure(job_id, released_parent_lock)
             raise bad_request(exc) from exc
 
     @router.post("/api/jobs/{job_id}/nl/manual-write")
@@ -348,9 +438,9 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
             NlManualWriteService.validate_text(body.nl)
         except ValueError as exc:
             raise bad_request(exc) from exc
-        released_parent_lock = False
+        released_parent_lock: str | None = None
         try:
-            released_parent_lock = context.preparation_service.release_lock_for_repair(job_id)
+            released_parent_lock = context.release_lock_for_repair(job_id)
             result = context.repair_service.prepare_manual_nl(
                 job_id, sample_id=body.sampleId, issue_id=body.issueId, confirmed=body.confirmed, for_manual_write=True,
             )
@@ -379,7 +469,7 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
             raise not_found(exc) from exc
         except (RepairPreparationError, PipelineError, SchedulerError, ValueError) as exc:
             if released_parent_lock:
-                context.preparation_service.restore_lock_after_repair_failure(job_id)
+                context.restore_lock_after_repair_failure(job_id, released_parent_lock)
             raise bad_request(exc) from exc
 
     return router

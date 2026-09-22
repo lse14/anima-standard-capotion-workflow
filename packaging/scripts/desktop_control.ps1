@@ -16,6 +16,8 @@ $frontendRoot = Join-Path $projectRoot 'frontend\dist'
 $resourceRoot = Join-Path $projectRoot 'resource-library'
 $launcherRoot = Join-Path $projectRoot '.runtime-build\launcher'
 $installStatePath = Join-Path $projectRoot '.runtime-build\manifests\install-state.json'
+$hostScript = Join-Path $projectRoot 'packaging\scripts\webui_host.ps1'
+# The visible host delegates to the embedded command: -B -I -m anima_core.
 
 function Get-InstallationStateId([string]$InstallRoot) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($InstallRoot.ToLowerInvariant())
@@ -57,6 +59,9 @@ function Assert-ReleaseBundle {
     if (-not (Test-Path -LiteralPath (Join-Path $resourceRoot 'defaults.json') -PathType Leaf)) {
         throw "Project-local resource library is missing: $resourceRoot"
     }
+    if (-not (Test-Path -LiteralPath $hostScript -PathType Leaf)) {
+        throw "WebUI host script is missing: $hostScript"
+    }
     & $corePython -B -I -m anima_core --check-runtime
     if ($LASTEXITCODE -ne 0) { throw 'Distributed core runtime verification failed' }
 }
@@ -94,6 +99,21 @@ function Read-State {
     return $null
 }
 
+function Test-ProcessAlive([int]$ProcessId) {
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return -not $process.HasExited
+    } catch {
+        return $false
+    }
+}
+
+function Get-StateBackendPid([object]$State) {
+    if ($null -ne $State.PSObject.Properties['backendPid']) { return [int]$State.backendPid }
+    if ($null -ne $State.PSObject.Properties['pid']) { return [int]$State.pid }
+    return 0
+}
+
 function Write-State([object]$State) {
     New-Item -ItemType Directory -Force -Path $launcherRoot | Out-Null
     $temporary = "$statePath.part"
@@ -115,7 +135,8 @@ function Start-WebUi {
     $state = Read-State
     $listeners = @(Get-Listener $Port)
     if ($listeners.Count -gt 0) {
-        if ($null -ne $state -and $state.installRoot -eq $projectRoot -and $state.port -eq $Port -and ($listeners | Where-Object { $_.OwningProcess -eq [int]$state.pid })) {
+        $statePid = if ($null -ne $state) { Get-StateBackendPid $state } else { 0 }
+        if ($null -ne $state -and $state.installRoot -eq $projectRoot -and $state.port -eq $Port -and $statePid -gt 0 -and ($listeners | Where-Object { $_.OwningProcess -eq $statePid })) {
             Start-Process "http://127.0.0.1:$Port/"
             return
         }
@@ -128,27 +149,23 @@ function Start-WebUi {
     if ($null -ne $state) { Remove-Item -LiteralPath $statePath -Force }
     New-Item -ItemType Directory -Force -Path $launcherRoot | Out-Null
     $token = New-Token
-    $stdout = Join-Path $launcherRoot ("webui-{0}.stdout.log" -f $instanceId)
-    $stderr = Join-Path $launcherRoot ("webui-{0}.stderr.log" -f $instanceId)
-    $arguments = '-B -I -m anima_core --port {0} --static-root "{1}" --resource-root "{2}" --shutdown-token {3}' -f $Port, $frontendRoot, $resourceRoot, $token
-    $process = Start-Process -FilePath $corePython -ArgumentList $arguments -WorkingDirectory $runtimeRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $state = [ordered]@{ schemaVersion = 1; installRoot = $projectRoot; runtimeRoot = $runtimeRoot; pid = $process.Id; port = $Port; token = $token }
-    Write-State $state
+    $hostCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -ProjectRoot "{1}" -RuntimeRoot "{2}" -CorePython "{3}" -FrontendRoot "{4}" -ResourceRoot "{5}" -LauncherRoot "{6}" -StatePath "{7}" -InstanceId "{8}" -HostPid {9} -Port {10} -Token {11}' -f $hostScript, $projectRoot, $runtimeRoot, $corePython, $frontendRoot, $resourceRoot, $launcherRoot, $statePath, $instanceId, 0, $Port, $token
+    $hostProcess = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d', '/c', $hostCommand) -WorkingDirectory $projectRoot -WindowStyle Normal -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ([DateTime]::UtcNow -lt $deadline) {
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
-            $ownedListeners = @(Get-Listener $Port | Where-Object { $_.OwningProcess -eq $process.Id })
-            if ($health.status -eq 'ok' -and $ownedListeners.Count -gt 0) {
+            $state = Read-State
+            $backendPid = if ($null -ne $state) { Get-StateBackendPid $state } else { 0 }
+            if ($health.status -eq 'ok' -and $backendPid -gt 0 -and @(Get-Listener $Port | Where-Object { $_.OwningProcess -eq $backendPid }).Count -gt 0) {
                 Start-Process "http://127.0.0.1:$Port/"
                 return
             }
         } catch {}
+        if (-not (Test-ProcessAlive $hostProcess.Id) -and (Get-Listener $Port).Count -eq 0) { break }
         Start-Sleep -Milliseconds 250
     }
-    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
-    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
-    throw 'WebUI backend did not become healthy within 30 seconds; see launcher logs'
+    throw 'WebUI backend did not become healthy within 30 seconds; inspect the visible host CMD and launcher logs'
 }
 
 function Stop-WebUi {
@@ -160,7 +177,8 @@ function Stop-WebUi {
     $stateBelongsToInstallation = (
         ([string]$state.installRoot -eq [string]$projectRoot) -and
         (([int]$state.port) -eq $Port) -and
-        (([string]$state.token) -match '^[0-9a-f]{64}$')
+        (([string]$state.token) -match '^[0-9a-f]{64}$') -and
+        ((Get-StateBackendPid $state) -gt 0)
     )
     if (-not $stateBelongsToInstallation) {
         throw 'WebUI state file does not belong to this installation'
@@ -170,7 +188,8 @@ function Stop-WebUi {
         Remove-Item -LiteralPath $statePath -Force
         return
     }
-    if (-not ($listeners | Where-Object { $_.OwningProcess -eq [int]$state.pid })) {
+    $backendPid = Get-StateBackendPid $state
+    if (-not ($listeners | Where-Object { $_.OwningProcess -eq $backendPid })) {
         throw "Port $Port is no longer owned by this installation"
     }
     Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$Port/api/application/shutdown" -ContentType 'application/json' -Body (@{ token = [string]$state.token } | ConvertTo-Json -Compress) -TimeoutSec 10 | Out-Null

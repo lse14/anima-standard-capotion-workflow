@@ -12,7 +12,7 @@ import {
 function prepareManualNlIssue(api: Parameters<typeof setJobSnapshot>[0], jobId: string) {
   const snapshot = makeSnapshot({ jobId, status: "reviewing", currentModuleId: "nl" });
   snapshot.issues = [{
-    issue_id: "nl-manual-issue", sample_id: 17, module_id: "nl", code: "nl_image_missing",
+    issue_id: "nl-manual-issue", sample_id: 17, relative_image_path: "broken/image-17.png", module_id: "nl", code: "nl_image_missing",
     severity: "error", message: "Image is unavailable.", retriable: 0, attempt: 1,
   }];
   setJobSnapshot(api, snapshot);
@@ -23,6 +23,9 @@ test.describe("application shell characterization", () => {
     const retryJobId = "job-manual-retry";
     prepareManualNlIssue(api, retryJobId);
     await openApp(page, { jobId: retryJobId, language: "en" });
+    await page.getByRole("button", { name: "Failures", exact: true }).click();
+    await expect(page.getByText("broken/image-17.png")).toBeVisible();
+    await expect(page.getByText(/Existing TXT\/JSON remain untouched/)).toBeVisible();
 
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Retry NL API" }).click();
@@ -33,6 +36,7 @@ test.describe("application shell characterization", () => {
     const writeJobId = "job-manual-write";
     prepareManualNlIssue(api, writeJobId);
     await openApp(page, { jobId: writeJobId, language: "en" });
+    await page.getByRole("button", { name: "Failures", exact: true }).click();
     await page.getByPlaceholder("Manual NL text").fill("Manual caption.");
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Write NL" }).click();

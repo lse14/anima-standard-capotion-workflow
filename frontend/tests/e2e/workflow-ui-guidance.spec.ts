@@ -1,4 +1,4 @@
-import { expect, openApp, test } from "./mockApi";
+import { expect, openApp, openPrecheck, openSetup, test } from "./mockApi";
 
 async function expectNoHorizontalOverflow(page: Parameters<typeof openApp>[0]) {
   const size = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth }));
@@ -38,6 +38,21 @@ test.describe("workflow field guidance foundation", () => {
     await expect(tooltip).toBeVisible();
     await info.click();
     await expect(tooltip).toBeHidden();
+  });
+
+  test("documents the JSON and TXT input formats in Setup", async ({ page }) => {
+    for (const scenario of [
+      { language: "en" as const, title: "JSON / TXT input formats", pairing: "same-stem siblings", raw: "Raw E621 JSON", txt: "NL TXT supplies JSON nl" },
+      { language: "zh-CN" as const, title: "JSON / TXT 输入格式", pairing: "同 stem 兄弟文件", raw: "原始 E621 JSON", txt: "NL TXT 写入 JSON 的 nl" },
+    ]) {
+      await openApp(page, { language: scenario.language });
+      const help = page.locator('[data-input-format-help]');
+      await help.locator("summary").click();
+      await expect(help).toContainText(scenario.title);
+      await expect(help).toContainText(scenario.pairing);
+      await expect(help).toContainText(scenario.raw);
+      await expect(help).toContainText(scenario.txt);
+    }
   });
 });
 
@@ -97,8 +112,9 @@ test.describe("workflow guidance for remaining modules", () => {
     await expect(page.getByRole("tooltip")).toContainText("Recommended: Auto");
 
     await page.getByLabel("Enable OCR", { exact: true }).check();
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\guidance");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => page.getByRole("button", { name: "Preflight", exact: true }).getAttribute("aria-busy")).toBe("false");
     await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
@@ -147,11 +163,15 @@ test.describe("workflow guidance for remaining modules", () => {
       }
     }
     await page.locator(".workflow-rail").getByRole("button", { name: /Dropout/ }).click();
-    const dropDescriptionInfo = page.getByRole("button", { name: "Drop description information" }).first();
-    await expect(dropDescriptionInfo).toBeEnabled();
-    await dropDescriptionInfo.click();
+    const nlDropoutInfo = page.getByRole("button", { name: "NL dropout rate information" }).first();
+    await expect(nlDropoutInfo).toBeEnabled();
+    await nlDropoutInfo.click();
     await expect(page.getByRole("tooltip")).toContainText("Default: 0.7");
     await expect(page.getByRole("tooltip")).toContainText("Range: 0-1, step 0.01");
+    await expect(page.getByRole("tooltip")).toContainText("JSON nl");
+    const tagDropoutInfo = page.getByRole("button", { name: "Tag dropout rate information" }).first();
+    await tagDropoutInfo.click();
+    await expect(page.getByRole("tooltip")).toContainText("JSON tags");
   });
 
   test("explains the folder artist mapping independently from the Character preset", async ({ page }) => {

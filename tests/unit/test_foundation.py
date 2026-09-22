@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,19 +23,22 @@ from anima_core.db import (
     assert_database_outside_datasets,
     default_state_database_path,
 )
+from anima_core.db_schema import FINISHED_JOB_STATUSES, NON_INTERRUPTIBLE_JOB_STATUSES, TERMINAL_JOB_STATUSES
 from anima_core.manifest import ManifestBuilder, ManifestError
 from anima_core.overlay import BaselineView, OverlayError, OverlayLayout, WorkingAnnotationView
 from anima_core.path_safety import (
     PathSafetyError,
     canonicalize,
     detect_annotation_collisions,
+    atomic_write_bytes,
+    replace_with_sharing_retry,
     read_annotation_state,
     safe_relative_path,
     sha256_file,
     windows_compare,
     windows_key,
 )
-from anima_core.state_machine import InvalidTransition, can_discard, decide_startup_recovery, transition_module
+from anima_core.state_machine import InvalidTransition, can_discard, decide_startup_recovery, transition_job, transition_module
 from anima_core.workspace import prepare_dataset
 
 
@@ -75,6 +79,95 @@ def _job_row(job_id: str, dataset_root: Path) -> dict[str, object]:
 
 
 class FoundationTests(unittest.TestCase):
+    def test_partial_success_is_terminal_finished_and_not_recoverable(self) -> None:
+        self.assertIn("succeeded_with_issues", TERMINAL_JOB_STATUSES)
+        self.assertIn("succeeded_with_issues", NON_INTERRUPTIBLE_JOB_STATUSES)
+        self.assertIn("succeeded_with_issues", FINISHED_JOB_STATUSES)
+        self.assertEqual("succeeded_with_issues", transition_job("committing", "succeeded_with_issues"))
+        self.assertEqual(
+            ("succeeded_with_issues", False),
+            (decide_startup_recovery("succeeded_with_issues", None).nextStatus,
+             decide_startup_recovery("succeeded_with_issues", None).requiresUserConfirmation),
+        )
+
+    def test_atomic_write_retries_transient_windows_file_sharing_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sharing_error = PermissionError(32, "sharing violation")
+            sharing_error.winerror = 32
+            with patch(
+                "anima_core.path_safety.os.replace",
+                side_effect=[sharing_error, None],
+            ) as replace:
+                atomic_write_bytes(temporary, "sample.txt", b"ok")
+            self.assertEqual(2, replace.call_count)
+
+    def test_sharing_retry_is_windows_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.tmp"
+            destination = root / "destination.txt"
+            source.write_bytes(b"payload")
+            sharing_error = PermissionError(32, "sharing violation")
+            sharing_error.winerror = 32
+            with patch("anima_core.path_safety.os.name", "posix"), patch(
+                "anima_core.path_safety.os.replace",
+                side_effect=[sharing_error, None],
+            ) as replace:
+                with self.assertRaises(PermissionError):
+                    replace_with_sharing_retry(source, destination)
+            self.assertEqual(1, replace.call_count)
+
+    def test_sharing_retry_does_not_retry_non_sharing_permission_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.tmp"
+            destination = root / "destination.txt"
+            source.write_bytes(b"payload")
+            access_error = PermissionError(5, "access denied")
+            access_error.winerror = 5
+            with patch(
+                "anima_core.path_safety.os.replace",
+                side_effect=access_error,
+            ) as replace:
+                with self.assertRaises(PermissionError):
+                    replace_with_sharing_retry(source, destination)
+            self.assertEqual(1, replace.call_count)
+
+    def test_sharing_retry_raises_after_five_windows_sharing_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.tmp"
+            destination = root / "destination.txt"
+            source.write_bytes(b"payload")
+            sharing_error = PermissionError(32, "sharing violation")
+            sharing_error.winerror = 32
+            with patch(
+                "anima_core.path_safety.os.replace",
+                side_effect=[sharing_error] * 5,
+            ) as replace:
+                with self.assertRaises(PermissionError):
+                    replace_with_sharing_retry(source, destination)
+            self.assertEqual(5, replace.call_count)
+
+    def test_state_database_connection_can_be_used_by_api_worker_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = StateDatabase.open(Path(temporary) / "state.db")
+            try:
+                errors: list[BaseException] = []
+
+                def read_from_worker() -> None:
+                    try:
+                        database.connection.execute("SELECT 1").fetchone()
+                    except BaseException as exc:  # pragma: no cover - assertion below reports the failure
+                        errors.append(exc)
+
+                worker = threading.Thread(target=read_from_worker)
+                worker.start()
+                worker.join()
+                self.assertEqual([], errors)
+            finally:
+                database.close()
+
     def test_fresh_state_database_uses_schema4_without_a_job_profile_column(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = StateDatabase.open(Path(temporary) / "state.db")
@@ -324,6 +417,44 @@ class FoundationTests(unittest.TestCase):
             finally:
                 database.close()
 
+    def test_failed_sample_issue_is_retained_but_does_not_block_export_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = StateDatabase.open(root / "state.db")
+            try:
+                database.insert_job(_job_row("job-failed-gate", root))
+                database.insert_samples("job-failed-gate", [{
+                    "sample_id": 1, "relative_image_path": "1.png", "annotation_key": "1",
+                    "source": "e621", "in_processing_scope": True, "image_format": "png", "image_frame_count": 1,
+                    "original_txt_state": "missing_or_blank", "original_json_state": "missing_or_blank",
+                }])
+                database.upsert_issue(SampleIssue(
+                    issueId="failed-issue", jobId="job-failed-gate", sampleId=1,
+                    relativeImagePath="1.png", moduleId="caption", code="caption_failed",
+                    severity="error", blocking=True, retriable=False, message="caption failed", attempt=1,
+                ))
+                database.connection.execute(
+                    "UPDATE sample_state SET current_module_id='caption',status='failed' WHERE job_id=? AND sample_id=1",
+                    ("job-failed-gate",),
+                )
+                self.assertEqual(0, database.count_unresolved_blocking_issues("job-failed-gate"))
+                self.assertEqual(0, database.count_unresolved_blocking_issues("job-failed-gate", exclude_module_id="export"))
+                self.assertEqual(1, database.connection.execute(
+                    "SELECT COUNT(*) FROM issues WHERE job_id=? AND resolved_at IS NULL", ("job-failed-gate",)
+                ).fetchone()[0])
+            finally:
+                database.close()
+
+    def test_manifest_excludes_generated_unlabeled_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            Image.new("RGB", (2, 2), "white").save(source / "source.png")
+            generated = source / "_unlabeled" / "job-token" / "nested"
+            generated.mkdir(parents=True)
+            Image.new("RGB", (2, 2), "black").save(generated / "copy.png")
+            records = list(ManifestBuilder(source, recursive=True).iter_records())
+            self.assertEqual(["source.png"], [record.relativeImagePath for record in records])
+
     def test_preflight_projection_counts_split_create_overwrite_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -408,6 +539,14 @@ class FoundationTests(unittest.TestCase):
                     "cancelling", decide_startup_recovery("cancelling", None).nextStatus
                 )
                 self.assertFalse(decide_startup_recovery("cancelled_recoverable", None).requiresUserConfirmation)
+                pre_swap = decide_startup_recovery("committing", "staged")
+                self.assertEqual(("interrupted", True), (
+                    pre_swap.nextStatus, pre_swap.requiresUserConfirmation,
+                ))
+                post_swap = decide_startup_recovery("committing", "rollback_created")
+                self.assertEqual(("committing", False), (
+                    post_swap.nextStatus, post_swap.requiresUserConfirmation,
+                ))
             finally:
                 database.close()
 
@@ -502,6 +641,61 @@ class FoundationTests(unittest.TestCase):
             copied = prepare_dataset(source, destination, "full_copy", "job-2")
             self.assertTrue(copied.copied)
             self.assertTrue((destination / "nested" / "two.png").is_file())
+
+    def test_manifest_candidate_count_and_progress_count_images_once_including_bad_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            Image.new("RGB", (2, 2), "white").save(source / "one.png")
+            Image.new("RGB", (2, 2), "black").save(source / "two.jpg")
+            (source / "broken.webp").write_bytes(b"not an image")
+            (source / "one.txt").write_text("tags", encoding="utf-8")
+            (source / "one.json").write_text('{"nl":"description"}', encoding="utf-8")
+            (source / "notes.txt").write_text("not a sample", encoding="utf-8")
+            (source / "notes.json").write_text("{}", encoding="utf-8")
+            (source / "unsupported.gif").write_bytes(b"not counted")
+            database = StateDatabase.open(root / "state.db")
+            progress: list[tuple[int, int]] = []
+            try:
+                database.insert_job(_job_row("job-progress", source))
+                builder = ManifestBuilder(source, recursive=False)
+                self.assertEqual(3, builder.count_candidate_images())
+                manifest = builder.scan_into(
+                    database,
+                    "job-progress",
+                    total_files=3,
+                    on_progress=lambda checked, total: progress.append((checked, total)),
+                )
+                self.assertEqual(3, manifest.sampleCount)
+                self.assertEqual([(1, 3), (2, 3), (3, 3)], progress)
+                self.assertEqual(1, builder.image_issue_count)
+            finally:
+                database.close()
+
+    def test_manifest_progress_rejects_an_added_candidate_before_callback_exceeds_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            Image.new("RGB", (2, 2), "white").save(source / "one.png")
+            database = StateDatabase.open(root / "state.db")
+            try:
+                database.insert_job(_job_row("job-progress-change", source))
+                builder = ManifestBuilder(source, recursive=False)
+                total = builder.count_candidate_images()
+                Image.new("RGB", (2, 2), "black").save(source / "two.png")
+                callbacks: list[tuple[int, int]] = []
+                with self.assertRaisesRegex(ManifestError, "supported image set changed during scan"):
+                    builder.scan_into(
+                        database,
+                        "job-progress-change",
+                        total_files=total,
+                        on_progress=lambda checked, expected: callbacks.append((checked, expected)),
+                    )
+                self.assertEqual([(1, 1)], callbacks)
+            finally:
+                database.close()
 
     def test_manifest_ignores_internal_directories_while_full_copy_preserves_them(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

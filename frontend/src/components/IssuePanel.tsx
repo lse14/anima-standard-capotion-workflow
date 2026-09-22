@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 export type IssuePanelIssue = {
   issueId: string;
   sampleId: number;
+  relativeImagePath?: string;
   moduleId: string;
   code: string;
   message: string;
@@ -32,6 +33,13 @@ export type IssuePanelProps = {
     selectedNlCount: (selected: number) => string;
     nlWrite: string;
     nlWritePlaceholder: string;
+    workbenchTitle: string;
+    workbenchHelp: string;
+    moduleFilter: string;
+    filterAll: string;
+    noIssues: string;
+    samplePath: string;
+    retriable: string;
   };
   canRestore: boolean;
   canReprocess: boolean;
@@ -59,7 +67,10 @@ export function IssuePanel({
   const manualNlWriting = pendingActions.has("nl_manual_write");
   const [nlDrafts, setNlDrafts] = useState<Record<string, string>>({});
   const [selectedNlIssueIds, setSelectedNlIssueIds] = useState<Set<string>>(new Set());
-  const selectableNlIssues = canManualNl ? issues.filter((item) => item.moduleId === "nl" && !item.retriable) : [];
+  const [moduleFilter, setModuleFilter] = useState("");
+  const modules = Array.from(new Set(issues.map((item) => item.moduleId))).sort();
+  const visibleIssues = moduleFilter ? issues.filter((item) => item.moduleId === moduleFilter) : issues;
+  const selectableNlIssues = canManualNl ? visibleIssues.filter((item) => item.moduleId === "nl" && !item.retriable) : [];
   const selectedNlIssues = selectableNlIssues.filter((item) => selectedNlIssueIds.has(item.issueId));
   const allNlPageSelected = selectableNlIssues.length > 0 && selectedNlIssues.length === selectableNlIssues.length;
 
@@ -71,10 +82,14 @@ export function IssuePanel({
     setSelectedNlIssueIds(allNlPageSelected ? new Set() : new Set(selectableNlIssues.map((item) => item.issueId)));
   };
 
-  return <section className="issues-panel" aria-busy={restoring || repairing || manualNlRetrying || manualNlBatchRetrying || manualNlWriting}>
+  return <section className="issues-panel failure-issues" aria-busy={restoring || repairing || manualNlRetrying || manualNlBatchRetrying || manualNlWriting}>
     <div className="panel-heading">
-      <div><p className="eyebrow">{labels.issues}</p><h2>{labels.issues}</h2></div>
+      <div><p className="eyebrow">{labels.issues}</p><h2>{labels.workbenchTitle}</h2><p className="panel-help">{labels.workbenchHelp}</p></div>
       <span>{labels.shownRetriable(issues.length, retriableCount)}</span>
+    </div>
+    <div className="failure-toolbar">
+      <label>{labels.moduleFilter}<select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="">{labels.filterAll}</option>{modules.map((module) => <option key={module} value={module}>{module}</option>)}</select></label>
+      <dl className="failure-facts"><div><dt>{labels.issues}</dt><dd>{visibleIssues.length}</dd></div><div><dt>{labels.retriable}</dt><dd>{retriableCount}</dd></div></dl>
     </div>
     {selectableNlIssues.length > 0 && <div className="issue-batch-bar">
       <label className="checkbox"><input type="checkbox" checked={allNlPageSelected} disabled={manualNlRetrying || manualNlBatchRetrying || manualNlWriting} onChange={toggleNlPage} />{labels.selectNlPage}</label>
@@ -85,13 +100,14 @@ export function IssuePanel({
       <button className="secondary" type="button" disabled={atFirstPage} onClick={onFirstPage}>{labels.firstPage}</button>
       <button className="secondary" type="button" disabled={atLastPage} onClick={onNextPage}>{labels.nextPage}</button>
     </div>
-    <ul className="issue-list">{issues.map((item) => {
+    {visibleIssues.length === 0 && <p className="review-empty">{labels.noIssues}</p>}
+    <ul className="issue-list">{visibleIssues.map((item) => {
       const isNlManual = canManualNl && item.moduleId === "nl" && !item.retriable;
       const draft = nlDrafts[item.issueId] ?? "";
       return <li key={item.issueId}>
         <div className="issue-row-selection">
           {isNlManual && <label className="checkbox"><input type="checkbox" checked={selectedNlIssueIds.has(item.issueId)} disabled={manualNlRetrying || manualNlBatchRetrying || manualNlWriting} onChange={(event) => setSelectedNlIssueIds((current) => { const next = new Set(current); if (event.target.checked) next.add(item.issueId); else next.delete(item.issueId); return next; })} /><span>#{item.sampleId}</span></label>}
-          <div><code>{item.moduleId}:{item.code}</code><span>{item.message}</span></div>
+          <div className="issue-primary"><code>{item.moduleId}:{item.code}</code>{item.relativeImagePath && <span className="issue-path"><strong>{labels.samplePath}</strong> {item.relativeImagePath}</span>}<span>{item.message}</span></div>
         </div>
         <small>{labels.attempt(item.attempt)}; {item.retriable ? labels.retryFrom(item.repairStartModule ?? "-") : labels.notRetriable}</small>
         {isNlManual && <div className="issue-manual-nl">

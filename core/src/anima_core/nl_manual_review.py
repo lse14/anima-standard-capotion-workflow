@@ -110,6 +110,7 @@ class NlManualWriteService:
                 annotation_key=str(row["annotation_key"]),
                 projection=projection,
                 nl=nl,
+                history_source="manual",
             )
             self.database.complete_leased_sample(
                 self.job_id, sample_id, lease_id=lease_id, allowed_statuses=("prepared",),

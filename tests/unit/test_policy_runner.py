@@ -104,6 +104,9 @@ class PolicyRunnerTests(unittest.TestCase):
         config.dropout["enabled"] = True
         config.tokenBudget["enabled"] = False  # type: ignore[index]
         config.dropout["quality"]["enabled"] = quality_device is not None
+        # This fixture exercises Policy against an existing JSON annotation;
+        # incremental preservation must therefore be explicitly overridden.
+        config.classify["overwriteJson"] = True
         catalog, _ = _write_test_resource_library(root, include_ocr=False)
         config.caption["resourceId"] = "tagger-default"
         config.classify["resourceId"] = "classify-default"

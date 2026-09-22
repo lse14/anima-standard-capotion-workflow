@@ -86,12 +86,12 @@ class ExportNormalizerTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertIn(code, {error.code for error in normalize_json_bytes(raw, POLICY).field_errors})
 
-    def test_control_nl_limit_cross_field_format_and_trigger_collisions_are_blocking(self) -> None:
+    def test_control_nl_limit_format_and_trigger_collisions_are_blocking(self) -> None:
         cases = (
             _payload(tags=["line\nbreak"]),
             _payload(nl="bad\x00control"),
             _payload(nl="a" * (MAX_NL_BYTES + 1)),
-            _payload(series="smile"),
+            _payload(series="Smile", tags=["smile"]),
             _payload(series="blue eyes", appearance=["blue_eyes"]),
             _payload(tags=["anima_style"]),
         )
@@ -154,11 +154,13 @@ class ExportNormalizerTests(unittest.TestCase):
         self.assertTrue(result.valid, {error.code for error in result.field_errors})
         self.assertEqual("solo", result.payload["count"])
         self.assertEqual(["solo", "smile"], result.payload["tags"])
-        # Every other pair of fields keeps the frozen collision check.
-        self.assertIn(
-            "cross_field_tag_collision",
-            {error.code for error in _normalise(_payload(series="smile", tags=["smile"])).field_errors},
-        )
+        # Exact tags/non-tags duplicates are removed from tags; non-tags pairs
+        # are intentionally retained without a field-priority collision.
+        duplicate = _normalise(_payload(series="smile", tags=["smile", "other"]))
+        self.assertTrue(duplicate.valid)
+        self.assertEqual(["other"], duplicate.payload["tags"])
+        self.assertEqual(1, duplicate.conversions["cross_field_duplicate_removed"])
+        self.assertTrue(_normalise(_payload(series="smile", artist="smile", tags=[])).valid)
 
     def test_existing_escapes_are_not_escaped_a_second_time(self) -> None:
         # F07: ROADMAP.md:978 allows an input tag to carry its own `\(` / `\)`.
@@ -178,8 +180,11 @@ class ExportNormalizerTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(_normalise(value).valid)
                 self.assertTrue(normalize_json_bytes(json.dumps(value).encode("utf-8"), POLICY, export_format="json").valid)
-        # Structural checks stay on for pure JSON exports.
-        self.assertFalse(normalize_json_bytes(json.dumps(_payload(series="smile")).encode("utf-8"), POLICY, export_format="json").valid)
+        # Structural checks stay on for pure JSON exports, while exact
+        # cross-field duplicate removal is format-independent.
+        json_duplicate = normalize_json_bytes(json.dumps(_payload(series="smile", tags=["smile"])).encode("utf-8"), POLICY, export_format="json")
+        self.assertTrue(json_duplicate.valid)
+        self.assertEqual([], json_duplicate.payload["tags"])
         with self.assertRaises(ValueError):
             normalize_json_bytes(b"{}", POLICY, export_format="csv")
 

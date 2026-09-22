@@ -179,6 +179,7 @@ class PolicyWorkerTests(unittest.TestCase):
         )
         self.assertEqual("drop_nl", outcome["decision"]["appearanceNlAction"])
         self.assertEqual(["white hair"], result["appearance"])
+        self.assertEqual(["smile"], result["tags"])
         self.assertEqual("", result["nl"])
 
     def test_hundred_percent_appearance_dropout_preserves_nl(self) -> None:
@@ -189,6 +190,7 @@ class PolicyWorkerTests(unittest.TestCase):
         )
         self.assertEqual("drop_appearance", outcome["decision"]["appearanceNlAction"])
         self.assertEqual([], result["appearance"])
+        self.assertEqual(["smile"], result["tags"])
         self.assertEqual("A person smiles.", result["nl"])
 
     def test_empty_appearance_protects_existing_nl(self) -> None:

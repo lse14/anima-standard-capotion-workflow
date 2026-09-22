@@ -15,9 +15,14 @@ from anima_core.resource_catalog import ResourceCatalog, verify_tagger_dictionar
 from copy_resource_library import assert_no_local_only_leaks
 
 
-def validate(root: Path, *, release: bool = False) -> dict[str, object]:
+def validate(
+    root: Path,
+    *,
+    release: bool = False,
+    require_quality_stack: bool = False,
+) -> dict[str, object]:
     root = root.resolve()
-    snapshot = ResourceCatalog(root).scan()
+    snapshot = ResourceCatalog(root).scan(require_quality_stack=require_quality_stack)
     if snapshot.invalid:
         details = "; ".join(f"{item.relative_path}: {item.reason}" for item in snapshot.invalid)
         raise ValueError(f"resource library contains invalid packages: {details}")
@@ -52,8 +57,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--release", action="store_true")
+    parser.add_argument("--require-quality-stack", action="store_true")
     arguments = parser.parse_args()
-    result = validate(arguments.root, release=arguments.release)
+    result = validate(
+        arguments.root,
+        release=arguments.release,
+        require_quality_stack=arguments.require_quality_stack,
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

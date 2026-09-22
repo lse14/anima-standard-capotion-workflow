@@ -365,6 +365,10 @@ class DanbooruCoreWiringTests(unittest.TestCase):
             catalog, cl, classification = _fixture_catalog(root)
             config = _config(dataset, cl, classification, active=False)
             config.classify["enabled"] = True
+            # This fixture validates the Classify worker against an existing
+            # TXT/JSON pair; opt into JSON replacement explicitly under the
+            # incremental preservation contract.
+            config.classify["overwriteJson"] = True
             preparation = JobPreparationService(root / "state.db", resource_catalog=catalog)  # type: ignore[arg-type]
             try:
                 summary = preparation.preflight(config.to_dict())

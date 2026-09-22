@@ -26,7 +26,9 @@ from .ocr_overlay import OcrWorkingSidecarView
 from .ocr_runner import OcrRunner
 from .ocr_runtime_binding import (
     OcrExecutionError,
+    read_execution_request,
     read_runtime_binding,
+    write_execution_request,
     write_runtime_binding,
 )
 from .overlay import BaselineView, OverlayError, OverlayLayout, WorkingAnnotationView
@@ -107,6 +109,19 @@ class PipelineDispatchMixin:
                 raise OcrExecutionError("repair parent OCR binding is unavailable")
             parent_layout = OverlayLayout.open_existing(parent_overlay_root, parent_job_id)
             parent_binding = read_runtime_binding(parent_layout.resource_path("ocr-runtime-binding-v1.json"))
+            parent_binding_path = parent_layout.resource_path("ocr-runtime-binding-v1.json")
+            parent_request_path = parent_layout.resource_path("ocr-execution-request-v1.json")
+            request_path = layout.resource_path("ocr-execution-request-v1.json")
+            if parent_request_path != parent_binding_path and parent_request_path != request_path:
+                write_execution_request(request_path, read_execution_request(parent_request_path))
+            try:
+                _, current_fingerprint = self._resolve_ocr_runtime(parent_binding.runtimeId)
+            except PipelineError:
+                # Let normal runtime selection report the current install state.
+                return target
+            if current_fingerprint != parent_binding.runtimeFingerprint:
+                # The parent may have been created before the OCR runtime was updated.
+                return target
             write_runtime_binding(target, parent_binding)
         except (KeyError, OcrExecutionError, OverlayError) as exc:
             raise PipelineError("repair parent OCR binding is unavailable or invalid") from exc
@@ -325,10 +340,32 @@ class PipelineDispatchMixin:
             raise PipelineError("frozen classification resource metadata does not match the resource library")
         return self.resource_root, package.manifest_relative_path, package.fingerprint, package.profile
 
-    def _nl_credentials(self, config: dict[str, object]) -> NlApiCredentials:
+    def _nl_credentials(self, config: dict[str, object], database: StateDatabase | None = None, *, job_id: str | None = None) -> NlApiCredentials:
         nl = config.get("nl")
         if not isinstance(nl, dict):
             raise PipelineError("frozen NL configuration is invalid")
+        runtime = nl.get("apiRuntime")
+        persisted_runtime = None
+        if database is not None:
+            evidence = database.get_runtime_evidence(job_id) if job_id is not None else None
+            if isinstance(evidence, dict) and isinstance(evidence.get("_nlApiRuntime"), dict):
+                persisted_runtime = evidence["_nlApiRuntime"]
+        if isinstance(persisted_runtime, dict):
+            runtime = persisted_runtime
+        if isinstance(runtime, dict):
+            try:
+                secret = self.credential_store.load(str(runtime["credentialRef"]))
+                return NlApiCredentials(
+                    str(runtime["endpoint"]), str(runtime["model"]), secret,
+                    runtime.get("backupModel") if isinstance(runtime.get("backupModel"), str) else None,
+                    str(runtime.get("protocol", "openai_chat_completions")),
+                    str(runtime.get("providerLabel", "gemini-relay")),
+                    str(runtime.get("jsonMode", "prompt_only")),
+                    int(runtime.get("revision", 1)),
+                    dict(runtime.get("policy", {})) if persisted_runtime is not None and isinstance(runtime.get("policy"), dict) else None,
+                )
+            except (CredentialStoreError, KeyError, TypeError, ValueError) as exc:
+                raise PipelineError("NL frozen API runtime or DPAPI credential is unavailable") from exc
         profile_id = nl.get("apiProfileId", "default")
         if not isinstance(profile_id, str):
             raise PipelineError("frozen NL profile reference is invalid")
@@ -337,7 +374,10 @@ class PipelineDispatchMixin:
             secret = self.credential_store.load(profile.apiCredentialRef)
         except (StopIteration, NlProfileError, CredentialStoreError) as exc:
             raise PipelineError("NL profile or DPAPI credential is unavailable") from exc
-        return NlApiCredentials(profile.endpoint, profile.model, secret, profile.backupModel)
+        return NlApiCredentials(
+            profile.endpoint, profile.model, secret, profile.backupModel,
+            profile.protocol, profile.providerLabel, profile.jsonMode, profile.revision,
+        )
 
     def _run_active_module(self, database: StateDatabase, scheduler: BoundedScheduler, job_id: str, module_id: str, config: dict[str, object]) -> str:
         job = database.get_job(job_id)
@@ -449,6 +489,11 @@ class PipelineDispatchMixin:
         if nl.get("apiEnabled") is not True or _is_input_txt_nl(config):
             return NlRunner(database, scheduler, _NoExchangeTransport(), view, writer, job_id=job_id,
                 worker_instance_id=worker_instance_id).run()
+        credentials = self._nl_credentials(config, database, job_id=job_id)
         with self._spawn_transport("nl") as transport:
             return NlRunner(database, scheduler, transport, view, writer, job_id=job_id,
-                worker_instance_id=worker_instance_id, credentials=self._nl_credentials(config)).run()
+                worker_instance_id=worker_instance_id,
+                credentials=credentials,
+                runtime_revision_provider=lambda: self.pending_nl_api_credentials(job_id),
+                runtime_revision_applied=lambda value: self.mark_nl_api_runtime_applied(job_id, value),
+            ).run()

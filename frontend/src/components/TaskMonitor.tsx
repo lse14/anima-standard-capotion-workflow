@@ -1,6 +1,8 @@
 export type TaskMonitorSnapshot = {
   status: string;
   currentModuleId: string | null;
+  apiRuntime?: { revision: number; providerLabel: string; endpoint: string; model: string; jsonMode: string } | null;
+  apiRuntimePending?: { revision: number; providerLabel: string; endpoint: string; model: string; jsonMode: string } | null;
   ocrRuntime: {
     availability: "pending" | "available" | "unavailable";
     runtimeId: "ocr-paddle" | "ocr-paddle-gpu" | null;
@@ -43,13 +45,15 @@ export type TaskMonitorProps = {
     taskOverview: string; taskProgress: string; currentModule: string; currentBatch: string;
     waitingForHumanReview: string;
     taskActions: string; activeModule: string; pauseTask: string; resumeTask: string; terminateTask: string; recoverTask: string;
-    discardTask: string; repairDeleteBlocked: string; repairTask: string; backToParentTask: string;
+    discardTask: string; deleteCompletedHistory: string; repairDeleteBlocked: string; repairTask: string; backToParentTask: string;
     additionalAttempts: string; addBudget: string; pendingApiDecisions: string; confirmUnknown: string;
     issues: string; noTask: string; loadingTask: string; retryTask: string;
     ocrRuntime: string; ocrAvailability: string; ocrGpu: string; ocrRequestedDevice: string; ocrObservedDevice: string;
     ocrRecommended: string; ocrEffective: string; ocrStartupReason: string;
+    apiSettings: string; apiRevision: string; apiProvider: string; apiModel: string; apiJsonMode: string; apiPending: string;
   };
   canDiscard: boolean;
+  canDeleteHistory: boolean;
   budget: string;
   pendingApiDecisions: number;
   nlAwaitsDecision: boolean;
@@ -59,6 +63,7 @@ export type TaskMonitorProps = {
   onTerminate: () => void;
   onRecover: () => void;
   onDiscard: () => void;
+  onDeleteHistory: () => void;
   onBackToParent: () => void;
   onBudgetChange: (value: string) => void;
   onAddBudget: () => void;
@@ -72,7 +77,7 @@ function formatGiB(bytes: number): string {
 
 export function TaskMonitor({
   snapshot, isRepairTask, hasRepairChildren, loading, error, statusLabel, currentModuleLabel, currentBatchLabel, rawE621ConvertedMessage, captionGpuFallbackMessage, modules, labels,
-  canDiscard, budget, pendingApiDecisions, nlAwaitsDecision, pendingActions, onPause, onResume, onTerminate, onRecover, onDiscard, onBackToParent,
+  canDiscard, canDeleteHistory, budget, pendingApiDecisions, nlAwaitsDecision, pendingActions, onPause, onResume, onTerminate, onRecover, onDiscard, onDeleteHistory, onBackToParent,
   onBudgetChange, onAddBudget, onConfirmUnknown, onRetry,
 }: TaskMonitorProps) {
   const isPending = (action: string) => pendingActions.has(action);
@@ -92,6 +97,16 @@ export function TaskMonitor({
         <div><dt>{labels.currentModule}</dt><dd>{currentModuleLabel}</dd></div>
         <div><dt>{labels.currentBatch}</dt><dd>{currentBatchLabel}</dd></div>
       </dl>
+      {snapshot.apiRuntime ? <section className="ocr-runtime" aria-label={labels.apiSettings}>
+        <h3>{labels.apiSettings}</h3>
+        <dl className="facts">
+          <div><dt>{labels.apiProvider}</dt><dd>{snapshot.apiRuntime.providerLabel}</dd></div>
+          <div><dt>{labels.apiModel}</dt><dd>{snapshot.apiRuntime.model}</dd></div>
+          <div><dt>{labels.apiRevision}</dt><dd>{snapshot.apiRuntime.revision}</dd></div>
+          <div><dt>{labels.apiJsonMode}</dt><dd>{snapshot.apiRuntime.jsonMode}</dd></div>
+        </dl>
+        {snapshot.apiRuntimePending ? <p className="hint" role="status">{labels.apiPending}: rev {snapshot.apiRuntimePending.revision}</p> : null}
+      </section> : null}
       {snapshot.ocrRuntime ? <section className="ocr-runtime" aria-label={labels.ocrRuntime}>
         <h3>{labels.ocrRuntime}</h3>
         <dl className="facts">
@@ -127,7 +142,9 @@ export function TaskMonitor({
           <button className="secondary" type="button" disabled={!canRecover || isPending("recover")} aria-busy={isPending("recover")} onClick={onRecover}>{labels.recoverTask}</button>
         </div>
         <div className="action-grid">
-          <button className="danger-action" type="button" disabled={!canDiscard || isPending("discard")} aria-busy={isPending("discard")} onClick={onDiscard}>{labels.discardTask}</button>
+          {snapshot.status === "succeeded"
+            ? <button className="danger-action" type="button" disabled={!canDeleteHistory || isPending("delete_history")} aria-busy={isPending("delete_history")} onClick={onDeleteHistory}>{labels.deleteCompletedHistory}</button>
+            : <button className="danger-action" type="button" disabled={!canDiscard || isPending("discard")} aria-busy={isPending("discard")} onClick={onDiscard}>{labels.discardTask}</button>}
         </div>
       </section>
       {hasRepairChildren && <p className="hint">{labels.repairDeleteBlocked}</p>}

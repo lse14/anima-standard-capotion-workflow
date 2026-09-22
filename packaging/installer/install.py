@@ -80,11 +80,10 @@ _RUNTIME_SOURCES: dict[str, dict[str, str]] = {
 
 _CUDA_PROBE_COMPANIONS = {
     "caption-e621": "e621-tagger",
-    "policy": "quality-stack",
+    "policy": "policy",
 }
 _FUNCTIONAL_PROBE_GROUPS = (
     ("caption-e621", "e621-tagger"),
-    ("policy", "quality-stack"),
     ("token-budget", "qwen3-tokenizer"),
 )
 _CAPTION_RUNTIME_CPU_FALLBACK = "caption-e621"
@@ -255,6 +254,14 @@ def _has_optional_ocr_model_input(project_root: Path) -> bool:
     ).exists()
 
 
+def _has_published_ocr_cpu_runtime(project_root: Path) -> bool:
+    runtime_python = project_root / ".runtime-build" / "runtimes" / "ocr-paddle" / "python.exe"
+    try:
+        return runtime_python.is_file() and not runtime_python.is_symlink()
+    except OSError:
+        return False
+
+
 def _import_available_ocr_models(source_root: Path, project_root: Path) -> object | None:
     module = _load_ocr_resource_module(source_root)
     try:
@@ -413,7 +420,7 @@ def _cpu_fallback_items(manifest: InstallManifest) -> dict[str, PlannedComponent
     )
     return {
         item.component.component_id: item
-        for item in installation_plan(fallback_manifest, accelerator="cpu").components
+        for item in installation_plan(fallback_manifest, accelerator="cpu", optional_components={"policy"}).components
     }
 
 
@@ -465,6 +472,7 @@ def install_project(
     source_root: str | Path,
     manifest: InstallManifest,
     accelerator: str,
+    optional_components: set[str] | frozenset[str] = frozenset(),
     base_runtime: str | Path,
     fetch_artifact: ArtifactFetcher | None = None,
     probe_component: Probe | None = None,
@@ -481,7 +489,7 @@ def install_project(
         from assemble import validate_mandatory_e621_components
 
         validate_mandatory_e621_components(manifest)
-    plan = installation_plan(manifest, accelerator=accelerator)
+    plan = installation_plan(manifest, accelerator=accelerator, optional_components=optional_components)
     report = progress or (lambda _message: None)
     fetch = fetch_artifact or (lambda artifact: download_verified(artifact, layout.cache, progress=report))
     writer = write_runtime_manifest or (lambda item, current_layout: _default_runtime_manifest_writer(source, item, current_layout))
@@ -652,15 +660,24 @@ def install_project(
                     "OCR models are not installed; see OCR_MODEL_DOWNLOAD.md and place the exact archives in ocr-model-archives"
                 )
         elif _has_optional_ocr_model_input(layout.project_root):
-            optional_result = _import_available_ocr_models(source, layout.project_root)
-            if optional_result is None:
+            if (
+                _complete_manual_ocr_archives(layout.project_root)
+                and not _has_published_ocr_cpu_runtime(layout.project_root)
+            ):
                 messages.append(
-                    "OCR models are not installed; see OCR_MODEL_DOWNLOAD.md and place the exact archives in ocr-model-archives"
+                    "OCR model archives are present, but the optional OCR CPU runtime is not installed; "
+                    "install the optional OCR component before importing models"
                 )
-            elif isinstance(optional_result, Mapping) and optional_result.get("resource") == "idempotent":
-                messages.append("OCR model resource is already verified")
             else:
-                messages.append("OCR model import completed")
+                optional_result = _import_available_ocr_models(source, layout.project_root)
+                if optional_result is None:
+                    messages.append(
+                        "OCR models are not installed; see OCR_MODEL_DOWNLOAD.md and place the exact archives in ocr-model-archives"
+                    )
+                elif isinstance(optional_result, Mapping) and optional_result.get("resource") == "idempotent":
+                    messages.append("OCR model resource is already verified")
+                else:
+                    messages.append("OCR model import completed")
         else:
             messages.append(
                 "OCR models are not installed; see OCR_MODEL_DOWNLOAD.md and place the exact archives in ocr-model-archives"
@@ -689,6 +706,8 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--accelerator", choices=("cpu", "nvidia"), required=True)
+    parser.add_argument("--include-policy", action="store_true")
+    parser.add_argument("--include-quality-stack", action="store_true")
     parser.add_argument("--bootstrap-runtime", type=Path, required=True)
     arguments = parser.parse_args()
     raw_manifest = arguments.manifest.read_bytes()
@@ -702,6 +721,14 @@ def main() -> int:
             source_root=arguments.project_root,
             manifest=manifest,
             accelerator=arguments.accelerator,
+            optional_components=frozenset(
+                component_id
+                for component_id, enabled in (
+                    ("policy", arguments.include_policy),
+                    ("quality-stack", arguments.include_quality_stack),
+                )
+                if enabled
+            ),
             base_runtime=_bootstrap_runtime_from_argument(arguments.bootstrap_runtime),
             preserve_bootstrap_on_success=True,
             progress=print,

@@ -46,6 +46,7 @@ class NlManualReviewTests(unittest.TestCase):
         *,
         sample_count: int = 1,
         release_parent_lock: bool = True,
+        ocr_enabled: bool = False,
     ) -> tuple[JobPreparationService, RepairPreparationService, StateDatabase, str]:
         dataset = root / "dataset"
         dataset.mkdir()
@@ -54,7 +55,8 @@ class NlManualReviewTests(unittest.TestCase):
             Image.new("RGB", (2, 2), "white").save(dataset / f"{name}.png")
             (dataset / f"{name}.json").write_bytes(serialize_annotation_json({"nl": "", "tags": []}))
         config = JobConfig(workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset), schemaVersion=10)
-        config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = False
+        config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = False
+        config.ocr["enabled"] = ocr_enabled
         config.countReview["enabled"] = False  # type: ignore[index]
         assert config.tokenBudget is not None
         config.tokenBudget["enabled"] = False
@@ -232,6 +234,33 @@ class NlManualReviewTests(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(parent_issue["resolved_at"])
             finally:
+                database.close()
+                repair.close()
+                preparation.close()
+
+    def test_manual_nl_child_with_no_ocr_targets_does_not_initialize_ocr_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preparation, repair, database, parent_id = self._fixture(root, ocr_enabled=True)
+            pipeline = PipelineService(root / "state.db", install_root=ROOT / ".runtime-build")
+            try:
+                result = repair.prepare_manual_nl(parent_id, issue_id="nl-manual-1", confirmed=True)
+                calls: list[str] = []
+
+                def run_module(_database, scheduler, job_id, module_id, _config):
+                    calls.append(module_id)
+                    if module_id == "nl":
+                        return "paused"
+                    return scheduler.finish_module(job_id, module_id)
+
+                pipeline._run_active_module = run_module  # type: ignore[method-assign]
+                pipeline._run(result.repairJobId)
+
+                self.assertNotIn("ocr", calls)
+                self.assertIn("nl", calls)
+                self.assertEqual(0, database.module_summary(result.repairJobId, "ocr")["total"])
+            finally:
+                pipeline.close()
                 database.close()
                 repair.close()
                 preparation.close()

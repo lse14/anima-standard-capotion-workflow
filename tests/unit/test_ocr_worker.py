@@ -28,7 +28,8 @@ import anima_ocr_worker.worker as worker_module
 from anima_ocr_worker.protocol import OcrPayloadError, hello_to_dict, parse_hello
 try:
     from anima_ocr_worker.entry import RUNTIME_ID, run
-    from anima_ocr_worker.image import image_exceeds_limits
+    from anima_ocr_worker import image as image_module
+    from anima_ocr_worker.image import image_exceeds_limits, scaled_dimensions
     from anima_ocr_worker.model import OcrModelError, PaddleOcrModel, create_paddle_engine
     from anima_ocr_worker.resource import OcrResource, OcrResourceError, load_ocr_resource
     from anima_ocr_worker.worker import OcrSourceFingerprintError, OcrWorker, OcrWorkerInitializationError
@@ -806,7 +807,29 @@ class OcrWorkerTests(unittest.TestCase):
                 worker.process(_request([changed]))
 
     @unittest.skipIf(_WORKER_IMPORT_ERROR is not None, "OCR worker source is not implemented")
-    def test_oversize_header_returns_nonretriable_failure_before_pixel_decode(self) -> None:
+    def test_oversize_dimensions_are_scaled_to_safe_ocr_size(self) -> None:
+        self.assertEqual((5412, 7390), scaled_dimensions(5859, 8000))
+        width, height = scaled_dimensions(12553, 6099)
+        self.assertLessEqual(width * height, 40_000_000)
+        self.assertLessEqual(max(width, height), 16_384)
+
+        with tempfile.TemporaryDirectory() as temporary_name:
+            temporary = Path(temporary_name)
+            path = temporary / "large.jpg"
+            Image.new("RGB", (200, 100), "white").save(path)
+            source_bytes = path.read_bytes()
+            worker, engine, _ = self._ready_worker(temporary)
+            with mock.patch.object(image_module, "MAX_PIXELS", 10_000):
+                outcome = parse_ocr_process_result(worker.process(_request([_work_item(path)])))[0]
+
+            self.assertEqual("success", outcome.status)
+            self.assertLessEqual(outcome.image.width * outcome.image.height, 10_000)
+            self.assertLessEqual(max(outcome.image.width, outcome.image.height), 16_384)
+            self.assertEqual(source_bytes, path.read_bytes())
+            self.assertEqual(1, len(engine.images))
+
+    @unittest.skipIf(_WORKER_IMPORT_ERROR is not None, "OCR worker source is not implemented")
+    def test_malformed_oversize_header_returns_decode_failure_without_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:
             temporary = Path(temporary_name)
             path = temporary / "too-large.bmp"
@@ -819,11 +842,11 @@ class OcrWorkerTests(unittest.TestCase):
             self.assertEqual("failed", outcome.status)
             self.assertEqual("ocr_image_too_large", outcome.error.code)
             self.assertFalse(outcome.error.retriable)
-            self.assertEqual(width * height, outcome.error.details.actualPixels)
+            self.assertEqual(width * height, outcome.error.to_dict()["details"]["actualPixels"])
             self.assertEqual([], engine.images)
 
     @unittest.skipIf(_WORKER_IMPORT_ERROR is not None, "OCR worker source is not implemented")
-    def test_oversize_header_above_pillow_default_limit_is_still_an_oversize_failure(self) -> None:
+    def test_malformed_huge_header_returns_decode_failure_without_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:
             temporary = Path(temporary_name)
             path = temporary / "very-large.bmp"
@@ -836,7 +859,7 @@ class OcrWorkerTests(unittest.TestCase):
             self.assertEqual("failed", outcome.status)
             self.assertEqual("ocr_image_too_large", outcome.error.code)
             self.assertFalse(outcome.error.retriable)
-            self.assertEqual(width * height, outcome.error.details.actualPixels)
+            self.assertEqual(width * height, outcome.error.to_dict()["details"]["actualPixels"])
             self.assertEqual([], engine.images)
 
     @unittest.skipIf(_WORKER_IMPORT_ERROR is not None, "OCR worker source is not implemented")

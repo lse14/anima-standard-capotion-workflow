@@ -63,7 +63,7 @@ def _strict_json(data: bytes) -> object:
     def reject_constant(_: str) -> None:
         raise ValueError("non-finite JSON number")
 
-    return json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicates, parse_constant=reject_constant)
+    return json.loads(data.decode("utf-8-sig"), object_pairs_hook=reject_duplicates, parse_constant=reject_constant)
 
 
 def _normalize_chat_endpoint(value: object) -> str | None:

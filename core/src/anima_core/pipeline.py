@@ -18,10 +18,12 @@ from .contracts import (
 from .count_review_service import CountReviewService
 from .credentials import DpapiCredentialStore
 from .db import StateDatabase
+from .db_primitives import repair_target_clause
 from .export_commit import ExportCommitCoordinator
 from .job_preflight import JobPreflightError, config_from_dict
 from .launcher import WorkerLaunchError, WorkerLauncher
 from .nl_profiles import NlApiProfileStore
+from .nl_runner import NlApiCredentials
 from .overlay import BaselineView, OverlayLayout, WorkingAnnotationView
 from .pipeline_dispatch import PipelineDispatchMixin, PipelineError, _RUNTIMES
 from .pipeline_recovery import PipelineRecoveryMixin
@@ -128,6 +130,100 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
         )
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
+        self._api_config_lock = threading.Lock()
+
+    def update_nl_api_config(self, job_id: str, payload: dict[str, object]) -> dict[str, object]:
+        """Queue a connection-only API revision for the next NL batch.
+
+        The immutable JobConfig remains untouched.  A worker that has already
+        started its current batch continues with its existing hello revision;
+        the queued revision is exposed to the control plane immediately.
+        """
+        with self._api_config_lock:
+            database = StateDatabase.open(self.database_path)
+            try:
+                job = database.get_job(job_id)
+                if str(job["status"]) not in {"running", "paused", "reviewing", "preparing_workspace"}:
+                    raise PipelineError("NL API settings can only change before or during an active task")
+                current = database.get_nl_api_runtime_override(job_id)
+                task_revision = database.get_nl_api_task_revision(job_id)
+                expected = payload.get("expectedTaskRevision")
+                if type(expected) is not int or expected != task_revision:
+                    raise PipelineError("api_task_revision_conflict")
+                profile_id = payload.get("profileId")
+                profile = next((item for item in self.profile_store.load_all() if item.profileId == profile_id), None)
+                if profile is None:
+                    raise PipelineError("NL API profile does not exist")
+                expected_profile = payload.get("expectedProfileRevision")
+                if type(expected_profile) is not int or profile.revision != expected_profile:
+                    raise PipelineError("profile_revision_conflict")
+                profile_snapshot = self.profile_store.snapshot_document()
+                updated = None
+                try:
+                    with database.transaction(immediate=True):
+                        updated = self.profile_store.save(
+                            type(profile)(
+                                profile.profileId, str(payload["endpoint"]), str(payload["model"]),
+                                payload.get("backupModel") if isinstance(payload.get("backupModel"), str) else None,
+                                str(payload["credentialRef"]), "", dict(payload.get("policy", {})),
+                                profile.name, str(payload.get("protocol", profile.protocol)),
+                                str(payload.get("providerLabel", profile.providerLabel)), str(payload.get("jsonMode", profile.jsonMode)),
+                                profile.revision, profile.updatedAt,
+                            ),
+                            expected_revision=profile.revision,
+                        )
+                        next_revision = task_revision + 1
+                        runtime = {
+                            "revision": updated.revision, "protocol": updated.protocol, "providerLabel": updated.providerLabel,
+                            "endpoint": updated.endpoint, "model": updated.model, "backupModel": updated.backupModel,
+                            "credentialRef": updated.apiCredentialRef, "jsonMode": updated.jsonMode,
+                            "policy": updated.policy, "appliedAt": updated.updatedAt,
+                        }
+                        database.set_nl_api_runtime_override(
+                            job_id, {"taskRevision": next_revision, "runtime": runtime},
+                        )
+                except Exception:
+                    if updated is not None:
+                        try:
+                            self.profile_store.restore_document(profile_snapshot)
+                        except Exception as rollback_error:
+                            raise PipelineError("NL API profile rollback failed") from rollback_error
+                    raise
+                return {"taskRevision": next_revision, "profileRevision": updated.revision, "apiRuntime": runtime, "effective": "next_batch"}
+            finally:
+                database.close()
+
+    def pending_nl_api_credentials(self, job_id: str) -> NlApiCredentials | None:
+        database = StateDatabase.open(self.database_path)
+        try:
+            pending = database.get_nl_api_runtime_override(job_id)
+        finally:
+            database.close()
+        runtime = pending.get("runtime") if isinstance(pending, dict) else None
+        if not isinstance(runtime, dict):
+            return None
+        try:
+            secret = self.credential_store.load(str(runtime["credentialRef"]))
+            return NlApiCredentials(
+                str(runtime["endpoint"]), str(runtime["model"]), secret,
+                runtime.get("backupModel") if isinstance(runtime.get("backupModel"), str) else None,
+                str(runtime.get("protocol", "openai_chat_completions")),
+                str(runtime.get("providerLabel", "gemini-relay")),
+                str(runtime.get("jsonMode", "prompt_only")), int(runtime["revision"]),
+                dict(runtime.get("policy", {})) if isinstance(runtime.get("policy"), dict) else None,
+            )
+        except (CredentialStoreError, KeyError, TypeError, ValueError):
+            return None
+
+    def mark_nl_api_runtime_applied(self, job_id: str, credentials: NlApiCredentials) -> None:
+        database = StateDatabase.open(self.database_path)
+        try:
+            pending = database.get_nl_api_runtime_override(job_id)
+            runtime = pending.get("runtime") if isinstance(pending, dict) else None
+            if isinstance(runtime, dict) and int(runtime.get("revision", 0)) == credentials.revision:
+                database.apply_nl_api_runtime_override(job_id, runtime)
+        finally:
+            database.close()
 
     def start(self, job_id: str) -> None:
         with self._lock:
@@ -351,6 +447,19 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
     def confirm_count_review(self, job_id: str, *, confirmed: bool) -> bool:
         """Open the confirmed application phase and continue from the Core module."""
         with self._lock:
+            settling_thread = self._threads.get(job_id)
+        if settling_thread is not None:
+            database = StateDatabase.open(self.database_path)
+            try:
+                settling_job = database.get_job(job_id)
+            finally:
+                database.close()
+            if settling_job["status"] == "reviewing" and settling_job["current_module_id"] == "count_review":
+                # CountReviewRunner persists the review state before _thread_main
+                # unregisters itself.  Wait outside _lock, because the thread's
+                # finally block needs the same lock to finish unregistering.
+                settling_thread.join(timeout=1.0)
+        with self._lock:
             database = StateDatabase.open(self.database_path)
             thread: threading.Thread | None = None
             try:
@@ -437,9 +546,13 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
             except (StdioJsonlTransportError, WorkerLaunchError):
                 if database.module_summary(job_id, module_id)["status"] != "running":
                     raise
-                if not scheduler.worker_exited(job_id, module_id, abnormal=True):
-                    raise
-                database.return_module_leases(job_id, module_id)
+                if scheduler.worker_exited(job_id, module_id, abnormal=True):
+                    database.return_module_leases(job_id, module_id)
+                    continue
+                job = database.get_job(job_id)
+                if job["status"] in {"paused", "reviewing", "cancelling", "cancelled_recoverable"}:
+                    return str(job["status"])
+                return str(database.module_summary(job_id, module_id)["status"])
 
     @staticmethod
     def _token_budget_export_gate(database: StateDatabase, job_id: str, config: dict[str, object]) -> bool:
@@ -472,26 +585,46 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
                     and issue["resolved_at"] is None
                     and bool(issue["blocking"])
                 ):
-                    blocking_samples.add(int(issue["sample_id"]))
+                    sample_id = int(issue["sample_id"])
+                    sample_state = database.get_sample_state(job_id, sample_id)
+                    if sample_state["status"] not in {"failed", "skipped"}:
+                        blocking_samples.add(sample_id)
             issue_after_sample_id = int(issues[-1]["sample_id"])
             issue_after_issue_id = str(issues[-1]["issue_id"])
         cursor: int | None = None
+        target_clause, target_parameters = repair_target_clause(
+            database.connection, job_id, "export",
+        )
         while True:
-            page = database.page_samples(job_id, after_sample_id=cursor, limit=500)
+            cursor_clause = "" if cursor is None else " AND s.sample_id>?"
+            parameters: list[object] = [job_id]
+            if cursor is not None:
+                parameters.append(cursor)
+            parameters.extend(target_parameters)
+            parameters.append(500)
+            page = list(database.connection.execute(
+                """SELECT s.* FROM samples AS s
+                   WHERE s.job_id=? AND s.in_processing_scope=1"""
+                + cursor_clause + target_clause + " ORDER BY s.sample_id LIMIT ?",
+                parameters,
+            ))
             if not page:
                 break
             cursor = int(page[-1]["sample_id"])
             for row in page:
                 if not bool(row["in_processing_scope"]):
                     continue
-                if int(row["sample_id"]) in blocking_samples:
+                sample_id = int(row["sample_id"])
+                sample_state = database.get_sample_state(job_id, sample_id)
+                if sample_state["status"] in {"failed", "skipped"}:
+                    continue
+                if sample_id in blocking_samples:
                     failed = True
                     continue
                 try:
-                    writer.record_for_export(sample_id=int(row["sample_id"]), annotation_key=str(row["annotation_key"]), caption_format=caption_format, max_tokens=max_tokens)
+                    writer.record_for_export(sample_id=sample_id, annotation_key=str(row["annotation_key"]), caption_format=caption_format, max_tokens=max_tokens)
                 except TokenBudgetOverlayError:
                     failed = True
-                    sample_id = int(row["sample_id"])
                     database.upsert_issue(SampleIssue(
                         issueId=hashlib.sha256(f"{job_id}\0{sample_id}\0token_budget\0token_budget_export_gate_failed".encode("utf-8")).hexdigest(),
                         jobId=job_id, sampleId=sample_id, relativeImagePath=str(row["relative_image_path"]),
@@ -551,7 +684,11 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
                 if state == "paused":
                     return
                 if state == "running":
-                    finished = self._run_module_with_restarts(database, scheduler, job_id, module_id, config)
+                    summary = database.module_summary(job_id, module_id)
+                    if module_id != "export" and int(summary["total"]) == 0:
+                        finished = scheduler.finish_module(job_id, module_id)
+                    else:
+                        finished = self._run_module_with_restarts(database, scheduler, job_id, module_id, config)
                     if finished in {"paused", "reviewing", "cancelling"}:
                         if finished == "cancelling" and not database.count_in_flight(job_id):
                             database.settle_cancellation(job_id)
@@ -567,7 +704,7 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
                         return
         except Exception:
             job = database.get_job(job_id)
-            if job["status"] not in {"cancelled_recoverable", "failed", "succeeded"}:
+            if job["status"] not in {"cancelled_recoverable", "failed", "succeeded", "succeeded_with_issues"}:
                 database.set_job_status(job_id, "failed", current_module_id=str(job["current_module_id"] or "workspace"))
             raise
         finally:

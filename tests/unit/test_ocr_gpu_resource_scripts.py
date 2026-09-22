@@ -76,10 +76,21 @@ class OcrGpuResourceScriptTests(unittest.TestCase):
             source = entrypoint.read_text(encoding="utf-8")
             self.assertIn(".runtime-build\\runtimes\\core\\python.exe", source)
             self.assertIn("-B -I", source)
-            self.assertIn("ocr_gpu_resource.py", source)
+            if name == "install":
+                self.assertIn("ocr_component.py", source)
+                self.assertIn("--mode gpu", source)
+                self.assertIn("--model-root", source)
+                self.assertNotIn("ocr_gpu_resource.py", source)
+            else:
+                self.assertIn("ocr_gpu_resource.py", source)
 
-    def test_root_entrypoints_default_to_deterministic_preview_without_writes(self) -> None:
-        for name, entrypoint in ROOT_ENTRYPOINTS.items():
+    def test_cleanup_entrypoints_default_to_deterministic_preview_without_writes(self) -> None:
+        install_source = ROOT_ENTRYPOINTS["install"].read_text(encoding="utf-8")
+        self.assertIn("ocr_component.py", install_source)
+        self.assertIn("--mode gpu", install_source)
+        self.assertIn("--model-root", install_source)
+        for name in ("reset", "clean"):
+            entrypoint = ROOT_ENTRYPOINTS[name]
             with self.subTest(entrypoint=name):
                 self.assertTrue(entrypoint.is_file(), f"missing {name} entrypoint")
                 before = [target.exists() for target in self._formal_gpu_targets(ROOT)]

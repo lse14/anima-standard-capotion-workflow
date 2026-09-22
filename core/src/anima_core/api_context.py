@@ -34,6 +34,19 @@ class ControlPlaneContext:
     shutdown_callback: Callable[[], None] | None
     native_path_picker: NativePathPicker
 
+    def release_lock_for_repair(self, job_id: str) -> str | None:
+        if self.repair_service.release_lock_for_repair(job_id):
+            return "repair"
+        if self.preparation_service.release_lock_for_repair(job_id):
+            return "preparation"
+        return None
+
+    def restore_lock_after_repair_failure(self, job_id: str, owner: str | None) -> None:
+        if owner == "repair":
+            self.repair_service.restore_lock_after_repair_failure(job_id)
+        elif owner == "preparation":
+            self.preparation_service.restore_lock_after_repair_failure(job_id)
+
 
 def bad_request(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))

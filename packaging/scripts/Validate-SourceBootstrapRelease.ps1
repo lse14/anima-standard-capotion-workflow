@@ -412,7 +412,8 @@ function Assert-Manifest([object]$Manifest) {
     [void](Assert-SafeRelative ([string](Get-RequiredProperty $bootstrap 'entryRelativePath' 'bootstrap')) 'bootstrap entryRelativePath')
     if ([Int64](Get-RequiredProperty $bootstrap 'peakBytes' 'bootstrap') -le 0) { Stop-ReleaseGate 'bootstrap peakBytes is invalid' }
 
-    $mandatory = @('core', 'caption-e621', 'classify-e621', 'replace-e621', 'nl', 'policy', 'export', 'token-budget', 'ocr-cpu', 'e621-indexes', 'e621-replacement-indexes', 'e621-tagger', 'qwen3-tokenizer', 'quality-stack')
+    $mandatory = @('core', 'caption-e621', 'classify-e621', 'replace-e621', 'nl', 'export', 'token-budget', 'e621-indexes', 'e621-replacement-indexes', 'e621-tagger', 'qwen3-tokenizer')
+    $optionalComponents = @('ocr-cpu', 'ocr-gpu', 'ocr-models', 'policy', 'quality-stack')
     $components = @($Manifest.components)
     if ($components.Count -eq 0) { Stop-ReleaseGate 'install manifest has no components' }
     $ids = @{}
@@ -450,6 +451,13 @@ function Assert-Manifest([object]$Manifest) {
         }
     }
     foreach ($id in $mandatory) { if (-not $ids.ContainsKey($id)) { Stop-ReleaseGate "mandatory component is missing: $id" } }
+    foreach ($id in $optionalComponents) {
+        if (-not $ids.ContainsKey($id)) { continue }
+        $component = $components | Where-Object { [string]$_.componentId -eq $id } | Select-Object -First 1
+        if ([bool]$component.required) {
+            Stop-ReleaseGate "optional component must set required=false: $id"
+        }
+    }
     return $releaseVersion
 }
 

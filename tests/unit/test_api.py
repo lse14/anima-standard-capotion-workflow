@@ -26,13 +26,14 @@ from anima_core.api import (
     build_control_app,
 )
 from anima_core.api_token_budget import _IsolatedShortRewriter
+from anima_core.api_models import _NlApiConfigBody
 from anima_core.token_budget_review import TokenBudgetReviewConflictError, TokenBudgetReviewError
 from anima_core.commit_journal import CommitJournal, write as write_journal
 from anima_core.job_preflight import JobPreflightError, JobPreparationService
 from anima_core.contracts import JobConfig, ProgressEvent, SampleIssue, pipeline_module_ids, sha256_json
 from anima_core.credentials import DpapiCredentialStore
 from anima_core.db import StateDatabase
-from anima_core.nl_profiles import NlApiProfileStore
+from anima_core.nl_profiles import NlApiProfile, NlApiProfileStore
 from anima_core.nl_prompt_presets import NlPromptPresetStore
 from anima_core.native_path_picker import NativePathPickerBusyError, NativePathPickerUnavailableError
 from anima_core.path_safety import windows_key
@@ -59,6 +60,9 @@ EXPECTED_CONTROL_ROUTES = {
     ("GET", "/api/jobs"),
     ("GET", "/api/jobs/{job_id}"),
     ("POST", "/api/jobs/preflight"),
+    ("POST", "/api/jobs/preflight/async"),
+    ("GET", "/api/jobs/preflight/{job_id}/progress"),
+    ("POST", "/api/jobs/preflight/{job_id}/cancel"),
     ("POST", "/api/jobs/{job_id}/confirm-workspace"),
     ("POST", "/api/jobs/{job_id}/start"),
     ("POST", "/api/jobs/{job_id}/pause"),
@@ -79,7 +83,10 @@ EXPECTED_CONTROL_ROUTES = {
     ("POST", "/api/jobs/{job_id}/cancel"),
     ("PUT", "/api/jobs/{job_id}/pin"),
     ("POST", "/api/jobs/{job_id}/discard"),
+    ("POST", "/api/jobs/{job_id}/delete-history"),
     ("POST", "/api/jobs/{job_id}/restore-original-annotations"),
+    ("GET", "/api/jobs/{job_id}/export/recommit"),
+    ("POST", "/api/jobs/{job_id}/export/recommit"),
     ("GET", "/api/nl/default-prompt"),
     ("GET", "/api/nl/prompt-presets"),
     ("GET", "/api/nl/prompt-presets/{preset_id}"),
@@ -91,11 +98,14 @@ EXPECTED_CONTROL_ROUTES = {
     ("POST", "/api/nl/diagnostics/test-message"),
     ("GET", "/api/nl/profiles"),
     ("PUT", "/api/nl/profiles/{profile_id}"),
+    ("POST", "/api/nl/profiles/{profile_id}/default"),
+    ("POST", "/api/nl/profiles/{profile_id}/copy"),
     ("DELETE", "/api/nl/profiles/{profile_id}"),
     ("PUT", "/api/nl/credentials/{reference}"),
     ("DELETE", "/api/nl/credentials/{reference}"),
     ("POST", "/api/jobs/{job_id}/nl/pause"),
     ("POST", "/api/jobs/{job_id}/nl/resume"),
+    ("PUT", "/api/jobs/{job_id}/nl/api-config"),
     ("POST", "/api/jobs/{job_id}/nl/api-budget"),
     ("POST", "/api/jobs/{job_id}/nl/confirm-api-outcomes"),
     ("POST", "/api/jobs/{job_id}/nl/manual-retry"),
@@ -389,9 +399,51 @@ class ControlPlaneApiTests(unittest.TestCase):
         body = _ProfileBody(endpoint="https://example.test/v1", model="main", backupModel=None, apiCredentialRef="key-a", systemPrompt="describe", apiPolicy={"maxRequestsPerMinute": 60})
         saved = save_profile("profile-a", body)
         self.assertTrue(saved["hasCredential"])
+        # Schema-2 clients use credentialRef/policy and must not be treated as
+        # legacy merely because the compatibility body supplies empty defaults.
+        updated = save_profile(
+            "profile-a",
+            _ProfileBody(
+                endpoint="https://example.test/v2", model="main-v2", credentialRef="key-a",
+                revision=saved["revision"], policy={"maxRequestsPerMinute": 30},
+            ),
+        )
+        self.assertEqual(("https://example.test/v2", "main-v2", "key-a"), (updated["endpoint"], updated["model"], updated["credentialRef"]))
         response = profiles()
         self.assertNotIn("top-secret", json.dumps(response))
         self.assertTrue(response["profiles"][0]["hasCredential"])
+
+    def test_running_api_config_queues_and_exposes_monotonic_task_revision(self) -> None:
+        self.credentials.save("runtime-key", "runtime-secret")
+        saved = self.profiles.save(NlApiProfile(
+            "runtime-profile", "https://old.example/v1", "old-model", None,
+            "runtime-key", "", {}, "Runtime", "openai_chat_completions", "gemini-relay", "prompt_only", 1, "",
+        ))
+        database = StateDatabase.open(self.database_path)
+        try:
+            database.connection.execute("UPDATE jobs SET status='running',current_module_id='nl' WHERE job_id='job-api'")
+        finally:
+            database.close()
+        update = _endpoint(self.app, "/api/jobs/{job_id}/nl/api-config", "PUT")
+        first = update("job-api", _NlApiConfigBody(
+            expectedTaskRevision=0, expectedProfileRevision=saved.revision, profileId="runtime-profile",
+            endpoint="https://new.example/v1", model="new-model", backupModel=None,
+            credentialRef="runtime-key", policy={},
+        ))
+        self.assertEqual(1, first["taskRevision"])
+        database = StateDatabase.open(self.database_path)
+        try:
+            runtime = first["apiRuntime"]
+            database.apply_nl_api_runtime_override("job-api", runtime)
+        finally:
+            database.close()
+        refreshed = self.profiles.load_all()[0]
+        second = update("job-api", _NlApiConfigBody(
+            expectedTaskRevision=1, expectedProfileRevision=refreshed.revision, profileId="runtime-profile",
+            endpoint="https://newer.example/v1", model="newer-model", backupModel=None,
+            credentialRef="runtime-key", policy={},
+        ))
+        self.assertEqual(2, second["taskRevision"])
 
     def test_prompt_presets_and_diagnostics_are_isolated_from_profiles_and_credentials(self) -> None:
         parameters = inspect.signature(build_control_app).parameters
@@ -1011,6 +1063,12 @@ class ControlPlaneApiTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls: list[str] = []
 
+            def release_lock_for_repair(self, _job_id: str) -> bool:
+                return False
+
+            def restore_lock_after_repair_failure(self, _job_id: str) -> None:
+                return None
+
             def prepare(self, job_id: str):
                 self.calls.append(job_id)
                 from anima_core.repair import RepairPreparationResult
@@ -1050,6 +1108,36 @@ class ControlPlaneApiTests(unittest.TestCase):
             confirm(result["jobId"], _WorkspaceBody(confirmed=False, confirmedRebuild=False))
         workspace = confirm(result["jobId"], _WorkspaceBody(confirmed=True, confirmedRebuild=False))
         self.assertEqual("preparing_workspace", workspace["status"])
+
+    def test_async_preflight_endpoint_exposes_independent_progress_and_summary(self) -> None:
+        start = _endpoint(self.app, "/api/jobs/preflight/async", "POST")
+        progress = _endpoint(self.app, "/api/jobs/preflight/{job_id}/progress", "GET")
+        config = JobConfig(
+            profile="e621", workMode="in_place", overwriteMode="incremental",
+            sourceRoot=str(Path(self.temporary.name) / "dataset"),
+        )
+        config.nl["systemPrompt"] = "describe"
+        result = start(_PreflightBody(config=config.to_dict()))
+        self.assertEqual("queued", result["status"])
+        self.assertEqual(0, int(result["lastEventId"]))
+        deadline = time.monotonic() + 10
+        while True:
+            current = progress(result["jobId"])
+            if current["status"] in {"completed", "failed"}:
+                break
+            if time.monotonic() >= deadline:
+                self.fail("async preflight endpoint did not finish")
+            time.sleep(0.01)
+        self.assertEqual("completed", current["status"])
+        self.assertEqual((0, 0), (current["checkedFiles"], current["totalFiles"]))
+        self.assertIsInstance(current["summary"], dict)
+
+    def test_async_preflight_cancel_endpoint_delegates_to_preparation_service(self) -> None:
+        cancel = _endpoint(self.app, "/api/jobs/preflight/{job_id}/cancel", "POST")
+        with patch.object(self.preparation, "cancel_preflight", return_value=True) as requested:
+            result = cancel("preflight-job",)
+        self.assertEqual({"jobId": "preflight-job", "cancelled": True}, result)
+        requested.assert_called_once_with("preflight-job")
 
     def test_confirm_workspace_maps_dataset_claim_conflict_to_actionable_409(self) -> None:
         dataset = Path(self.temporary.name) / "dataset"
@@ -1168,6 +1256,24 @@ class ControlPlaneApiTests(unittest.TestCase):
         self.assertEqual(("job-api", 2), (response["jobId"], response["restored"]))
         self.assertEqual(original_json, (dataset / "image.json").read_bytes())
         self.assertEqual(original_txt, (dataset / "image.txt").read_bytes())
+        database = StateDatabase.open(self.database_path)
+        try:
+            database.connection.execute("UPDATE jobs SET status='succeeded_with_issues' WHERE job_id='job-api'")
+        finally:
+            database.close()
+        partial_response = restore("job-api", _ConfirmBody(confirmed=True))
+        self.assertEqual(("job-api", 2), (partial_response["jobId"], partial_response["restored"]))
+
+    def test_partial_success_snapshot_does_not_expose_repair_preview(self) -> None:
+        database = StateDatabase.open(self.database_path)
+        try:
+            database.connection.execute("UPDATE jobs SET status='succeeded_with_issues' WHERE job_id='job-api'")
+        finally:
+            database.close()
+        snapshot = _endpoint(self.app, "/api/jobs/{job_id}", "GET")(
+            "job-api", afterEventId=0, issueAfterSampleId=0, issueAfterIssueId=None, limit=200,
+        )
+        self.assertIsNone(snapshot["repairPreview"])
 
     def test_snapshot_exposes_bounded_export_summary_without_issue_payload(self) -> None:
         dataset = Path(self.temporary.name) / "dataset"
@@ -1180,7 +1286,7 @@ class ControlPlaneApiTests(unittest.TestCase):
         finally:
             database.close()
         snapshot = _endpoint(self.app, "/api/jobs/{job_id}", "GET")("job-api", afterEventId=0, issueAfterSampleId=0, issueAfterIssueId=None, limit=200)
-        self.assertEqual({"format":"both","commitStatus":"backup_verified","scanned":19,"valid":12,"invalid":3,"exported":0,"skipped":4,"issueCount":3,"issuesPageEndpoint":"/api/jobs/job-api?issueAfterSampleId=0","convertedSamples":0,"conversions":{}}, snapshot["exportSummary"])
+        self.assertEqual({"format":"both","commitStatus":"backup_verified","scanned":19,"valid":12,"invalid":3,"exported":0,"skipped":4,"issueCount":3,"issuesPageEndpoint":"/api/jobs/job-api?issueAfterSampleId=0","convertedSamples":0,"conversions":{},"unlabeled":0,"unlabeledFolder":None}, snapshot["exportSummary"])
 
     def test_snapshot_uses_event_cursor_and_keyset_paged_issues_with_attempts(self) -> None:
         database = StateDatabase.open(self.database_path)
@@ -1281,6 +1387,142 @@ class ControlPlaneApiTests(unittest.TestCase):
         try:
             with self.assertRaises(KeyError):
                 database.get_job("job-api")
+        finally:
+            database.close()
+
+    def test_delete_history_releases_completed_lock_before_removing_control_record(self) -> None:
+        delete_history = _endpoint(self.app, "/api/jobs/{job_id}/delete-history", "POST")
+        released: list[str] = []
+        self.preparation.release_lock_for_history_deletion = lambda job_id: released.append(job_id) or False  # type: ignore[method-assign]
+        database = StateDatabase.open(self.database_path)
+        try:
+            database.connection.execute(
+                "UPDATE jobs SET status='succeeded', finished_at='2026-07-24T00:01:00Z' WHERE job_id='job-api'"
+            )
+        finally:
+            database.close()
+
+        self.assertEqual(
+            {
+                "jobId": "job-api",
+                "deletedControlRecord": True,
+                "preserved": {"dataset": True, "exports": True, "backup": True},
+            },
+            delete_history("job-api", _ConfirmBody(confirmed=True)),
+        )
+        self.assertEqual(["job-api"], released)
+        database = StateDatabase.open(self.database_path)
+        try:
+            with self.assertRaises(KeyError):
+                database.get_job("job-api")
+        finally:
+            database.close()
+
+    def test_delete_history_keeps_the_control_record_when_confirmation_or_lock_release_fails(self) -> None:
+        delete_history = _endpoint(self.app, "/api/jobs/{job_id}/delete-history", "POST")
+        released: list[str] = []
+        self.preparation.release_lock_for_history_deletion = lambda job_id: released.append(job_id) or (_ for _ in ()).throw(  # type: ignore[method-assign]
+            JobPreflightError("injected completed lock release failure")
+        )
+        database = StateDatabase.open(self.database_path)
+        try:
+            database.connection.execute(
+                "UPDATE jobs SET status='succeeded', finished_at='2026-07-24T00:01:00Z' WHERE job_id='job-api'"
+            )
+        finally:
+            database.close()
+
+        with self.assertRaises(HTTPException) as unconfirmed:
+            delete_history("job-api", _ConfirmBody(confirmed=False))
+        self.assertEqual(400, unconfirmed.exception.status_code)
+        self.assertEqual([], released)
+        with self.assertRaises(HTTPException) as failed_release:
+            delete_history("job-api", _ConfirmBody(confirmed=True))
+        self.assertEqual(400, failed_release.exception.status_code)
+        self.assertEqual(["job-api"], released)
+        database = StateDatabase.open(self.database_path)
+        try:
+            self.assertEqual("succeeded", database.get_job("job-api")["status"])
+        finally:
+            database.close()
+
+    def test_delete_history_rejects_parent_when_repair_child_exists_without_releasing_locks(self) -> None:
+        delete_history = _endpoint(self.app, "/api/jobs/{job_id}/delete-history", "POST")
+        released: list[str] = []
+        self.preparation.release_lock_for_history_deletion = lambda job_id: released.append(job_id) or False  # type: ignore[method-assign]
+        database = StateDatabase.open(self.database_path)
+        try:
+            template = dict(database.get_job("job-api"))
+            database.insert_job({
+                **template,
+                "job_id": "repair-api",
+                "status": "succeeded",
+                "finished_at": "2026-07-24T00:01:00Z",
+            })
+            database.create_repair_link("repair-api", "job-api")
+            database.connection.execute(
+                "UPDATE jobs SET status='succeeded', finished_at='2026-07-24T00:01:00Z' WHERE job_id='job-api'"
+            )
+        finally:
+            database.close()
+
+        with self.assertRaises(HTTPException) as rejected:
+            delete_history("job-api", _ConfirmBody(confirmed=True))
+        self.assertEqual(400, rejected.exception.status_code)
+        self.assertIn("请先删除修复子任务", str(rejected.exception.detail))
+        self.assertEqual([], released)
+        database = StateDatabase.open(self.database_path)
+        try:
+            self.assertEqual("succeeded", database.get_job("job-api")["status"])
+            self.assertEqual("succeeded", database.get_job("repair-api")["status"])
+            self.assertTrue(database.has_repair_children("job-api"))
+        finally:
+            database.close()
+
+    def test_delete_history_for_repair_child_releases_only_repair_service_lock(self) -> None:
+        repair_service = importlib.import_module("anima_core.repair").RepairPreparationService(self.database_path)
+        app = build_control_app(
+            database_path=self.database_path,
+            profile_store=self.profiles,
+            credential_store=self.credentials,
+            preparation_service=self.preparation,
+            pipeline_service=self.pipeline,
+            repair_service=repair_service,
+        )
+        delete_history = _endpoint(app, "/api/jobs/{job_id}/delete-history", "POST")
+        preparation_releases: list[str] = []
+        repair_releases: list[str] = []
+        self.preparation.release_lock_for_history_deletion = lambda job_id: preparation_releases.append(job_id) or False  # type: ignore[method-assign]
+        repair_service.release_lock_for_history_deletion = lambda job_id: repair_releases.append(job_id) or False  # type: ignore[method-assign]
+        database = StateDatabase.open(self.database_path)
+        try:
+            template = dict(database.get_job("job-api"))
+            database.insert_job({
+                **template,
+                "job_id": "repair-api",
+                "status": "succeeded",
+                "finished_at": "2026-07-24T00:01:00Z",
+            })
+            database.create_repair_link("repair-api", "job-api")
+        finally:
+            database.close()
+
+        self.assertEqual(
+            {
+                "jobId": "repair-api",
+                "deletedControlRecord": True,
+                "preserved": {"dataset": True, "exports": True, "backup": True},
+            },
+            delete_history("repair-api", _ConfirmBody(confirmed=True)),
+        )
+        self.assertEqual([], preparation_releases)
+        self.assertEqual(["repair-api"], repair_releases)
+        database = StateDatabase.open(self.database_path)
+        try:
+            with self.assertRaises(KeyError):
+                database.get_job("repair-api")
+            self.assertEqual("job-api", database.get_job("job-api")["job_id"])
+            self.assertFalse(database.has_repair_children("job-api"))
         finally:
             database.close()
 

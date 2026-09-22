@@ -36,7 +36,7 @@ class SourceBootstrapPowerShellTests(unittest.TestCase):
         bootstrap_payload = b"fixture bootstrap artifact"
         mandatory = (
             "core", "caption-e621", "classify-e621", "replace-e621", "nl", "policy",
-            "export", "token-budget", "ocr-cpu", "e621-tagger", "qwen3-tokenizer", "quality-stack",
+            "export", "token-budget", "e621-tagger", "qwen3-tokenizer", "quality-stack",
         )
         components: list[dict[str, object]] = []
         for component_id in mandatory:
@@ -292,6 +292,7 @@ class SourceBootstrapPowerShellTests(unittest.TestCase):
             "Invoke-Expression $node.Extent.Text }; "
             "$manifest=[pscustomobject]@{bootstrap=[pscustomobject]@{peakBytes=1;artifact=[pscustomobject]@{sizeBytes=2}};components=@("
             "[pscustomobject]@{componentId='core';required=$true;variants=[pscustomobject]@{cpu=[pscustomobject]@{peakBytes=3;artifacts=@([pscustomobject]@{sizeBytes=4})}}},"
+            "[pscustomobject]@{componentId='ocr-cpu';required=$false;variants=[pscustomobject]@{cpu=[pscustomobject]@{peakBytes=50;artifacts=@([pscustomobject]@{sizeBytes=60})}}},"
             "[pscustomobject]@{componentId='ocr-gpu';required=$false;variants=[pscustomobject]@{cuda=[pscustomobject]@{peakBytes=100;artifacts=@([pscustomobject]@{sizeBytes=200})}}},"
             "[pscustomobject]@{componentId='fixture-shared';required=$true;variants=[pscustomobject]@{shared=[pscustomobject]@{peakBytes=5;artifacts=@([pscustomobject]@{sizeBytes=6})}}},"
             "[pscustomobject]@{componentId='ocr-models';required=$false;variants=[pscustomobject]@{shared=[pscustomobject]@{peakBytes=300;artifacts=@([pscustomobject]@{sizeBytes=400})}}}"
@@ -513,12 +514,14 @@ class SourceBootstrapPowerShellTests(unittest.TestCase):
                         check=False, timeout=12,
                     )
 
-    def test_release_validator_requires_ocr_runtime_but_not_manual_ocr_models(self) -> None:
+    def test_release_validator_treats_ocr_runtime_and_models_as_optional(self) -> None:
         self.assertTrue(RELEASE_VALIDATOR.is_file(), "source bootstrap release validator must exist")
         script = RELEASE_VALIDATOR.read_text(encoding="utf-8")
 
         self.assertIn("'ocr-cpu'", script)
-        self.assertNotIn("'ocr-models'", script)
+        self.assertIn("'ocr-gpu'", script)
+        self.assertIn("'ocr-models'", script)
+        self.assertIn("optional OCR", script)
 
     def test_release_validator_has_explicit_published_bootstrap_verification_mode(self) -> None:
         self.assertTrue(RELEASE_VALIDATOR.is_file(), "source bootstrap release validator must exist")

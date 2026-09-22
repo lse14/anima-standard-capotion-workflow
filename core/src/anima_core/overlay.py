@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .contracts import canonical_json, utc_now
+from .dataset_workspace import DatasetWorkspace
 from .path_safety import (
     IMAGE_EXTENSIONS,
     PathSafetyError,
     atomic_write_bytes,
     canonicalize,
     ensure_within,
+    replace_with_sharing_retry,
     safe_relative_path,
     sha256_file,
 )
@@ -51,8 +53,14 @@ class OverlayLayout:
         safe_job = "".join(character for character in job_id if character.isalnum() or character in "-_")
         if not safe_job or safe_job != job_id:
             raise OverlayError("jobId contains unsafe characters")
-        overlay = dataset.parent / f".{dataset.name}.anima-overlay-{safe_job}"
-        ensure_within(dataset.parent, overlay)
+        workspace = DatasetWorkspace.for_dataset(dataset)
+        job_root = workspace.job_root(job_id, create=False)
+        workspace.root.mkdir(parents=True, exist_ok=True)
+        (workspace.root / "jobs").mkdir(parents=True, exist_ok=True)
+        if job_root.exists():
+            raise OverlayError(f"task workspace already exists: {job_root}")
+        job_root.mkdir()
+        overlay = workspace.overlay_root(job_id)
         if overlay.exists():
             raise OverlayError(f"overlay already exists: {overlay}")
         overlay.mkdir()
@@ -66,12 +74,13 @@ class OverlayLayout:
                 "schemaVersion": 1,
                 "jobId": job_id,
                 "datasetRoot": str(dataset),
+                "layout": "dataset_workspace_v1",
                 "createdAt": utc_now(),
             }
             atomic_write_bytes(overlay, OVERLAY_MARKER, (canonical_json(marker) + "\n").encode("utf-8"))
             _set_hidden(overlay)
         except Exception:
-            shutil.rmtree(overlay, ignore_errors=True)
+            shutil.rmtree(job_root, ignore_errors=True)
             raise
         return cls(job_id, dataset, overlay)
 
@@ -160,7 +169,7 @@ class OverlayLayout:
             raise OverlayError("prepared artifact is missing or has an invalid digest")
         destination = self.annotation_path(annotation_key, suffix)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(prepared, destination)
+        replace_with_sharing_retry(prepared, destination)
         return destination
 
     def write_ocr_prepared(self, lease_id: str, data: bytes) -> tuple[Path, str]:
@@ -181,7 +190,7 @@ class OverlayLayout:
             raise OverlayError("OCR prepared artifact is missing or has an invalid digest")
         destination = self.ocr_sidecar_path(relative_image_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(prepared, destination)
+        replace_with_sharing_retry(prepared, destination)
         return destination
 
     def commit_journal_path(self) -> Path:
@@ -207,7 +216,7 @@ class OverlayLayout:
         payload = dict(value)
         payload.setdefault("schemaVersion", 1)
         payload.setdefault("jobId", self.job_id)
-        if payload["schemaVersion"] != 1 or payload["jobId"] != self.job_id:
+        if payload["schemaVersion"] not in {1, 2} or payload["jobId"] != self.job_id:
             raise OverlayError("commit journal does not match overlay")
         return atomic_write_bytes(self.root, "commit\\journal.json", (canonical_json(payload) + "\n").encode("utf-8"))
 
@@ -219,7 +228,15 @@ class OverlayLayout:
         verified = self.open_existing(self.root, self.job_id)
         if verified.has_unresolved_journal():
             raise OverlayError("commit journal must be resolved before discard")
+        job_root = verified.root.parent
         shutil.rmtree(verified.root)
+        # Reclaim only this resolved task directory.  Sibling jobs and
+        # dataset-level backups remain untouched.
+        try:
+            if job_root.is_dir() and not any(job_root.iterdir()):
+                job_root.rmdir()
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)

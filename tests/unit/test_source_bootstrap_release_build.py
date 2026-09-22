@@ -108,6 +108,9 @@ class SourceBootstrapReleaseBuildTests(unittest.TestCase):
             },
             {item["componentId"] for item in value["manifest"]["components"]},
         )
+        components = {item["componentId"]: item for item in value["manifest"]["components"]}
+        self.assertFalse(components["ocr-cpu"]["required"])
+        self.assertFalse(components["ocr-gpu"]["required"])
         self.assertEqual(
             {
                 "core:cpu", "caption-e621:cpu", "caption-e621:cuda", "classify-e621:cpu",
@@ -142,6 +145,18 @@ class SourceBootstrapReleaseBuildTests(unittest.TestCase):
                 artifacts = component["variants"]["shared"]["artifacts"]
                 self.assertEqual(contract["files"], {artifact["relativePath"] for artifact in artifacts})
                 self.assertTrue(all(artifact["delivery"] == "source-tree" for artifact in artifacts))
+
+    def test_manifest_builder_rejects_required_ocr_components(self) -> None:
+        self.assertTrue(INVENTORY.is_file(), "source-bootstrap inventory must exist")
+        value = json.loads(INVENTORY.read_text(encoding="utf-8"))
+        value["manifest"]["components"] = [
+            dict(component) for component in value["manifest"]["components"]
+        ]
+        next(component for component in value["manifest"]["components"] if component["componentId"] == "ocr-cpu")["required"] = True
+        module = _load_manifest_builder()
+        self.assertIsNotNone(module, "source bootstrap manifest builder must exist")
+        with self.assertRaisesRegex(module.ManifestBuildError, "optional component"):
+            module.audit_inventory(value, REQUIREMENTS)
 
     def test_production_source_tree_identities_match_the_tracked_git_blobs(self) -> None:
         value = json.loads(INVENTORY.read_text(encoding="utf-8"))

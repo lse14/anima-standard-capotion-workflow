@@ -8,15 +8,18 @@ import os
 import re
 import threading
 from pathlib import Path
+from typing import Literal
 
 from . import PROTOCOL_VERSION
 from .contracts import SampleIssue
+from .commit_journal import CommitJournal, load as load_commit_journal
 from .caption_overlay import CaptionOverlayWriter
 from .classify_overlay import ClassifyOverlayWriter
 from .count_review_overlay import CountReviewOverlayWriter
 from .db import StateDatabase
 from .db_scheduler import _complete_leased_sample_with_issue
 from .export_commit import ExportCommitCoordinator
+from .export_summary import UNLABELED_IMAGES_CODE
 from .job_preflight import config_from_dict
 from .nl_overlay import NlOverlayWriter
 from .ocr_sidecar import OcrSidecarError, parse_ocr_sidecar
@@ -28,6 +31,20 @@ from .token_budget_overlay import TokenBudgetOverlayWriter
 from .token_budget_review import TokenBudgetReviewService
 from .retention import RetentionManager
 from .scheduler import BoundedScheduler
+
+
+ExportRecoveryKind = Literal["manual_recommit", "automatic_switch_recovery", "resolved"]
+
+
+def classify_export_recovery(journal: CommitJournal) -> ExportRecoveryKind:
+    """Classify directory recovery without changing any filesystem state."""
+    if journal.state in {"prepared", "declared", "staging", "staged", "backup_verified"}:
+        return "manual_recommit"
+    if journal.state in {"rollback_created", "rollback_required"}:
+        return "automatic_switch_recovery"
+    if journal.state in {"committed", "rolled_back"}:
+        return "resolved"
+    raise PipelineError("commit journal has no supported recovery classification")
 
 
 def _recover_ocr_prepared(
@@ -172,6 +189,15 @@ class PipelineRecoveryMixin:
                     layout = OverlayLayout.open_existing(
                         str(row["overlay_root"]), job_id, allow_missing_dataset=True,
                     )
+                    journal = load_commit_journal(layout)
+                    if journal is None:
+                        continue
+                    recovery_kind = classify_export_recovery(journal)
+                    if recovery_kind == "manual_recommit":
+                        database.mark_interrupted(
+                            job_id, allow_failed=str(row["status"]) == "failed",
+                        )
+                        continue
                     result = ExportCommitCoordinator.recover(layout)
                     # Startup recovery may already have frozen the job, so the
                     # module it was interrupted in decides the outcome.
@@ -179,7 +205,10 @@ class PipelineRecoveryMixin:
                     if status == "interrupted" and row["resume_status"]:
                         status = str(row["resume_status"])
                     if result == "committed" and status == "committing":
-                        database.set_job_status(job_id, "succeeded", current_module_id="export")
+                        terminal_status = "succeeded_with_issues" if database.module_diagnostic_count(
+                            job_id, "export", UNLABELED_IMAGES_CODE,
+                        ) > 0 else "succeeded"
+                        database.set_job_status(job_id, terminal_status, current_module_id="export")
                     elif result == "rolled_back" and status in {"exporting", "committing", "cancelling"}:
                         database.set_job_status(job_id, "failed", current_module_id="export")
         finally:
@@ -256,6 +285,27 @@ class PipelineRecoveryMixin:
                     raise PipelineError("frozen JobConfig hash no longer matches")
                 module_id = job["current_module_id"]
                 resume_status = job["resume_status"]
+                if not isinstance(job["overlay_root"], str) or not job["overlay_root"]:
+                    raise PipelineError("interrupted job has no annotation overlay")
+                layout = OverlayLayout.open_existing(str(job["overlay_root"]), job_id)
+                if module_id == "export" and job["status"] == "interrupted":
+                    summary = database.module_summary(job_id, "export")
+                    journal = load_commit_journal(layout)
+                    if (
+                        summary["status"] == "completed"
+                        and journal is not None
+                        and classify_export_recovery(journal) == "manual_recommit"
+                    ):
+                        return {
+                            "jobId": job_id,
+                            "returnedLeases": 0,
+                            "committedPrepared": 0,
+                            "repeatedPrepared": 0,
+                            "pendingApiDecisions": 0,
+                            "started": False,
+                            "status": "interrupted",
+                            "recoveryKind": "export_recommit",
+                        }
                 target_status = self._recovery_target_status(module_id)
                 if not isinstance(resume_status, str):
                     raise PipelineError("interrupted job has no recoverable worker state")
@@ -266,9 +316,6 @@ class PipelineRecoveryMixin:
                 )
                 if resume_status not in allowed_resume_statuses:
                     raise PipelineError("persisted recovery target is incompatible with current module")
-                if not isinstance(job["overlay_root"], str) or not job["overlay_root"]:
-                    raise PipelineError("interrupted job has no annotation overlay")
-                layout = OverlayLayout.open_existing(str(job["overlay_root"]), job_id)
                 view = WorkingAnnotationView(BaselineView(Path(str(job["dataset_root"]))), layout)
                 if module_id == "token_budget":
                     # Review-owned unprepared leases must return to the failed review

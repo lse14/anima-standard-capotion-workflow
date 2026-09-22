@@ -24,7 +24,12 @@ def reveal_staging(staging_root:str|Path)->None:
 
 def create_hardlink_staging(dataset_root:str|Path,staging_root:str|Path)->Path:
     dataset=canonicalize(dataset_root,must_exist=True,directory=True).value; staging=canonicalize(staging_root,directory=True).value
-    if dataset.parent!=staging.parent or staging.exists(): raise StagingError("staging must be a new dataset sibling")
+    if staging.exists(): raise StagingError("staging must be a new workspace path")
+    try:
+        if dataset.stat().st_dev != staging.parent.stat().st_dev:
+            raise StagingError("staging must remain on the dataset volume")
+    except OSError as exc:
+        raise StagingError("staging volume cannot be verified") from exc
     assert_no_reparse_tree(dataset);staging.mkdir()
     stack=[(dataset,staging)]
     try:

@@ -20,12 +20,13 @@
 
 ## OCR 手动归档
 
-OCR is disabled by default。`Install-WebUI.bat` 会安装 OCR CPU runtime；检测到 NVIDIA
-时也会安装 GPU runtime，但不会自动下载或重新分发 OCR 模型权重。请按项目根
-[OCR_MODEL_DOWNLOAD.md](../OCR_MODEL_DOWNLOAD.md) 中固定的三个官方 URL、文件名、大小和
-SHA-256，将未解压归档放入 `ocr-model-archives`，再双击 `Install-WebUI.bat`。
+OCR is disabled by default。`Install-WebUI.bat` 只安装基础 WebUI，不安装 OCR runtime
+或模型。请按项目根 [OCR_MODEL_DOWNLOAD.md](../OCR_MODEL_DOWNLOAD.md) 中固定的三个官方
+URL、文件名、大小和 SHA-256，将未解压归档放入 `ocr-model-archives`，再使用
+`Install-Ocr.bat` 安装并验证 CPU runtime；需要 CUDA 时，在 CPU fallback 完整后使用
+`Install-OcrGpu.bat`。
 
-安装器会验证归档、在项目内 staging 运行 offline CPU OCR probe 并发布
+可选入口会验证归档、在项目内 staging 运行 offline CPU OCR probe，并只在验证通过后发布
 `resource-library/ocr-models/`。没有通过该验证时，基础 WebUI 仍可用，only OCR-enabled
 jobs are blocked。`Install-WebUI.bat` 没有 `-OcrMode` 参数；OCR 归档、正式 OCR 资源和
 runtime 都不应提交到 Git。

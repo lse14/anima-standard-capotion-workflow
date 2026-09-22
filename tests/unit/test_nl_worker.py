@@ -211,6 +211,26 @@ class NlWorkerTests(unittest.TestCase):
             asyncio.run(scenario())
         self.assertTrue(factory.call_args.kwargs["trust_env"])
 
+    def test_initialize_refreshes_connection_for_a_batch_boundary_revision(self) -> None:
+        clients: list[_Client] = []
+
+        def make_client(**kwargs):
+            client = _Client(**kwargs)
+            clients.append(client)
+            return client
+
+        with patch("anima_nl_worker.worker.httpx.AsyncClient", side_effect=make_client):
+            async def scenario() -> tuple[str, str, int]:
+                worker = NlWorker()
+                await worker.initialize(_hello())
+                updated = {**_hello(), "endpoint": "https://new.example/v1", "model": "new-model", "providerLabel": "gemini-relay"}
+                await worker.initialize(updated)
+                assert worker.hello is not None
+                return worker.hello.endpoint, worker.hello.model, len(clients)
+
+            endpoint, model, client_count = asyncio.run(scenario())
+        self.assertEqual(("https://new.example/v1/chat/completions", "new-model", 2), (endpoint, model, client_count))
+
     def test_endpoint_and_response_validation(self) -> None:
         self.assertEqual("https://example.test/v1/chat/completions", normalize_endpoint("https://example.test/v1"))
         self.assertEqual("http://localhost:8080/chat/completions", normalize_endpoint("http://localhost:8080"))
@@ -267,6 +287,24 @@ class NlWorkerTests(unittest.TestCase):
             with self.subTest(content=content), self.assertRaises(NlValidationError):
                 body = json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": content}}]}).encode("utf-8")
                 validate_completion_response_v2(body)
+
+    def test_v2_response_validation_accepts_json_code_fence(self) -> None:
+        body = json.dumps({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "```json\n"
+                    '{"nl":"A character stands in a room.","count":"solo",'
+                    '"layout":"single_scene","sameCharacterRepeated":false}\n```',
+                },
+            }],
+        }).encode("utf-8")
+
+        nl, observation, _, _ = validate_completion_response_v2(body)
+
+        self.assertEqual("A character stands in a room.", nl)
+        self.assertEqual("solo", observation["countValue"])
+        self.assertEqual("single_scene", observation["layoutValue"])
 
     def test_protocol_requires_exact_bounded_context(self) -> None:
         hello = parse_hello(_hello())
@@ -412,7 +450,7 @@ class NlWorkerTests(unittest.TestCase):
         self.assertEqual(("nl_issue", "nl_image_not_received", False), (result["payloadType"], result["code"], result["retriable"]))
 
     def test_final_api_unavailable_is_non_retriable_after_attempts(self) -> None:
-        client = _SequenceClient([_RetryableResponse()])
+        client = _SequenceClient([_RetryableResponse(), _RetryableResponse()])
         with patch("anima_nl_worker.worker.httpx.AsyncClient", return_value=client), patch("anima_nl_worker.worker.asyncio.sleep", return_value=None):
             async def scenario() -> dict[str, object]:
                 worker = NlWorker()
@@ -424,7 +462,7 @@ class NlWorkerTests(unittest.TestCase):
                 await worker.close()
                 return result
             result = asyncio.run(scenario())
-        self.assertEqual(("nl_api_unavailable", False), (result["code"], result["retriable"]))
+        self.assertEqual(("nl_api_unavailable", False, 2), (result["code"], result["retriable"], result["httpAttempts"]))
 
     def test_missing_image_path_is_non_retriable_without_http_request(self) -> None:
         payload = _process()
@@ -551,15 +589,16 @@ class NlWorkerTests(unittest.TestCase):
             result = asyncio.run(scenario())
         self.assertEqual(("nl_result_v2", "invalid", 1, 1), (result["payloadType"], result["observation"]["status"], result["httpAttempts"], len(client.calls)))
 
-    def test_v2_invalid_nl_fails_without_observation_retry(self) -> None:
+    def test_v2_invalid_nl_uses_one_recovery_attempt(self) -> None:
         hello = _hello()
         hello["responseProtocol"] = "nl-count-v2"
-        client = _SequenceClient([_StructuredResponse({
+        invalid = _StructuredResponse({
             "nl": "",
             "count": "solo",
             "layout": "single_scene",
             "sameCharacterRepeated": False,
-        })])
+        })
+        client = _SequenceClient([invalid, invalid])
         with patch("anima_nl_worker.worker.httpx.AsyncClient", return_value=client):
             async def scenario() -> dict[str, object]:
                 worker = NlWorker()
@@ -570,7 +609,7 @@ class NlWorkerTests(unittest.TestCase):
                 return result
 
             result = asyncio.run(scenario())
-        self.assertEqual(("nl_issue", "nl_response_invalid", 1, 1), (result["payloadType"], result["code"], result["httpAttempts"], len(client.calls)))
+        self.assertEqual(("nl_issue", "nl_response_invalid", 2, 2), (result["payloadType"], result["code"], result["httpAttempts"], len(client.calls)))
 
     def test_v2_network_retry_uses_existing_attempt_policy_only(self) -> None:
         hello = _hello()
@@ -647,7 +686,7 @@ class NlWorkerTests(unittest.TestCase):
         self.assertIn("nl_budget_exhausted", {item.get("code") for item in result})
 
     def test_backup_model_runs_only_after_main_attempts_are_exhausted(self) -> None:
-        client = _SequenceClient([_RetryableResponse(), _Response()])
+        client = _SequenceClient([_RetryableResponse(), _RetryableResponse(), _Response()])
         hello = _hello()
         hello["backupModel"] = "backup"
         hello["apiPolicy"].update({"mainAttempts": 1, "backupEnabled": True, "backupAttempts": 1})
@@ -655,13 +694,15 @@ class NlWorkerTests(unittest.TestCase):
             async def scenario() -> dict[str, object]:
                 worker = NlWorker()
                 await worker.initialize(hello)
-                items, allowance = parse_process(_process())
+                payload = _process()
+                payload["httpAttemptAllowance"] = 3
+                items, allowance = parse_process(payload)
                 result = (await worker.process(items, allowance))[0]
                 await worker.close()
                 return result
             result = asyncio.run(scenario())
-        self.assertEqual(("nl_result", 2), (result["payloadType"], result["httpAttempts"]))
-        self.assertEqual(["main", "backup"], [call["json"]["model"] for call in client.calls])
+        self.assertEqual(("nl_result", 3), (result["payloadType"], result["httpAttempts"]))
+        self.assertEqual(["main", "main", "backup"], [call["json"]["model"] for call in client.calls])
 
     def test_main_model_retries_before_success(self) -> None:
         client = _SequenceClient([_RetryableResponse(), _Response()])
@@ -679,8 +720,33 @@ class NlWorkerTests(unittest.TestCase):
         self.assertEqual(("nl_result", 2), (result["payloadType"], result["httpAttempts"]))
         self.assertEqual(["main", "main"], [call["json"]["model"] for call in client.calls])
 
+    def test_repeated_hello_policy_controls_next_batch_http_requests(self) -> None:
+        client = _SequenceClient([_RetryableResponse(), _RetryableResponse(), _Response()])
+        old_hello = _hello()
+        old_hello["providerLabel"] = "gemini-relay"
+        old_hello["apiPolicy"]["mainAttempts"] = 1
+        new_hello = _hello()
+        new_hello["providerLabel"] = "gemini-relay"
+        new_hello["apiPolicy"].update({"mainAttempts": 2, "connectTimeoutSeconds": 3, "readTimeoutSeconds": 5})
+        with patch("anima_nl_worker.worker.httpx.AsyncClient", return_value=client), patch("anima_nl_worker.worker.asyncio.sleep", return_value=None):
+            async def scenario() -> tuple[dict[str, object], dict[str, object]]:
+                worker = NlWorker()
+                await worker.initialize(old_hello)
+                items, allowance = parse_process(_process())
+                first = (await worker.process(items, allowance))[0]
+                await worker.initialize(new_hello)
+                items, allowance = parse_process(_process())
+                second = (await worker.process(items, allowance))[0]
+                await worker.close()
+                return first, second
+
+            first, second = asyncio.run(scenario())
+        self.assertEqual(("nl_issue", "nl_api_unavailable", 1), (first["payloadType"], first["code"], first["httpAttempts"]))
+        self.assertEqual(("nl_result", 2), (second["payloadType"], second["httpAttempts"]))
+        self.assertEqual(3, len(client.calls))
+
     def test_oversized_response_is_rejected_before_json_parsing(self) -> None:
-        client = _SequenceClient([_OversizedResponse()])
+        client = _SequenceClient([_OversizedResponse(), _OversizedResponse()])
         with patch("anima_nl_worker.worker.httpx.AsyncClient", return_value=client):
             async def scenario() -> dict[str, object]:
                 worker = NlWorker()
@@ -690,8 +756,8 @@ class NlWorkerTests(unittest.TestCase):
                 await worker.close()
                 return result
             result = asyncio.run(scenario())
-        self.assertEqual(("nl_issue", "nl_response_invalid", 1), (result["payloadType"], result["code"], result["httpAttempts"]))
-        self.assertEqual(1, len(client.calls))
+        self.assertEqual(("nl_issue", "nl_response_invalid", 2), (result["payloadType"], result["code"], result["httpAttempts"]))
+        self.assertEqual(2, len(client.calls))
 
     def test_requests_respect_the_configured_concurrency(self) -> None:
         client = _ConcurrencyClient()

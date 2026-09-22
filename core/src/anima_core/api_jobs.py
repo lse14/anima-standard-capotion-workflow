@@ -7,10 +7,18 @@ from fastapi import APIRouter, Query
 
 from .annotation_restore import AnnotationRestoreCoordinator, AnnotationRestoreError
 from .api_context import ControlPlaneContext, bad_request, conflict, not_found
-from .api_models import _ConfirmBody, _PinBody, _PreflightBody, _WorkspaceBody, parse_create_job_body
+from .api_models import (
+    _ConfirmBody,
+    _ExportRecommitBody,
+    _PinBody,
+    _PreflightBody,
+    _WorkspaceBody,
+    parse_create_job_body,
+)
 from .commit_journal import CommitJournalError, load as load_journal
 from .contracts import job_config_supports_ocr_device, pipeline_module_ids
 from .db import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, StateDatabase
+from .export_recommit import ExportRecommitError, ExportRecommitService
 from .export_summary import build_export_summary
 from .job_preflight import JobPreflightError
 from .lifecycle import JobLifecycle, JobLifecycleError
@@ -93,6 +101,74 @@ def _dropout_runtime_snapshot(job: object) -> dict[str, object] | None:
         return None
     value = evidence.get("dropout") if isinstance(evidence, dict) else None
     return value if isinstance(value, dict) else None
+
+
+def _nl_api_runtime_snapshot(job: object, config: object) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    """Expose the active and queued connection-only revisions without secrets."""
+    frozen: dict[str, object] | None = None
+    if isinstance(config, dict) and isinstance(config.get("nl"), dict):
+        value = config["nl"].get("apiRuntime")
+        if isinstance(value, dict):
+            frozen = dict(value)
+    active = frozen
+    pending: dict[str, object] | None = None
+    if isinstance(job, dict) and isinstance(job.get("runtime_evidence_json"), str):
+        try:
+            evidence = json.loads(str(job["runtime_evidence_json"]))
+        except (TypeError, json.JSONDecodeError):
+            evidence = None
+        if isinstance(evidence, dict):
+            persisted = evidence.get("_nlApiRuntime")
+            queued = evidence.get("_nlApiOverride")
+            if isinstance(persisted, dict):
+                active = dict(persisted)
+            if isinstance(queued, dict) and isinstance(queued.get("runtime"), dict):
+                pending = dict(queued["runtime"])
+    return active, pending
+
+
+def _nl_api_task_revision(job: object) -> int:
+    """Expose the monotonic task-local API revision without credential data."""
+    if not isinstance(job, dict) or not isinstance(job.get("runtime_evidence_json"), str):
+        return 0
+    try:
+        evidence = json.loads(str(job["runtime_evidence_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return 0
+    if not isinstance(evidence, dict):
+        return 0
+    pending = evidence.get("_nlApiOverride")
+    if isinstance(pending, dict) and type(pending.get("taskRevision")) is int:
+        return int(pending["taskRevision"])
+    value = evidence.get("_nlApiTaskRevision")
+    return int(value) if type(value) is int and value >= 0 else 0
+
+
+def _preflight_progress_response(database: StateDatabase, job_id: str) -> dict[str, object]:
+    """Map the durable preflight row to the public polling payload."""
+    progress = database.get_preflight_progress(job_id)
+    job = database.get_job(job_id)
+    raw_summary = progress.get("summary_json")
+    summary: dict[str, object] | None = None
+    if raw_summary:
+        try:
+            parsed = json.loads(str(raw_summary))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("preflight summary is invalid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("preflight summary must be an object")
+        summary = parsed
+    return {
+        "jobId": job_id,
+        "status": str(progress["status"]),
+        "checkedFiles": int(progress["checked_files"]),
+        "totalFiles": int(progress["total_files"]),
+        "error": progress["error"],
+        "summary": summary,
+        "updatedAt": progress["updated_at"],
+        # Preflight progress is intentionally independent from the event ring.
+        "lastEventId": int(job["last_event_id"]),
+    }
 
 
 def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
@@ -181,15 +257,17 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
                     module_summary=export_module, journal=journal,
                     diagnostics=database.module_diagnostics(job_id, "export"),
                 ).to_dict()
-                target_count, nl_upper_bound = database.repair_candidate_summary(job_id)
-                nl_config = config.get("nl") if isinstance(config, dict) else None
-                api_enabled = isinstance(nl_config, dict) and nl_config.get("enabled") is True and nl_config.get("apiEnabled") is True
-                repair_preview = {
-                    "eligibleTargetCount": target_count,
-                    "estimatedApiRequests": nl_upper_bound if api_enabled else 0,
-                }
+                if job["status"] != "succeeded_with_issues":
+                    target_count, nl_upper_bound = database.repair_candidate_summary(job_id)
+                    nl_config = config.get("nl") if isinstance(config, dict) else None
+                    api_enabled = isinstance(nl_config, dict) and nl_config.get("enabled") is True and nl_config.get("apiEnabled") is True
+                    repair_preview = {
+                        "eligibleTargetCount": target_count,
+                        "estimatedApiRequests": nl_upper_bound if api_enabled else 0,
+                    }
                 ocr_runtime = _ocr_runtime_snapshot(dict(job), config)
                 dropout_runtime = _dropout_runtime_snapshot(dict(job))
+                api_runtime, api_runtime_pending = _nl_api_runtime_snapshot(dict(job), config)
             except (CommitJournalError, OSError, UnicodeError, ValueError) as exc:
                 raise bad_request(exc) from exc
             return {
@@ -203,6 +281,10 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
                     "configHash": job["config_hash"], "manifestSchemaVersion": job["manifest_schema_version"],
                     "createdAt": job["created_at"], "startedAt": job["started_at"],
                     "cancelRequestedAt": job["cancel_requested_at"], "finishedAt": job["finished_at"],
+                    "frozenConfig": config,
+                    "apiRuntime": api_runtime,
+                    "apiRuntimePending": api_runtime_pending,
+                    "apiConfigRevision": _nl_api_task_revision(dict(job)),
                 },
                 "moduleOrder": list(pipeline_module_ids(int(job["config_schema_version"]))),
                 "modules": [dict(row) for row in database.module_summaries(job_id)],
@@ -249,6 +331,59 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
             "annotationKeyCollisionCount": summary.annotationKeyCollisionCount, "imageIssueCount": summary.imageIssueCount,
             "projection": summary.projection, "estimate": summary.estimate, "api": summary.api,
         }
+
+    @router.post("/api/jobs/preflight/async")
+    def start_async_preflight(body: _PreflightBody) -> dict[str, object]:
+        """Queue preflight work and return a durable, event-independent cursor."""
+        try:
+            request = parse_create_job_body(body.model_dump())
+            job_id = context.preparation_service.start_preflight(
+                request.config, ocr_execution=request.ocrExecution,
+            )
+            database = StateDatabase.open(context.database_path)
+            try:
+                progress = database.get_preflight_progress(job_id)
+                job = database.get_job(job_id)
+                # The POST acknowledges queueing, even when a tiny/empty dataset
+                # finishes before the HTTP response is serialized.  Clients then
+                # use GET to observe the authoritative status.
+                return {
+                    "jobId": job_id,
+                    "status": "queued",
+                    "checkedFiles": 0,
+                    "totalFiles": int(progress["total_files"]),
+                    "error": None,
+                    "summary": None,
+                    "updatedAt": progress["updated_at"],
+                    "lastEventId": int(job["last_event_id"]),
+                }
+            finally:
+                database.close()
+        except (JobPreflightError, ValueError) as exc:
+            raise bad_request(exc) from exc
+
+    @router.get("/api/jobs/preflight/{job_id}/progress")
+    def get_async_preflight_progress(job_id: str) -> dict[str, object]:
+        database = StateDatabase.open(context.database_path)
+        try:
+            try:
+                return _preflight_progress_response(database, job_id)
+            except KeyError as exc:
+                raise not_found(exc) from exc
+            except ValueError as exc:
+                raise bad_request(exc) from exc
+        finally:
+            database.close()
+
+    @router.post("/api/jobs/preflight/{job_id}/cancel")
+    def cancel_async_preflight(job_id: str) -> dict[str, object]:
+        try:
+            cancelled = context.preparation_service.cancel_preflight(job_id)
+            return {"jobId": job_id, "cancelled": cancelled}
+        except KeyError as exc:
+            raise not_found(exc) from exc
+        except JobPreflightError as exc:
+            raise bad_request(exc) from exc
 
     @router.post("/api/jobs/{job_id}/confirm-workspace")
     def confirm_workspace(job_id: str, body: _WorkspaceBody) -> dict[str, object]:
@@ -323,7 +458,7 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
 
     @router.post("/api/jobs/{job_id}/repair")
     def repair_job(job_id: str) -> dict[str, object]:
-        released_parent_lock = False
+        released_parent_lock: str | None = None
         try:
             database = StateDatabase.open(context.database_path)
             try:
@@ -334,7 +469,7 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
                 estimated_requests = nl_upper_bound if isinstance(nl, dict) and nl.get("enabled") is True and nl.get("apiEnabled") is True else 0
             finally:
                 database.close()
-            released_parent_lock = context.preparation_service.release_lock_for_repair(job_id)
+            released_parent_lock = context.release_lock_for_repair(job_id)
             result = context.repair_service.prepare(job_id)
             context.pipeline_service.start(result.repairJobId)
             return {
@@ -346,7 +481,7 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
             raise not_found(exc) from exc
         except (JobPreflightError, RepairPreparationError, PipelineError, SchedulerError, ValueError) as exc:
             if released_parent_lock:
-                context.preparation_service.restore_lock_after_repair_failure(job_id)
+                context.restore_lock_after_repair_failure(job_id, released_parent_lock)
             raise bad_request(exc) from exc
 
     @router.post("/api/jobs/{job_id}/recover")
@@ -356,6 +491,28 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
         except KeyError as exc:
             raise not_found(exc) from exc
         except (PipelineError, SchedulerError, ValueError) as exc:
+            raise bad_request(exc) from exc
+
+    @router.get("/api/jobs/{job_id}/export/recommit")
+    def preview_export_recommit(job_id: str) -> dict[str, object]:
+        try:
+            return ExportRecommitService(context.database_path).preview(job_id)
+        except KeyError as exc:
+            raise not_found(exc) from exc
+        except (ExportRecommitError, ValueError) as exc:
+            raise bad_request(exc) from exc
+
+    @router.post("/api/jobs/{job_id}/export/recommit")
+    def recommit_export(job_id: str, body: _ExportRecommitBody) -> dict[str, object]:
+        try:
+            return ExportRecommitService(context.database_path).recommit(
+                job_id,
+                confirmed=body.confirmed,
+                inventory_fingerprint=body.inventoryFingerprint,
+            )
+        except KeyError as exc:
+            raise not_found(exc) from exc
+        except (ExportRecommitError, PipelineError, ValueError) as exc:
             raise bad_request(exc) from exc
 
     @router.post("/api/jobs/{job_id}/cancel")
@@ -410,6 +567,30 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
         finally:
             database.close()
 
+    @router.post("/api/jobs/{job_id}/delete-history")
+    def delete_completed_history(job_id: str, body: _ConfirmBody) -> dict[str, object]:
+        database = StateDatabase.open(context.database_path)
+        try:
+            try:
+                lifecycle = JobLifecycle(database)
+                lifecycle.ensure_history_delete_allowed(job_id, confirmed=body.confirmed)
+                if database.repair_parent_job_id(job_id) is None:
+                    context.preparation_service.release_lock_for_history_deletion(job_id)
+                else:
+                    context.repair_service.release_lock_for_history_deletion(job_id)
+                result = lifecycle.delete_history(job_id, confirmed=body.confirmed)
+                return {
+                    "jobId": result.jobId,
+                    "deletedControlRecord": result.deletedControlRecord,
+                    "preserved": {"dataset": True, "exports": True, "backup": True},
+                }
+            except KeyError as exc:
+                raise not_found(exc) from exc
+            except (JobLifecycleError, JobPreflightError, DatasetLockError, ValueError) as exc:
+                raise bad_request(exc) from exc
+        finally:
+            database.close()
+
     @router.post("/api/jobs/{job_id}/restore-original-annotations")
     def restore_original_annotations(job_id: str, body: _ConfirmBody) -> dict[str, object]:
         if not body.confirmed:
@@ -422,7 +603,7 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
                 raise not_found(exc) from exc
             dataset = Path(str(job["dataset_root"]))
             backup = dataset.parent / f".{dataset.name}.anima-backups" / f"{job_id}.zip"
-            if job["status"] != "succeeded" or not backup.is_file():
+            if job["status"] not in {"succeeded", "succeeded_with_issues"} or not backup.is_file():
                 raise bad_request(ValueError("only a completed task with its annotation backup can restore originals"))
             # A committed task no longer owns an overlay, so restoration carries its own
             # one-shot overlay for the commit journal (ROADMAP.md:1056).

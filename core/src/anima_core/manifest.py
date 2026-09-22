@@ -6,7 +6,7 @@ import warnings
 from dataclasses import dataclass
 from functools import cmp_to_key
 from pathlib import Path
-from typing import Iterator, Any, Literal
+from typing import Callable, Iterator, Any, Literal
 
 from .contracts import SampleIssue, SampleManifest, SampleRecord, utc_now
 from .path_safety import (
@@ -25,6 +25,13 @@ class ManifestError(ValueError):
     def __init__(self, message: str, *, code: str = "manifest_invalid") -> None:
         super().__init__(message)
         self.code = code
+
+
+class ManifestCancelled(ManifestError):
+    """Raised when a caller cancels a manifest walk between filesystem entries."""
+
+    def __init__(self, message: str = "manifest scan cancelled") -> None:
+        super().__init__(message, code="manifest_cancelled")
 
 
 @dataclass(frozen=True)
@@ -100,10 +107,12 @@ class ManifestBuilder:
         self.annotation_files = 0
         self.image_issue_count = 0
 
-    def _iter_paths(self) -> Iterator[tuple[Path, bool]]:
+    def _iter_paths(self, *, cancel_check: Callable[[], bool] | None = None) -> Iterator[tuple[Path, bool]]:
         root = self.source_root
         stack: list[tuple[Path, bool]] = [(root, True)]
         while stack:
+            if cancel_check is not None and cancel_check():
+                raise ManifestCancelled()
             current, is_scope = stack.pop()
             directories: list[tuple[Path, bool]] = []
             with os.scandir(current) as entries:
@@ -113,9 +122,13 @@ class ManifestBuilder:
                     entries,
                     key=cmp_to_key(lambda left, right: windows_compare(left.name, right.name)),
                 ):
+                    if cancel_check is not None and cancel_check():
+                        raise ManifestCancelled()
                     path = Path(entry.path)
                     if entry.is_dir(follow_symlinks=False):
-                        if entry.name in {".mikazuki-cache", ".anima-idg"}:
+                        if entry.name in {".mikazuki-cache", ".anima-idg"} or (
+                            current == root and entry.name == "_unlabeled"
+                        ):
                             continue
                         directories.append((path, is_scope and self.recursive))
                         continue
@@ -170,6 +183,15 @@ class ManifestBuilder:
 
     def iter_scan_records(self) -> Iterator[tuple[SampleRecord, ManifestError | None]]:
         """Yield every discovered sample with its per-sample image defect, if any."""
+        for record, defect, _in_scope in self._iter_scan_records_with_scope():
+            yield record, defect
+
+    def _iter_scan_records_with_scope(
+        self,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> Iterator[tuple[SampleRecord, ManifestError | None, bool]]:
+        """Yield scan records together with the original scope classification."""
         if self.profile not in {"e621", "danbooru"}:
             raise ManifestError(f"unsupported profile:{self.profile}")
         assert_no_reparse_tree(self.source_root)
@@ -180,24 +202,38 @@ class ManifestBuilder:
         collision_db.execute("CREATE TABLE keys(value TEXT COLLATE WIN_ORDINAL_NOCASE PRIMARY KEY)")
         try:
             sample_id = 0
-            for path, in_scope in self._iter_paths():
+            for path, in_scope in self._iter_paths(cancel_check=cancel_check):
                 sample_id += 1
                 record, defect = self._record(sample_id, path, in_scope)
                 try:
                     collision_db.execute("INSERT INTO keys(value) VALUES (?)", (record.annotationKey,))
                 except sqlite3.IntegrityError as exc:
                     raise ManifestError(f"annotationKey collision: {record.annotationKey}") from exc
-                yield record, defect
+                yield record, defect, in_scope
         finally:
             collision_db.close()
 
     def count(self) -> int:
         return sum(1 for _ in self.iter_records())
 
+    def count_candidate_images(self, *, cancel_check: Callable[[], bool] | None = None) -> int:
+        """Count in-scope supported image files without decoding image data."""
+        assert_no_reparse_tree(self.source_root)
+        return sum(1 for _path, in_scope in self._iter_paths(cancel_check=cancel_check) if in_scope)
+
     def create_manifest(self, job_id: str) -> SampleManifest:
         return SampleManifest(jobId=job_id, recursive=self.recursive, sampleCount=self.count(), generatedAt=utc_now())
 
-    def scan_into(self, database: Any, job_id: str, *, batch_size: int = 500) -> SampleManifest:
+    def scan_into(
+        self,
+        database: Any,
+        job_id: str,
+        *,
+        batch_size: int = 500,
+        total_files: int | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> SampleManifest:
         """Decode and persist a manifest in one bounded pass.
 
         Callers that need both the immutable header and rows should use this
@@ -206,12 +242,17 @@ class ManifestBuilder:
         """
         if not 1 <= batch_size <= 1_000:
             raise ValueError("manifest batch_size must be between 1 and 1000")
+        if total_files is None:
+            total_files = self.count_candidate_images()
+        if type(total_files) is not int or total_files < 0:
+            raise ValueError("manifest total_files must be a non-negative integer")
         count = 0
+        checked = 0
         self.image_issue_count = 0
         batch: list[dict[str, object]] = []
         completed = False
         try:
-            for record, defect in self.iter_scan_records():
+            for record, defect, in_scope in self._iter_scan_records_with_scope(cancel_check=cancel_check):
                 count += 1
                 batch.append(record_storage_values(self, record))
                 if defect is not None:
@@ -226,8 +267,20 @@ class ManifestBuilder:
                 if len(batch) >= batch_size:
                     database.insert_samples(job_id, batch, batch_size=batch_size)
                     batch.clear()
+                if in_scope:
+                    checked += 1
+                    if checked > total_files:
+                        raise ManifestError(
+                            f"supported image set changed during scan: checked {checked} of {total_files}"
+                        )
+                    if on_progress is not None:
+                        on_progress(checked, total_files)
             if batch:
                 database.insert_samples(job_id, batch, batch_size=batch_size)
+            if checked != total_files:
+                raise ManifestError(
+                    f"supported image set changed during scan: checked {checked} of {total_files}"
+                )
             generated = utc_now()
             database.connection.execute(
                 "UPDATE jobs SET sample_count=?,manifest_generated_at=? WHERE job_id=?",

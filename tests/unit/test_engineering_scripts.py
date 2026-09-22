@@ -1139,6 +1139,45 @@ class VerifyProjectScriptTests(unittest.TestCase):
         ):
             self.assertIn(f"'{filename}'", distribution)
 
+    def test_release_assembly_copies_optional_ocr_entrypoints_and_wrappers(self) -> None:
+        distribution = BUILD_DISTRIBUTION_SCRIPT.read_text(encoding="utf-8")
+
+        for filename in (
+            "Install-Ocr.bat",
+            "Install-OcrGpu.bat",
+            "Import-OcrResource.bat",
+            "Reset-OcrRuntime.bat",
+            "Reset-OcrGpuRuntime.bat",
+            "Clean-OcrArtifacts.bat",
+            "Clean-OcrGpuArtifacts.bat",
+        ):
+            self.assertIn(f"'{filename}'", distribution)
+        for filename in (
+            "Import-OcrResource.ps1",
+            "Install-OcrGpu.ps1",
+            "Reset-OcrRuntime.ps1",
+            "Reset-OcrGpuRuntime.ps1",
+            "Clean-OcrArtifacts.ps1",
+            "Clean-OcrGpuArtifacts.ps1",
+            "ocr_gpu_resource.py",
+        ):
+            self.assertIn(f"'{filename}'", distribution)
+
+    def test_ocr_install_wrappers_use_verified_optional_component_loader(self) -> None:
+        cpu = (ROOT / "Install-Ocr.bat").read_text(encoding="ascii")
+        gpu = (ROOT / "Install-OcrGpu.bat").read_text(encoding="ascii")
+
+        self.assertIn("ocr_component.py", cpu)
+        self.assertIn(" install ", cpu)
+        self.assertIn("--mode cpu", cpu)
+        self.assertNotIn("ocr_resource.py", cpu)
+        self.assertNotIn("Import-OcrResource.bat", cpu)
+
+        self.assertIn("ocr_component.py", gpu)
+        self.assertIn(" install ", gpu)
+        self.assertIn("--mode gpu", gpu)
+        self.assertNotIn("ocr_gpu_resource.py", gpu)
+
     def test_release_assembly_preserves_the_frontend_dist_layout(self) -> None:
         distribution = BUILD_DISTRIBUTION_SCRIPT.read_text(encoding="utf-8")
 
@@ -1174,6 +1213,31 @@ class VerifyProjectScriptTests(unittest.TestCase):
         self.assertIn("token-budget", generator)
         self.assertIn("anima_token_budget_worker.entry", generator)
         self.assertIn("anima_caption_format", generator)
+
+    def test_release_assembly_keeps_policy_runtime_optional_with_explicit_variants(self) -> None:
+        distribution = BUILD_DISTRIBUTION_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("[ValidateSet('None', 'Cpu', 'Cuda')][string]$PolicyComponents = 'None'", distribution)
+        self.assertIn("Cpu = 'policy-cpu'", distribution)
+        self.assertIn("Cuda = 'policy-cuda'", distribution)
+        self.assertIn("if ($PolicyComponents -ne 'None')", distribution)
+        self.assertIn("--runtime-id", distribution)
+        self.assertIn("policy-cpu", distribution)
+        self.assertIn("policy-cuda", distribution)
+
+    def test_release_assembly_keeps_quality_resource_optional(self) -> None:
+        distribution = BUILD_DISTRIBUTION_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("[switch]$IncludeQualityStack", distribution)
+        self.assertIn("dropout-models\\lse14-scorer-5k-v1", distribution)
+        self.assertIn("if (-not $IncludeQualityStack)", distribution)
+        self.assertIn("--require-quality-stack", distribution)
+
+    def test_release_assembly_accepts_an_explicit_wheelhouse_root(self) -> None:
+        distribution = BUILD_DISTRIBUTION_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("[string]$WheelhouseRoot", distribution)
+        self.assertIn("Resolve-Path -LiteralPath $WheelhouseRoot", distribution)
 
     def test_gate_inventory_freezes_fast_full_and_release_commands(self) -> None:
         frontend = ROOT / "frontend"

@@ -51,7 +51,11 @@ class StateDatabase(
         if target.suffix.lower() not in {".db", ".sqlite3"}:
             raise ValueError("control-plane database must be a SQLite .db file")
         target.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(target, timeout=30, isolation_level=None)
+        # A live dataset lock can outlive the request thread that created it;
+        # FastAPI may dispatch repair/release calls to another worker thread.
+        connection = sqlite3.connect(
+            target, timeout=30, isolation_level=None, check_same_thread=False,
+        )
         connection.row_factory = sqlite3.Row
         connection.create_collation("WIN_ORDINAL_NOCASE", _ordinal_nocase)
         connection.execute("PRAGMA foreign_keys=ON")

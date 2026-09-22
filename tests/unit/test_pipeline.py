@@ -18,14 +18,25 @@ from PIL import Image
 
 from anima_caption_format import flat_txt_sha256
 from anima_caption_format.normalizer import CaptionDisplayPolicy
+from anima_core.commit_journal import CommitJournal, load as load_commit_journal, write as write_commit_journal
 from anima_core.contracts import JobConfig
 from anima_core.db import StateDatabase
+from anima_core.dataset_workspace import DatasetWorkspace
 from anima_core.job_preflight import JobPreparationService
+from anima_core.repair import RepairPreparationService
 from anima_core.overlay import BaselineView, OverlayLayout, WorkingAnnotationView
 from anima_core.path_safety import file_fingerprint, windows_key
 from anima_core.pipeline import PipelineService
+from anima_core import pipeline_recovery as pipeline_recovery_module
 from anima_core.pipeline_dispatch import PipelineError
-from anima_core.ocr_runtime_binding import OcrRuntimeBindingV1, read_runtime_binding, write_runtime_binding
+from anima_core.ocr_runtime_binding import (
+    OcrRuntimeBindingV1,
+    OcrExecutionRequestV1,
+    read_execution_request,
+    read_runtime_binding,
+    write_execution_request,
+    write_runtime_binding,
+)
 from anima_core.scheduler import BoundedScheduler
 from anima_core.contracts import SampleIssue, SampleRunState
 from anima_core.classify_overlay import serialize_annotation_json
@@ -98,6 +109,7 @@ class PipelineTests(unittest.TestCase):
             parent_path = root / "parent" / "ocr-runtime-binding-v1.json"
             write_runtime_binding(parent_path, binding)
             dispatch = object.__new__(PipelineService)
+            dispatch.install_root = root
             database = SimpleNamespace(
                 repair_parent_job_id=lambda _job_id: "parent-job",
                 get_job=lambda _job_id: {"overlay_root": str(root / "parent-overlay")},
@@ -106,6 +118,7 @@ class PipelineTests(unittest.TestCase):
             child_layout = SimpleNamespace(resource_path=lambda _filename: child_path)
             parent_layout = SimpleNamespace(resource_path=lambda _filename: parent_path)
             with patch("anima_core.pipeline_dispatch.OverlayLayout.open_existing", return_value=parent_layout):
+                dispatch._resolve_ocr_runtime = lambda runtime_id: (SimpleNamespace(), binding.runtimeFingerprint)  # type: ignore[method-assign]
                 self.assertEqual(child_path, dispatch._ocr_binding_path(database, "repair-job", child_layout))
             self.assertEqual(binding, read_runtime_binding(child_path))
 
@@ -117,6 +130,54 @@ class PipelineTests(unittest.TestCase):
                 selection.runtime_id, selection.runtime_fingerprint, selection.total_vram_bytes, selection.startup_reason,
             ))
             self.assertEqual(original, child_path.read_bytes())
+
+    def test_v7_repair_does_not_copy_a_stale_parent_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent_binding = self._v7_cpu_ocr_binding()
+            parent_path = root / "parent" / "ocr-runtime-binding-v1.json"
+            write_runtime_binding(parent_path, parent_binding)
+            dispatch = object.__new__(PipelineService)
+            dispatch.install_root = root
+            database = SimpleNamespace(
+                repair_parent_job_id=lambda _job_id: "parent-job",
+                get_job=lambda _job_id: {"overlay_root": str(root / "parent-overlay")},
+            )
+            child_path = root / "child" / "ocr-runtime-binding-v1.json"
+            child_layout = SimpleNamespace(resource_path=lambda _filename: child_path)
+            parent_layout = SimpleNamespace(resource_path=lambda _filename: parent_path)
+            with patch("anima_core.pipeline_dispatch.OverlayLayout.open_existing", return_value=parent_layout):
+                dispatch._resolve_ocr_runtime = lambda runtime_id: (SimpleNamespace(), f"{runtime_id}-current")  # type: ignore[method-assign]
+                self.assertEqual(child_path, dispatch._ocr_binding_path(database, "repair-job", child_layout))
+            self.assertFalse(child_path.exists())
+
+    def test_v7_stale_repair_binding_inherits_execution_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent_binding_path = root / "parent" / "ocr-runtime-binding-v1.json"
+            parent_request_path = root / "parent" / "ocr-execution-request-v1.json"
+            child_binding_path = root / "child" / "ocr-runtime-binding-v1.json"
+            child_request_path = root / "child" / "ocr-execution-request-v1.json"
+            write_runtime_binding(parent_binding_path, self._v7_cpu_ocr_binding())
+            request = OcrExecutionRequestV1.auto()
+            write_execution_request(parent_request_path, request)
+            dispatch = object.__new__(PipelineService)
+            dispatch.install_root = root
+            database = SimpleNamespace(
+                repair_parent_job_id=lambda _job_id: "parent-job",
+                get_job=lambda _job_id: {"overlay_root": str(root / "parent-overlay")},
+            )
+            child_layout = SimpleNamespace(
+                resource_path=lambda name: child_binding_path if name == "ocr-runtime-binding-v1.json" else child_request_path,
+            )
+            parent_layout = SimpleNamespace(
+                resource_path=lambda name: parent_binding_path if name == "ocr-runtime-binding-v1.json" else parent_request_path,
+            )
+            with patch("anima_core.pipeline_dispatch.OverlayLayout.open_existing", return_value=parent_layout):
+                dispatch._resolve_ocr_runtime = lambda runtime_id: (SimpleNamespace(), f"{runtime_id}-current")  # type: ignore[method-assign]
+                self.assertEqual(child_binding_path, dispatch._ocr_binding_path(database, "repair-job", child_layout))
+            self.assertFalse(child_binding_path.exists())
+            self.assertEqual(request, read_execution_request(child_request_path))
 
     def test_v7_auto_ocr_falls_back_to_cpu_when_gpu_operation_probe_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -374,11 +435,137 @@ class PipelineTests(unittest.TestCase):
         config.dropout["enabled"] = True
         config.dropout["artist"]["enabled"] = False
         config.dropout["quality"]["enabled"] = False
+        # These tests exercise Dropout/Export processing of the existing JSON
+        # annotation; opt into that mutation explicitly under incremental mode.
+        config.classify["overwriteJson"] = True
         config.tokenBudget["enabled"] = False  # type: ignore[index]
         preparation = JobPreparationService(root / "state.db")
         job_id = preparation.preflight(config.to_dict()).jobId
         preparation.confirm_workspace(job_id, confirmed=True, confirmed_rebuild=False)
         return preparation, job_id
+
+    @staticmethod
+    def _interrupted_export_commit(
+        root: Path,
+        *,
+        state: str = "staged",
+        phase: str = "writing_backup",
+        freeze: bool = False,
+    ) -> tuple[JobPreparationService, str, Path, OverlayLayout, Path]:
+        preparation, job_id = PipelineTests._dropout_only_job(root)
+        database = StateDatabase.open(root / "state.db")
+        try:
+            scheduler = BoundedScheduler(database)
+            for module_id in (
+                "caption", "classify", "replace", "ocr", "nl",
+                "count_review", "dropout", "token_budget",
+            ):
+                scheduler.start_module(job_id, module_id, enabled=False, profile="e621")
+            scheduler.start_module(job_id, "export", enabled=True, profile="e621")
+            database.set_module_summary(
+                job_id, "export", status="completed", completed=1, finished=True,
+            )
+            database.set_job_status(job_id, "committing", current_module_id="export")
+            job = database.get_job(job_id)
+            dataset = Path(str(job["dataset_root"]))
+            layout = OverlayLayout.open_existing(str(job["overlay_root"]), job_id)
+            token = job_id.replace("-", "")[:24]
+            staging = dataset.parent / f".{dataset.name}.anima-stage-{token}"
+            rollback = dataset.parent / f".{dataset.name}.anima-rollback-{token}"
+            backup = dataset.parent / f".{dataset.name}.anima-backups" / f"{job_id}.zip"
+            staging.mkdir()
+            (staging / "owned-stage.txt").write_text("owned", encoding="ascii")
+            write_commit_journal(layout, CommitJournal.v2(
+                job_id, state, dataset, staging, rollback, backup, phase=phase,
+            ))  # type: ignore[arg-type]
+            if freeze:
+                database.mark_interrupted(job_id)
+        finally:
+            database.close()
+        return preparation, job_id, dataset, layout, staging
+
+    def test_export_recovery_classification_separates_pre_and_post_swap(self) -> None:
+        classify = getattr(pipeline_recovery_module, "classify_export_recovery", None)
+        self.assertTrue(callable(classify), "export recovery classifier is missing")
+        root = Path(tempfile.gettempdir()) / "anima-export-recovery-classification"
+        paths = (
+            root / "dataset", root / ".dataset.stage", root / ".dataset.rollback",
+            root / ".dataset.anima-backups" / "job.zip",
+        )
+        for state, phase, expected in (
+            ("declared", "creating_stage", "manual_recommit"),
+            ("staging", "writing_annotations", "manual_recommit"),
+            ("staged", "writing_backup", "manual_recommit"),
+            ("backup_verified", "switching_directories", "manual_recommit"),
+            ("rollback_created", "switching_directories", "automatic_switch_recovery"),
+            ("rollback_required", "switching_directories", "automatic_switch_recovery"),
+            ("committed", "cleanup", "resolved"),
+            ("rolled_back", "cleanup", "resolved"),
+        ):
+            with self.subTest(state=state):
+                journal = CommitJournal.v2("job", state, *paths, phase=phase)  # type: ignore[arg-type]
+                self.assertEqual(expected, classify(journal))
+        legacy = CommitJournal("job", "prepared", *paths)
+        self.assertEqual("manual_recommit", classify(legacy))
+
+    def test_startup_recovery_preserves_every_pre_swap_stage(self) -> None:
+        for state, phase in (
+            ("declared", "creating_stage"),
+            ("staging", "writing_annotations"),
+            ("staged", "writing_backup"),
+            ("backup_verified", "switching_directories"),
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                preparation, job_id, dataset, layout, staging = self._interrupted_export_commit(
+                    root, state=state, phase=phase,
+                )
+                pipeline = PipelineService(root / "state.db", install_root=ROOT / ".runtime-build")
+                try:
+                    pipeline.startup_recovery()
+                    self.assertTrue((staging / "owned-stage.txt").is_file())
+                    self.assertTrue(dataset.is_dir())
+                    journal = load_commit_journal(layout)
+                    self.assertIsNotNone(journal)
+                    assert journal is not None
+                    self.assertEqual((state, phase), (journal.state, journal.phase))
+                    database = StateDatabase.open(root / "state.db")
+                    try:
+                        job = database.get_job(job_id)
+                        self.assertEqual(("interrupted", "committing", "export"), (
+                            job["status"], job["resume_status"], job["current_module_id"],
+                        ))
+                    finally:
+                        database.close()
+                finally:
+                    pipeline.close()
+                    preparation.close()
+
+    def test_completed_export_recovery_returns_recommit_without_starting_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preparation, job_id, _dataset, _layout, staging = self._interrupted_export_commit(
+                root, freeze=True,
+            )
+            pipeline = PipelineService(root / "state.db", install_root=ROOT / ".runtime-build")
+            try:
+                with patch("anima_core.pipeline_recovery.BoundedScheduler.recover") as recover, patch(
+                    "anima_core.pipeline.BoundedScheduler.start_module",
+                ) as start_module, patch.object(
+                    StateDatabase, "resolve_repaired_parent_issues",
+                ) as resolve_parent_issues:
+                    response = pipeline.recover_job(job_id, confirmed=True)
+                self.assertEqual((False, "interrupted", "export_recommit"), (
+                    response["started"], response["status"], response["recoveryKind"],
+                ))
+                recover.assert_not_called()
+                start_module.assert_not_called()
+                resolve_parent_issues.assert_not_called()
+                self.assertTrue((staging / "owned-stage.txt").is_file())
+                self.assertFalse(pipeline.is_running(job_id))
+            finally:
+                pipeline.close()
+                preparation.close()
 
     @staticmethod
     def _prepared_ocr_job(
@@ -549,43 +736,89 @@ class PipelineTests(unittest.TestCase):
                 pipeline._threads.pop(job_id, None)
                 preparation.close()
 
-    def test_abnormal_worker_exit_restarts_the_module_twice_then_fails_it(self) -> None:
-        for crashes, expected in ((2, "paused"), (9, "failed")):
+    def test_abnormal_worker_exit_restarts_twice_then_skips_the_remainder(self) -> None:
+        for crashes, expected in ((2, "paused"), (9, "succeeded")):
             with self.subTest(crashes=crashes), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 preparation, job_id = self._dropout_only_job(root)
                 pipeline = PipelineService(root / "state.db", install_root=ROOT / ".runtime-build")
                 attempts: list[str] = []
 
-                def crashing(_database, _scheduler, _job_id, module_id, _config, attempts=attempts) -> str:
+                def crashing(_database, scheduler, current_job_id, module_id, _config, attempts=attempts) -> str:
                     attempts.append(module_id)
-                    if len(attempts) <= crashes:
+                    if module_id == "dropout" and sum(item == "dropout" for item in attempts) <= crashes:
                         raise StdioJsonlTransportError("worker exited before request")
+                    if module_id == "export":
+                        return scheduler.finish_module(current_job_id, "export")
                     return "paused"
 
                 pipeline._run_active_module = crashing  # type: ignore[method-assign]
                 try:
-                    if expected == "failed":
-                        # The third abnormal exit stops the module instead of
-                        # restarting an embedded worker forever.
-                        with self.assertRaises(StdioJsonlTransportError):
-                            pipeline._run(job_id)
-                    else:
-                        pipeline._run(job_id)
+                    original = (root / "dataset" / "image.json").read_bytes()
+                    pipeline._run(job_id)
                     database = StateDatabase.open(root / "state.db")
                     try:
                         summary = database.module_summary(job_id, "dropout")
-                        self.assertEqual(3, len(attempts))
+                        self.assertEqual(3, sum(item == "dropout" for item in attempts))
                         self.assertEqual(min(crashes, 3), int(summary["worker_restart_count"]))
-                        if expected == "failed":
-                            self.assertEqual("failed", summary["status"])
-                            self.assertEqual("failed", database.get_job(job_id)["status"])
+                        if expected == "succeeded":
+                            self.assertEqual("completed_with_issues", summary["status"])
+                            self.assertEqual((1, 1), (summary["failed"], summary["issue_count"]))
+                            self.assertEqual("succeeded", database.get_job(job_id)["status"])
+                            state = database.get_sample_state(job_id, 1)
+                            self.assertEqual(("export", "skipped"), (state["current_module_id"], state["status"]))
+                            self.assertEqual(original, (root / "dataset" / "image.json").read_bytes())
                         else:
                             self.assertEqual("running", summary["status"])
                     finally:
                         database.close()
                 finally:
                     preparation.close()
+
+    def test_export_worker_exhaustion_skips_unfinished_samples_and_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preparation, job_id = self._dropout_only_job(root)
+            pipeline = PipelineService(root / "state.db", install_root=ROOT / ".runtime-build")
+            export_attempts = 0
+
+            def crash_export(database, scheduler, current_job_id, module_id, _config) -> str:
+                nonlocal export_attempts
+                if module_id == "dropout":
+                    leases = scheduler.claim_batch(
+                        current_job_id,
+                        "dropout",
+                        "dropout-worker",
+                        database.get_job(current_job_id)["config_hash"],
+                    )
+                    for lease in leases:
+                        scheduler.complete(lease)
+                    return scheduler.finish_module(current_job_id, "dropout")
+                if module_id == "export":
+                    export_attempts += 1
+                    raise StdioJsonlTransportError("export worker exited before request")
+                return "paused"
+
+            pipeline._run_active_module = crash_export  # type: ignore[method-assign]
+            try:
+                original = (root / "dataset" / "image.json").read_bytes()
+                pipeline._run(job_id)
+
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    self.assertEqual(3, export_attempts)
+                    self.assertEqual("succeeded", database.get_job(job_id)["status"])
+                    summary = database.module_summary(job_id, "export")
+                    self.assertEqual(("completed", 1, 1), (
+                        summary["status"], summary["failed"], summary["issue_count"],
+                    ))
+                    state = database.get_sample_state(job_id, 1)
+                    self.assertEqual(("export", "skipped"), (state["current_module_id"], state["status"]))
+                    self.assertEqual(original, (root / "dataset" / "image.json").read_bytes())
+                finally:
+                    database.close()
+            finally:
+                preparation.close()
 
     def test_caption_production_wiring_passes_install_root_to_resource_coverage_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -624,7 +857,7 @@ class PipelineTests(unittest.TestCase):
                 pipeline.close()
                 preparation.close()
 
-    def test_blocking_issues_from_upstream_modules_hold_the_job_in_review(self) -> None:
+    def test_blocking_issues_for_skipped_samples_do_not_hold_the_job_in_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dataset = root / "dataset"
@@ -654,11 +887,12 @@ class PipelineTests(unittest.TestCase):
                 pipeline._run(job_id)
                 database = StateDatabase.open(root / "state.db")
                 try:
-                    # Export must not bypass unresolved issues from upstream modules.
-                    self.assertEqual("reviewing", database.get_job(job_id)["status"])
-                    self.assertNotIn(
+                    self.assertEqual("succeeded_with_issues", database.get_job(job_id)["status"])
+                    self.assertIn(
                         "export", {str(row["module_id"]) for row in database.module_summaries(job_id)}
                     )
+                    issue = database.page_issues(job_id, limit=10)
+                    self.assertTrue(any(row["issue_id"] == "blocking-classify" for row in issue))
                 finally:
                     database.close()
             finally:
@@ -1200,6 +1434,7 @@ class PipelineTests(unittest.TestCase):
             config.countReview["enabled"] = False  # type: ignore[index]
             config.dropout["enabled"] = True
             config.dropout["quality"]["enabled"] = False
+            config.classify["overwriteJson"] = True
             config.tokenBudget["enabled"] = False  # type: ignore[index]
             preparation = JobPreparationService(root / "state.db")
             job_id = preparation.preflight(config.to_dict()).jobId
@@ -1283,6 +1518,7 @@ class PipelineTests(unittest.TestCase):
             config.countReview["enabled"] = False  # type: ignore[index]
             config.dropout["enabled"] = True
             config.dropout["quality"]["enabled"] = False
+            config.classify["overwriteJson"] = True
             config.tokenBudget["enabled"] = False  # type: ignore[index]
             preparation = JobPreparationService(root / "state.db")
             job_id = preparation.preflight(config.to_dict()).jobId
@@ -1940,6 +2176,7 @@ class PipelineTests(unittest.TestCase):
             config.dropout["enabled"] = True
             config.dropout["quality"]["enabled"] = False
             config.dropout["appearanceNl"]["enabled"] = False
+            config.classify["overwriteJson"] = True
             config.tokenBudget["enabled"] = False  # type: ignore[index]
             preparation = JobPreparationService(root / "state.db")
             job_id = preparation.preflight(config.to_dict()).jobId
@@ -2076,7 +2313,7 @@ class PipelineTests(unittest.TestCase):
                 pipeline.close()
                 preparation.close()
 
-    def test_disabled_modules_reach_export_and_missing_json_returns_to_review(self) -> None:
+    def test_disabled_modules_commit_missing_annotations_to_unlabeled_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dataset = root / "dataset"
@@ -2105,7 +2342,7 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(pipeline.is_running(job_id))
             database = StateDatabase.open(root / "state.db")
             try:
-                self.assertEqual("reviewing", database.get_job(job_id)["status"])
+                self.assertEqual("succeeded_with_issues", database.get_job(job_id)["status"])
                 summaries = {str(row["module_id"]): str(row["status"]) for row in database.module_summaries(job_id)}
                 self.assertEqual(
                     {"caption", "classify", "replace", "ocr", "nl", "count_review", "dropout", "token_budget", "export"},
@@ -2115,14 +2352,15 @@ class PipelineTests(unittest.TestCase):
                     "caption": "skipped", "classify": "skipped", "replace": "skipped",
                     "ocr": "skipped", "nl": "skipped", "count_review": "skipped",
                     "dropout": "skipped", "token_budget": "skipped",
-                    "export": "completed_with_issues",
+                    "export": "completed",
                 }, summaries)
                 self.assertEqual(1, database.count("issues", job_id))
                 self.assertFalse((dataset / "image.json").exists())
                 self.assertFalse((dataset / "image.txt").exists())
-                self.assertFalse((dataset.parent / ".dataset.anima-backups").exists())
-                overlay = Path(str(database.get_job(job_id)["overlay_root"]))
-                self.assertFalse((overlay / "commit-journal.json").exists())
+                unlabeled = dataset / "_unlabeled" / job_id.replace("-", "")[:24] / "image.png"
+                self.assertTrue(unlabeled.is_file())
+                self.assertTrue(DatasetWorkspace.for_dataset(dataset).backup_zip(job_id).is_file())
+                self.assertIsNone(database.get_job(job_id)["overlay_root"])
             finally:
                 database.close()
                 preparation.close()
@@ -2254,6 +2492,108 @@ class PipelineTests(unittest.TestCase):
                 database.close()
                 preparation.close()
 
+    def test_v10_token_budget_failure_is_retained_but_skipped_by_the_export_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            Image.new("RGB", (3, 3), "white").save(dataset / "image.png")
+            (dataset / "image.json").write_bytes(serialize_annotation_json({
+                "quality": [], "count": "solo", "character": "", "series": "", "artist": "",
+                "appearance": [], "tags": ["smile"], "environment": [], "nl": "",
+            }))
+            config = JobConfig(schemaVersion=10, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
+            config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+            config.countReview["enabled"] = False  # type: ignore[index]
+            preparation = JobPreparationService(root / "state.db")
+            job_id = preparation.preflight(config.to_dict()).jobId
+            preparation.confirm_workspace(job_id, confirmed=True, confirmed_rebuild=False)
+            database = StateDatabase.open(root / "state.db")
+            try:
+                database.set_job_status(job_id, "running", current_module_id="token_budget")
+                database.set_sample_state(job_id, 1, SampleRunState(
+                    sampleId=1, currentModuleId="token_budget", status="failed", attempt=1,
+                ))
+                database.upsert_issue(SampleIssue(
+                    issueId="overflow-failed", jobId=job_id, sampleId=1, relativeImagePath="image.png",
+                    moduleId="token_budget", code="token_budget_overflow", severity="error", blocking=True,
+                    retriable=True, repairStartModule="token_budget", message="Token Budget exceeded the frozen maximum", attempt=1,
+                ))
+
+                frozen = json.loads(str(database.get_job(job_id)["config_json"]))
+                self.assertTrue(PipelineService._token_budget_export_gate(database, job_id, frozen))
+                self.assertEqual("running", database.get_job(job_id)["status"])
+                self.assertEqual(1, len(database.page_issues(job_id, limit=10)))
+            finally:
+                database.close()
+                preparation.close()
+
+    def test_v10_repair_export_gate_only_checks_repair_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            Image.new("RGB", (3, 3), "white").save(dataset / "target.png")
+            Image.new("RGB", (3, 3), "black").save(dataset / "untargeted.png")
+            (dataset / "target.json").write_bytes(serialize_annotation_json({
+                "quality": [], "count": "solo", "character": "", "series": "", "artist": "",
+                "appearance": [], "tags": ["smile"], "environment": [], "nl": "",
+            }))
+            config = JobConfig(
+                schemaVersion=10,
+                workMode="in_place",
+                overwriteMode="incremental",
+                sourceRoot=str(dataset),
+            )
+            config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = False
+            config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+            config.countReview["enabled"] = False  # type: ignore[index]
+            preparation = JobPreparationService(root / "state.db")
+            repair = RepairPreparationService(root / "state.db")
+            try:
+                parent_id = preparation.preflight(config.to_dict()).jobId
+                preparation.confirm_workspace(parent_id, confirmed=True, confirmed_rebuild=False)
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    target = next(
+                        row for row in database.page_samples(parent_id, limit=10)
+                        if row["relative_image_path"] == "target.png"
+                    )
+                    database.set_job_status(parent_id, "running", current_module_id="token_budget")
+                    database.set_job_status(parent_id, "reviewing", current_module_id="token_budget")
+                    database.upsert_issue(SampleIssue(
+                        issueId="target-token-budget", jobId=parent_id,
+                        sampleId=int(target["sample_id"]), relativeImagePath="target.png",
+                        moduleId="token_budget", code="token_budget_overflow", severity="error",
+                        blocking=True, retriable=True, repairStartModule="token_budget",
+                        message="retry", attempt=1,
+                    ))
+                finally:
+                    database.close()
+                self.assertTrue(preparation.release_lock_for_repair(parent_id))
+                repair_job_id = repair.prepare(parent_id).repairJobId
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    seen: list[int] = []
+                    frozen = json.loads(str(database.get_job(repair_job_id)["config_json"]))
+                    with patch.object(
+                        TokenBudgetOverlayWriter,
+                        "record_for_export",
+                        side_effect=lambda **kwargs: seen.append(int(kwargs["sample_id"])),
+                    ):
+                        self.assertTrue(PipelineService._token_budget_export_gate(database, repair_job_id, frozen))
+                    target_id = int(database.connection.execute(
+                        "SELECT sample_id FROM repair_targets WHERE repair_job_id=?",
+                        (repair_job_id,),
+                    ).fetchone()["sample_id"])
+                    self.assertEqual([target_id], seen)
+                    self.assertEqual([], database.page_issues(repair_job_id, limit=10))
+                finally:
+                    database.close()
+            finally:
+                repair.close()
+                preparation.close()
+
     def test_v10_disabled_token_budget_skips_runtime_and_overlay_before_export(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2299,6 +2639,7 @@ class PipelineTests(unittest.TestCase):
                 (dataset / "image.json").write_bytes(serialize_annotation_json(annotation))
                 config = JobConfig(schemaVersion=10, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
                 config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+                config.classify["overwriteJson"] = True
                 config.countReview["enabled"] = False  # type: ignore[index]
                 config.export["format"] = export_format
                 preparation = JobPreparationService(root / "state.db")
@@ -2335,6 +2676,7 @@ class PipelineTests(unittest.TestCase):
             (dataset / "image.json").write_bytes(serialize_annotation_json(annotation))
             config = JobConfig(schemaVersion=10, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
             config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+            config.classify["overwriteJson"] = True
             config.countReview["enabled"] = False  # type: ignore[index]
             preparation = JobPreparationService(root / "state.db")
             job_id = preparation.preflight(config.to_dict()).jobId
@@ -2378,6 +2720,7 @@ class PipelineTests(unittest.TestCase):
             (dataset / "image.json").write_bytes(serialize_annotation_json(annotation))
             config = JobConfig(schemaVersion=10, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
             config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+            config.classify["overwriteJson"] = True
             config.countReview["enabled"] = False  # type: ignore[index]
             preparation = JobPreparationService(root / "state.db")
             pipeline: PipelineService | None = None
@@ -2471,6 +2814,7 @@ class PipelineTests(unittest.TestCase):
             }))
             config = JobConfig(schemaVersion=10, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
             config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+            config.classify["overwriteJson"] = True
             config.countReview["enabled"] = False  # type: ignore[index]
             preparation = JobPreparationService(root / "state.db")
             pipeline: PipelineService | None = None

@@ -43,13 +43,20 @@ class NlOverlayWriter:
             raise OverlayError("working JSON is invalid while committing staged NL") from exc
         if projection is None:
             raise OverlayError("working JSON is missing while committing staged NL")
-        self.write_value(sample_id=sample_id, lease_id=lease_id, annotation_key=str(row["annotation_key"]), projection=projection, nl=str(staged["nl"]), allowed_statuses=("response_staged",))
+        self.write_value(sample_id=sample_id, lease_id=lease_id, annotation_key=str(row["annotation_key"]), projection=projection, nl=str(staged["nl"]), allowed_statuses=("response_staged",), history_source="api")
         self.database.delete_staged_nl(job_id, sample_id, lease_id=lease_id)
         return True
 
-    def write_value(self, *, sample_id: int, lease_id: str, annotation_key: str, projection: dict[str, object], nl: str, allowed_statuses: tuple[str, ...] = ("leased",)) -> None:
+    def write_value(
+        self, *, sample_id: int, lease_id: str, annotation_key: str, projection: dict[str, object], nl: str,
+        allowed_statuses: tuple[str, ...] = ("leased",), history_source: str = "api",
+    ) -> None:
         if not isinstance(nl, str) or len(nl.encode("utf-8")) > 16_384:
             raise OverlayError("NL output exceeds its limit")
+        previous = projection.get("nl")
+        if isinstance(previous, str) and previous.strip() and previous != nl:
+            source = "original_json" if self.database.get_sample_with_state(self.job_id, sample_id)["original_json_state"] == "nonblank" else "nl_txt" if self.database.get_sample_with_state(self.job_id, sample_id)["original_txt_state"] == "nonblank" else "unknown"
+            self.database.archive_nl_for_sample(self.job_id, sample_id, source=source, text=previous)
         result = dict(projection)
         result["nl"] = nl
         data = serialize_annotation_json(result)
@@ -59,6 +66,11 @@ class NlOverlayWriter:
             self.job_id, sample_id, lease_id=lease_id, relative_path=relative, sha256=digest,
             allowed_statuses=allowed_statuses,
         )
+        # Persist the result before the filesystem replacement.  Recovery can
+        # safely repeat this idempotent archive if a process stops between
+        # staging and the replacement.
+        if nl.strip():
+            self.database.archive_nl_for_sample(self.job_id, sample_id, source=history_source, text=nl)
         self.layout.commit_prepared(relative, digest, annotation_key, ".json")
 
     def recover_prepared(self, job_id: str, sample_id: int, prepared_relative_path: str, expected_sha256: str) -> bool:
@@ -77,4 +89,11 @@ class NlOverlayWriter:
             return True
         if not prepared.is_file() or sha256_file(prepared) != expected_sha256:
             return False
+        try:
+            recovered = parse_annotation_json(prepared.read_bytes())
+        except (OSError, ClassifyJsonError):
+            recovered = None
+        if recovered is not None and isinstance(recovered.get("nl"), str) and recovered["nl"].strip():
+            source = "manual" if str(row["lease_id"] or "").startswith("manual-nl-") else "api"
+            self.database.archive_nl_for_sample(job_id, sample_id, source=source, text=str(recovered["nl"]))
         return sha256_file(self.layout.commit_prepared(prepared_relative_path, expected_sha256, str(row["annotation_key"]), ".json")) == expected_sha256

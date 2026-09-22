@@ -6,9 +6,12 @@ param(
     [Parameter(Mandatory = $true)][string]$RepositoryRoot,
     [Parameter(Mandatory = $true)][string]$PythonSourceUrl,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$PythonSourceSha256,
+    [string]$WheelhouseRoot,
     [switch]$ReuseBaseRuntime,
     [ValidateSet('None', 'Cpu', 'Gpu')][string]$OcrComponents = 'None',
-    [switch]$IncludeOcrPaddleGpu
+    [switch]$IncludeOcrPaddleGpu,
+    [ValidateSet('None', 'Cpu', 'Cuda')][string]$PolicyComponents = 'None',
+    [switch]$IncludeQualityStack
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,7 +20,16 @@ $builder = (Resolve-Path -LiteralPath $BuildPython).Path
 $source = (Resolve-Path -LiteralPath $PythonSourceRoot).Path
 $install = [System.IO.Path]::GetFullPath($InstallRoot)
 $requirements = Join-Path $repo 'packaging\requirements'
-$wheelhouse = Join-Path $repo 'packaging\wheelhouse'
+$wheelhouse = if ([string]::IsNullOrWhiteSpace($WheelhouseRoot)) {
+    Join-Path $repo 'packaging\wheelhouse'
+}
+else {
+    $resolvedWheelhouse = Resolve-Path -LiteralPath $WheelhouseRoot
+    if (-not $resolvedWheelhouse) { throw "Wheelhouse root does not exist: $WheelhouseRoot" }
+    $resolvedWheelhouseItem = Get-Item -LiteralPath $resolvedWheelhouse.Path -Force
+    if (-not $resolvedWheelhouseItem.PSIsContainer) { throw "Wheelhouse root must be a directory: $($resolvedWheelhouseItem.FullName)" }
+    $resolvedWheelhouseItem.FullName
+}
 if ($PSBoundParameters.ContainsKey('IncludeOcrPaddleGpu')) {
     if ($PSBoundParameters.ContainsKey('OcrComponents')) {
         throw 'IncludeOcrPaddleGpu and OcrComponents are ambiguous; use OcrComponents only'
@@ -32,6 +44,21 @@ if ($OcrComponents -eq 'Gpu') {
     )
     if (@($gpuInputs | Where-Object { -not (Test-Path -LiteralPath $_) }).Count -ne 0) {
         throw 'GPU distribution opt-in requires complete ocr-paddle-gpu lock and wheelhouse inputs before assembly'
+    }
+}
+$policyLock = $null
+if ($PolicyComponents -ne 'None') {
+    $policyLock = @{
+        Cpu = 'policy-cpu'
+        Cuda = 'policy-cuda'
+    }[$PolicyComponents]
+    $policyInputs = @(
+        (Join-Path $requirements "$policyLock.in"),
+        (Join-Path $requirements "$policyLock.lock"),
+        (Join-Path $wheelhouse $policyLock)
+    )
+    if (@($policyInputs | Where-Object { -not (Test-Path -LiteralPath $_) }).Count -ne 0) {
+        throw "Policy distribution opt-in requires complete $policyLock lock and wheelhouse inputs before assembly"
     }
 }
 $nodeVersion = (& node --version).Trim()
@@ -49,7 +76,8 @@ else {
     & (Join-Path $repo 'packaging\scripts\build_cpython311_runtime.ps1') -PythonSourceRoot $source -OutputRoot $install
 }
 
-$lockRuntimes = @('core', 'caption-e621', 'classify-e621', 'replace-e621', 'nl', 'policy', 'export', 'token-budget')
+$lockRuntimes = @('core', 'caption-e621', 'classify-e621', 'replace-e621', 'nl', 'export', 'token-budget')
+if ($PolicyComponents -ne 'None') { $lockRuntimes += $policyLock }
 & $builder -B -I (Join-Path $repo 'packaging\scripts\verify_locks.py') --requirements-root $requirements --wheelhouse-root $wheelhouse @lockRuntimes
 if ($LASTEXITCODE -ne 0) { throw 'Dependency lock verification failed' }
 
@@ -60,10 +88,12 @@ $runtimeJobs = @(
     @{ Id = 'classify-e621'; Lock = 'classify-e621'; Source = (Join-Path $repo 'workers\classify\src\anima_classify_worker') },
     @{ Id = 'replace-e621'; Lock = 'replace-e621'; Source = (Join-Path $repo 'workers\replace\src\anima_replace_worker') },
     @{ Id = 'nl'; Lock = 'nl'; Source = (Join-Path $repo 'workers\nl\src\anima_nl_worker') },
-    @{ Id = 'policy'; Lock = 'policy'; Source = (Join-Path $repo 'workers\policy\src\anima_policy_worker') },
     @{ Id = 'export'; Lock = 'export'; Source = (Join-Path $repo 'workers\export\src\anima_export_worker'); SharedSource = (Join-Path $repo 'shared\anima_caption_format\anima_caption_format') },
     @{ Id = 'token-budget'; Lock = 'token-budget'; Source = (Join-Path $repo 'workers\token_budget\src\anima_token_budget_worker'); SharedSource = (Join-Path $repo 'shared\anima_caption_format\anima_caption_format') }
 )
+if ($PolicyComponents -ne 'None') {
+    $runtimeJobs += @{ Id = 'policy'; Lock = $policyLock; Source = (Join-Path $repo 'workers\policy\src\anima_policy_worker') }
+}
 foreach ($job in $runtimeJobs) {
     $assemblyArguments = @{
         BaseRuntime = $base
@@ -78,6 +108,7 @@ foreach ($job in $runtimeJobs) {
 }
 Remove-Item -LiteralPath $base -Recurse -Force
 $manifestArguments = @('--install-root', $install, '--requirements-root', $requirements)
+foreach ($job in $runtimeJobs) { $manifestArguments += @('--runtime-id', $job.Id) }
 & $builder -B -I (Join-Path $repo 'packaging\scripts\generate_runtime_manifests.py') @manifestArguments
 if ($LASTEXITCODE -ne 0) { throw 'Runtime manifest generation failed' }
 $resourceLibrarySource = (Resolve-Path -LiteralPath (Join-Path $repo 'resource-library')).Path
@@ -97,9 +128,16 @@ else {
     if (Test-Path -LiteralPath $optionalOcrResource) {
         Remove-Item -LiteralPath $optionalOcrResource -Recurse -Force
     }
+    if (-not $IncludeQualityStack) {
+        $optionalQualityResource = Join-Path $resourceLibrary 'dropout-models\lse14-scorer-5k-v1'
+        if (Test-Path -LiteralPath $optionalQualityResource) {
+            Remove-Item -LiteralPath $optionalQualityResource -Recurse -Force
+        }
+    }
 }
 $resourceValidationArguments = @('--root', $resourceLibrary)
 if (-not $isDevelopmentInstall) { $resourceValidationArguments += '--release' }
+if ($IncludeQualityStack) { $resourceValidationArguments += '--require-quality-stack' }
 & $builder -B -I (Join-Path $repo 'packaging\scripts\validate_resource_library.py') @resourceValidationArguments
 if ($LASTEXITCODE -ne 0) { throw 'Project-local resource library validation failed' }
 if ($OcrComponents -eq 'None') {
@@ -135,8 +173,17 @@ Copy-Item -Path (Join-Path $repo 'profiles\*.profile.json') -Destination $profil
 
 $releaseRootFiles = @(
     'Install-WebUI.bat',
+    'Install-Policy.bat',
+    'Install-QualityStack.bat',
     'Start-WebUI.bat',
     'Stop-WebUI.bat',
+    'Install-Ocr.bat',
+    'Install-OcrGpu.bat',
+    'Import-OcrResource.bat',
+    'Reset-OcrRuntime.bat',
+    'Reset-OcrGpuRuntime.bat',
+    'Clean-OcrArtifacts.bat',
+    'Clean-OcrGpuArtifacts.bat',
     'README.md',
     'OCR_MODEL_DOWNLOAD.md'
 )
@@ -145,8 +192,16 @@ foreach ($filename in $releaseRootFiles) {
 }
 $releaseControlScripts = @(
     'desktop_control.ps1',
+    'webui_host.ps1',
+    'Import-OcrResource.ps1',
+    'Install-OcrGpu.ps1',
+    'Reset-OcrRuntime.ps1',
+    'Reset-OcrGpuRuntime.ps1',
+    'Clean-OcrArtifacts.ps1',
+    'Clean-OcrGpuArtifacts.ps1',
     'ocr_component.py',
     'ocr_resource.py',
+    'ocr_gpu_resource.py',
     'ocr_compatibility.py'
 )
 $releaseControlRoot = Join-Path $install 'packaging\scripts'

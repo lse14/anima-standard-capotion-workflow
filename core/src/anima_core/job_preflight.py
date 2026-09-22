@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .contracts import (
     CaptionFormatPolicy,
@@ -26,10 +29,12 @@ from .custom_classification_resource import (
     inspect_custom_classification_resource,
 )
 from .db import StateDatabase, assert_database_outside_datasets
-from .locks import DatasetLock, DatasetLockError
-from .manifest import ManifestBuilder, ManifestError
+from .locks import DatasetLock, DatasetLockError, release_completed_dataset_lock
+from .manifest import ManifestBuilder, ManifestCancelled, ManifestError
 from .nl_runner import nl_http_attempt_budget
 from .nl_length import character_name
+from .nl_profiles import NlApiProfileStore, NlProfileError
+from .launcher import WorkerLaunchError, WorkerLauncher
 from .ocr_runtime_binding import (
     OcrExecutionRequestV1,
     read_execution_request,
@@ -37,6 +42,7 @@ from .ocr_runtime_binding import (
 )
 from .overlay import OverlayLayout
 from .path_safety import (
+    CanonicalPath,
     PathSafetyError,
     ensure_within,
     file_fingerprint,
@@ -154,10 +160,22 @@ def config_from_dict(value: object) -> JobConfig:
 class JobPreparationService:
     """Creates immutable manifest drafts before any overlay/copy/worker activity."""
 
-    def __init__(self, database_path: str | Path, *, resource_catalog: ResourceCatalog | None = None) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        resource_catalog: ResourceCatalog | None = None,
+        install_root: str | Path | None = None,
+        profile_store: NlApiProfileStore | None = None,
+    ) -> None:
         self.database_path = Path(database_path)
         self.resource_catalog = resource_catalog or ResourceCatalog(default_resource_library_root())
+        self.install_root = Path(install_root) if install_root is not None else None
+        self.profile_store = profile_store
         self._locks: dict[str, DatasetLock] = {}
+        self._preflight_lock = threading.Lock()
+        self._preflight_threads: dict[str, threading.Thread] = {}
+        self._preflight_cancel: dict[str, threading.Event] = {}
 
     def _preflight_ocr_request_path(self, job_id: str) -> Path:
         if not job_id or not job_id.isalnum():
@@ -252,6 +270,75 @@ class JobPreparationService:
         section["resourceId"] = package.resource_id
         section["resourceManifestRelativePath"] = package.manifest_relative_path
         section["resourceFingerprint"] = package.fingerprint
+
+    def _validate_ocr_runtime(self, config: JobConfig) -> None:
+        if self.install_root is None or not job_config_supports_ocr_device(config.schemaVersion):
+            return
+        ocr = config.ocr
+        if not isinstance(ocr, dict) or ocr.get("enabled") is not True:
+            return
+        device = ocr.get("device", "auto")
+        if device not in {"auto", "cuda", "cpu"}:
+            raise JobPreflightError("OCR device is invalid")
+        runtime_ids = ["ocr-paddle"]
+        if device == "cuda":
+            runtime_ids.append("ocr-paddle-gpu")
+        launcher = WorkerLauncher.from_install_root(
+            self.install_root,
+            resource_root=self.resource_catalog.root,
+        )
+        try:
+            for runtime_id in runtime_ids:
+                launcher.resolve(runtime_id, expected_owner="ocr", verify_interpreter=False)
+        except (WorkerLaunchError, OSError) as exc:
+            raise JobPreflightError(
+                "ocr_runtime_install_required: selected OCR runtime "
+                f"{runtime_ids[-1]} is unavailable; install the optional OCR component "
+                "before enabling OCR"
+            ) from exc
+
+    def _validate_policy_runtime(self, config: JobConfig) -> None:
+        """Check the policy worker only when the Dropout worker will run."""
+        if self.install_root is None or config.dropout.get("enabled") is not True:
+            return
+        children = (config.dropout.get("artist"), config.dropout.get("quality"), config.dropout.get("appearanceNl"))
+        if not any(isinstance(child, dict) and child.get("enabled") is True for child in children):
+            return
+        launcher = WorkerLauncher.from_install_root(
+            self.install_root,
+            resource_root=self.resource_catalog.root,
+        )
+        try:
+            launcher.resolve("policy", expected_owner="policy", verify_interpreter=False)
+        except (WorkerLaunchError, OSError) as exc:
+            raise JobPreflightError(
+                "policy_runtime_install_required: policy runtime is unavailable; "
+                "install the optional policy component before enabling Dropout"
+            ) from exc
+
+    def _freeze_api_runtime(self, config: JobConfig) -> None:
+        """Copy connection-only Profile data into the immutable task config."""
+        if self.profile_store is None or not _nl_api_work_enabled(config):
+            return
+        profile_id = config.nl.get("apiProfileId")
+        if not isinstance(profile_id, str):
+            return
+        try:
+            profile = next(item for item in self.profile_store.load_all() if item.profileId == profile_id)
+        except (StopIteration, NlProfileError):
+            return
+        config.nl["apiRuntime"] = {
+            "revision": profile.revision,
+            "protocol": profile.protocol,
+            "providerLabel": profile.providerLabel,
+            "endpoint": profile.endpoint,
+            "model": profile.model,
+            "backupModel": profile.backupModel,
+            "credentialRef": profile.apiCredentialRef,
+            "jsonMode": profile.jsonMode,
+            "policy": profile.policy,
+            "appliedAt": profile.updatedAt or utc_now(),
+        }
 
     def _resolve_resources(
         self,
@@ -403,10 +490,23 @@ class JobPreparationService:
         quality = config.dropout.get("quality")
         if not isinstance(quality, dict):
             raise ResourceCatalogError("dropout quality configuration is invalid")
-        resolve(
-            "dropout", "dropout-model", quality, "dropoutModel",
-            config.dropout.get("enabled") is True and quality.get("enabled") is True,
-        )
+        quality_active = config.dropout.get("enabled") is True and quality.get("enabled") is True
+        if quality_active:
+            try:
+                resolve("dropout", "dropout-model", quality, "dropoutModel", True)
+            except ResourceCatalogError as exc:
+                raise ResourceCatalogError(
+                    "quality_stack_install_required: selected LSE14 quality model "
+                    "lse14-scorer-5k-v1 is unavailable or invalid; install the optional "
+                    "quality-stack component before enabling quality scoring"
+                ) from exc
+        elif quality.get("resourceManifestRelativePath") is None and quality.get("resourceFingerprint") is None:
+            # Keep legacy reference migration when the optional package is present,
+            # while allowing disabled Dropout to proceed when it is absent.
+            try:
+                resolve("dropout", "dropout-model", quality, "dropoutModel", False)
+            except ResourceCatalogError:
+                pass
         return snapshot, selected
 
     @staticmethod
@@ -549,16 +649,18 @@ class JobPreparationService:
                 + suffix
             )
 
-    def preflight(
+    def _validate_preflight_input(
         self,
         raw_config: object,
-        *,
-        ocr_execution: OcrExecutionRequestV1 | None = None,
-    ) -> PreflightSummary:
+    ) -> tuple[JobConfig, dict[str, ResourcePackage], CustomReplaceIndex | None, CanonicalPath, CanonicalPath | None]:
+        """Validate and freeze non-manifest inputs before creating a job row."""
         try:
             self._reject_client_frozen_resources(raw_config)
             config = config_from_dict(raw_config)
+            self._freeze_api_runtime(config)
             _, selected_resources = self._resolve_resources(config, freeze=True)
+            self._validate_ocr_runtime(config)
+            self._validate_policy_runtime(config)
             validate_job_config(config)
             replace_index: CustomReplaceIndex | None = None
             if config.replace["indexMode"] == "custom":
@@ -571,6 +673,17 @@ class JobPreparationService:
             assert_database_outside_datasets(self.database_path, [source.value, *( [output.value] if output else [] )])
         except (ValueError, PathSafetyError, CustomReplaceIndexError) as exc:
             raise JobPreflightError(str(exc)) from exc
+        return config, selected_resources, replace_index, source, output
+
+    def _create_preflight_job(
+        self,
+        config: JobConfig,
+        source: CanonicalPath,
+        *,
+        ocr_execution: OcrExecutionRequestV1 | None,
+        total_files: int | None = None,
+    ) -> str:
+        """Persist the immutable job header and (for async scans) its progress row."""
         job_id = uuid.uuid4().hex
         database = StateDatabase.open(self.database_path)
         try:
@@ -580,11 +693,62 @@ class JobPreparationService:
                     self._preflight_ocr_request_path(job_id),
                     ocr_execution or OcrExecutionRequestV1.auto(),
                 )
+            if total_files is not None:
+                database.create_preflight_progress(job_id, total_files=total_files)
+        except Exception:
+            # No user dataset is touched here; remove only the just-created
+            # control row if initialization itself fails.
+            try:
+                database.delete_job_control_record(job_id)
+            except Exception:
+                pass
+            raise
+        finally:
+            database.close()
+        return job_id
+
+    @staticmethod
+    def _preflight_summary_json(summary: PreflightSummary) -> str:
+        return json.dumps(asdict(summary), ensure_ascii=False, separators=(",", ":"))
+
+    def _execute_preflight(
+        self,
+        job_id: str,
+        config: JobConfig,
+        selected_resources: dict[str, ResourcePackage],
+        replace_index: CustomReplaceIndex | None,
+        source: CanonicalPath,
+        *,
+        total_files: int | None = None,
+        persist_progress: bool = False,
+        retain_failed_job: bool = False,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> PreflightSummary:
+        """Run the bounded manifest pass for either sync or async callers."""
+        database = StateDatabase.open(self.database_path)
+        try:
+            if cancel_check is not None and cancel_check():
+                raise ManifestCancelled()
+            if persist_progress:
+                database.update_preflight_progress(job_id, status="preflighting")
             builder = ManifestBuilder(
                 source.value, recursive=config.recursive, profile=str(config.classify["resourceProfile"]),
                 invalid_image_action=config.imageDecode.invalidImageAction,
             )
-            builder.scan_into(database, job_id)
+            on_progress = (
+                lambda checked, total: database.update_preflight_progress(
+                    job_id, status="preflighting", checked_files=checked, total_files=total,
+                )
+            ) if persist_progress else None
+            builder.scan_into(
+                database,
+                job_id,
+                total_files=total_files,
+                on_progress=on_progress,
+                cancel_check=cancel_check,
+            )
+            if cancel_check is not None and cancel_check():
+                raise ManifestCancelled()
             counts = database.connection.execute(
                 """SELECT COUNT(*) AS samples,COALESCE(SUM(in_processing_scope),0) AS scoped,
                    COALESCE(SUM(original_txt_state='nonblank'),0) AS txt,COALESCE(SUM(original_json_state='nonblank'),0) AS json,
@@ -605,27 +769,268 @@ class JobPreparationService:
                     name_placeholder="name",
                     flat_root_name=source.value.name,
                 )
+            if cancel_check is not None and cancel_check():
+                raise ManifestCancelled()
             config = self._freeze_nl_attempt_budget(database, job_id, config, scoped)
-            database.set_job_status(job_id, "ready")
-            replace_summary = replace_index.summary() if replace_index else {
-                "mode": "bundled",
-                "resourceId": selected_resources["replace"].resource_id,
-                "sha256": selected_resources["replace"].fingerprint,
-                "ruleCount": selected_resources["replace"].metadata["ruleCount"],
-            }
-            return PreflightSummary(
-                job_id, samples, scoped, samples - scoped, int(counts["txt"]), int(counts["json"]), config.config_hash,
-                replace_summary,
-                resources=self._resource_summary(selected_resources),
-                blankTxtCount=samples - int(counts["txt"]), blankJsonCount=samples - int(counts["json"]),
-                # A duplicate annotationKey is fatal above, so a summary always reports zero.
-                annotationKeyCollisionCount=0, imageIssueCount=builder.image_issue_count, projection=projection,
-                estimate=self._estimates(builder, projection),
-                api=self._api_bounds(config, scoped, int(counts["image_bytes"])),
-            )
-        except (ManifestError, OSError, ValueError) as exc:
-            database.delete_job_control_record(job_id)
+            if cancel_check is not None and cancel_check():
+                raise ManifestCancelled()
+            # Serialize the final ready/completed transition with a cancellation
+            # request.  Exactly one side wins: cancellation either observes an
+            # active job and the worker rolls it back, or observes completed and
+            # returns ``False`` without publishing a misleading cancellation.
+            finalization_guard = self._preflight_lock if persist_progress else nullcontext()
+            with finalization_guard:
+                if cancel_check is not None and cancel_check():
+                    raise ManifestCancelled()
+                database.set_job_status(job_id, "ready")
+                replace_summary = replace_index.summary() if replace_index else {
+                    "mode": "bundled",
+                    "resourceId": selected_resources["replace"].resource_id,
+                    "sha256": selected_resources["replace"].fingerprint,
+                    "ruleCount": selected_resources["replace"].metadata["ruleCount"],
+                }
+                summary = PreflightSummary(
+                    job_id, samples, scoped, samples - scoped, int(counts["txt"]), int(counts["json"]), config.config_hash,
+                    replace_summary,
+                    resources=self._resource_summary(selected_resources),
+                    blankTxtCount=samples - int(counts["txt"]), blankJsonCount=samples - int(counts["json"]),
+                    # A duplicate annotationKey is fatal above, so a summary always reports zero.
+                    annotationKeyCollisionCount=0, imageIssueCount=builder.image_issue_count, projection=projection,
+                    estimate=self._estimates(builder, projection),
+                    api=self._api_bounds(config, scoped, int(counts["image_bytes"])),
+                )
+                if persist_progress:
+                    database.update_preflight_progress(
+                        job_id,
+                        status="completed",
+                        checked_files=int(total_files or 0),
+                        total_files=int(total_files or 0),
+                        summary_json=self._preflight_summary_json(summary),
+                    )
+            return summary
+        except ManifestCancelled as exc:
+            if persist_progress:
+                try:
+                    current = database.get_preflight_progress(job_id)
+                    database.update_preflight_progress(
+                        job_id,
+                        status="cancelled",
+                        checked_files=int(current["checked_files"]),
+                        total_files=int(current["total_files"]),
+                        error=str(exc),
+                    )
+                    database.clear_manifest_rows(job_id)
+                    database.set_job_status(job_id, "draft")
+                except Exception:
+                    pass
             raise JobPreflightError(str(exc)) from exc
+        except (ManifestError, OSError, ValueError) as exc:
+            if persist_progress:
+                try:
+                    current = database.get_preflight_progress(job_id)
+                    database.update_preflight_progress(
+                        job_id,
+                        status="failed",
+                        checked_files=int(current["checked_files"]),
+                        total_files=int(current["total_files"]),
+                        error=str(exc)[:16_384],
+                    )
+                except Exception:
+                    pass
+                try:
+                    if database.get_job(job_id)["status"] != "failed":
+                        database.set_job_status(job_id, "failed", current_module_id="workspace")
+                except Exception:
+                    pass
+            elif not retain_failed_job:
+                database.delete_job_control_record(job_id)
+            raise JobPreflightError(str(exc)) from exc
+        finally:
+            database.close()
+
+    def preflight(
+        self,
+        raw_config: object,
+        *,
+        ocr_execution: OcrExecutionRequestV1 | None = None,
+    ) -> PreflightSummary:
+        config, selected_resources, replace_index, source, _output = self._validate_preflight_input(raw_config)
+        job_id = self._create_preflight_job(config, source, ocr_execution=ocr_execution)
+        return self._execute_preflight(
+            job_id,
+            config,
+            selected_resources,
+            replace_index,
+            source,
+            retain_failed_job=False,
+        )
+
+    def _async_preflight_worker(
+        self,
+        job_id: str,
+        config: JobConfig,
+        selected_resources: dict[str, ResourcePackage],
+        replace_index: CustomReplaceIndex | None,
+        source: CanonicalPath,
+    ) -> None:
+        with self._preflight_lock:
+            cancel_event = self._preflight_cancel.get(job_id)
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ManifestCancelled()
+            builder = ManifestBuilder(
+                source.value,
+                recursive=config.recursive,
+                profile=str(config.classify["resourceProfile"]),
+                invalid_image_action=config.imageDecode.invalidImageAction,
+            )
+            total_files = builder.count_candidate_images(
+                cancel_check=cancel_event.is_set if cancel_event is not None else None,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                raise ManifestCancelled()
+            database = StateDatabase.open(self.database_path)
+            try:
+                database.update_preflight_progress(
+                    job_id, status="preflighting", checked_files=0, total_files=total_files,
+                )
+            finally:
+                database.close()
+            self._execute_preflight(
+                job_id,
+                config,
+                selected_resources,
+                replace_index,
+                source,
+                total_files=total_files,
+                persist_progress=True,
+                retain_failed_job=True,
+                cancel_check=cancel_event.is_set if cancel_event is not None else None,
+            )
+        except ManifestCancelled as exc:
+            self._persist_preflight_cancelled(job_id, str(exc))
+        except Exception as exc:
+            # A cancellation request owns the terminal transition.  Do not
+            # turn a cooperative cancellation observed while unwinding into a
+            # failed preflight.
+            if cancel_event is not None and cancel_event.is_set():
+                self._persist_preflight_cancelled(job_id, str(exc))
+                return
+            # _execute_preflight persists expected failures.  Keep a final
+            # fail-safe for injected/unexpected exceptions so polling never
+            # remains stuck in queued/preflighting forever.
+            database = StateDatabase.open(self.database_path)
+            try:
+                try:
+                    current = database.get_preflight_progress(job_id)
+                except KeyError:
+                    current = None
+                if current is not None and current["status"] not in {"completed", "failed", "cancelled"}:
+                    database.update_preflight_progress(
+                        job_id,
+                        status="failed",
+                        checked_files=int(current["checked_files"]),
+                        total_files=int(current["total_files"]),
+                        error=f"{type(exc).__name__}: {exc}"[:16_384],
+                    )
+                    try:
+                        database.set_job_status(job_id, "failed", current_module_id="workspace")
+                    except Exception:
+                        pass
+            finally:
+                database.close()
+        finally:
+            with self._preflight_lock:
+                self._preflight_threads.pop(job_id, None)
+                self._preflight_cancel.pop(job_id, None)
+
+    def start_preflight(
+        self,
+        raw_config: object,
+        *,
+        ocr_execution: OcrExecutionRequestV1 | None = None,
+    ) -> str:
+        """Queue an image preflight and return its durable job identity."""
+        config, selected_resources, replace_index, source, _output = self._validate_preflight_input(raw_config)
+        job_id = self._create_preflight_job(
+            config,
+            source,
+            ocr_execution=ocr_execution,
+            # The candidate walk itself belongs to the background worker.  A
+            # zero denominator is the explicit "not counted yet" state.
+            total_files=0,
+        )
+        thread = threading.Thread(
+            target=self._async_preflight_worker,
+            args=(job_id, config, selected_resources, replace_index, source),
+            daemon=True,
+            name=f"anima-preflight-{job_id[:12]}",
+        )
+        with self._preflight_lock:
+            self._preflight_threads[job_id] = thread
+            self._preflight_cancel[job_id] = threading.Event()
+        try:
+            thread.start()
+        except Exception:
+            with self._preflight_lock:
+                self._preflight_threads.pop(job_id, None)
+                self._preflight_cancel.pop(job_id, None)
+            database = StateDatabase.open(self.database_path)
+            try:
+                database.update_preflight_progress(
+                    job_id, status="failed", error="preflight worker could not start",
+                )
+                database.set_job_status(job_id, "failed", current_module_id="workspace")
+            finally:
+                database.close()
+            raise
+        return job_id
+
+    def cancel_preflight(self, job_id: str) -> bool:
+        """Request cancellation of a queued or running asynchronous preflight."""
+        with self._preflight_lock:
+            event = self._preflight_cancel.get(job_id)
+            thread = self._preflight_threads.get(job_id)
+            if event is not None:
+                event.set()
+        database = StateDatabase.open(self.database_path)
+        try:
+            progress = database.get_preflight_progress(job_id)
+            if progress["status"] == "cancelled":
+                return True
+            if progress["status"] in {"completed", "failed"}:
+                return False
+            if event is None or thread is None:
+                raise JobPreflightError("preflight worker is not active")
+            # The worker owns cleanup and the terminal transition.  Publishing
+            # a terminal row here would race with an in-flight manifest write
+            # and could leave samples/issues behind after cancellation.
+            return True
+        finally:
+            database.close()
+
+    def _persist_preflight_cancelled(self, job_id: str, error: str) -> None:
+        database = StateDatabase.open(self.database_path)
+        try:
+            try:
+                progress = database.get_preflight_progress(job_id)
+            except KeyError:
+                return
+            if progress["status"] in {"completed", "failed", "cancelled"}:
+                return
+            # Clear rows first while the progress row is still mutable.  This
+            # ordering also makes cancellation safe if a scan was interrupted
+            # between a batch insert and its next callback.
+            database.clear_manifest_rows(job_id)
+            database.update_preflight_progress(
+                job_id,
+                status="cancelled",
+                checked_files=int(progress["checked_files"]),
+                total_files=int(progress["total_files"]),
+                error=error[:16_384] or "preflight cancelled",
+            )
+            if database.get_job(job_id)["status"] == "preflighting":
+                database.set_job_status(job_id, "draft")
         finally:
             database.close()
 
@@ -644,6 +1049,13 @@ class JobPreparationService:
             raw_config = self._restore_missing_bundled_resource_ids(raw_config)
             config = config_from_dict(raw_config)
             previous_hash = str(job["config_hash"])
+            preservation = database.freeze_incremental_preservation(
+                job_id,
+                overwrite_mode=config.overwriteMode,
+                overwrite_json=bool(config.classify.get("overwriteJson")),
+                overwrite_txt=bool(config.caption.get("overwriteTxt")),
+                overwrite_count=bool(config.classify.get("overwriteCount")),
+            )
             try:
                 self._resolve_resources(config, freeze=False)
             except CustomClassificationResourceError as exc:
@@ -659,8 +1071,12 @@ class JobPreparationService:
                 )
             if database.count_unresolved_blocking_issues(job_id):
                 raise JobPreflightError("preflight found unusable images; fix them or choose skip and run preflight again")
+            # Incremental-preserved samples never reach a mutating worker or
+            # Token Budget, so they must not inflate the frozen API/budget
+            # candidate count. Explicit overwrite decisions are already
+            # represented by incremental_preserve=0.
             candidate_count = int(database.connection.execute(
-                "SELECT COUNT(*) FROM samples WHERE job_id=? AND in_processing_scope=1",
+                "SELECT COUNT(*) FROM samples WHERE job_id=? AND in_processing_scope=1 AND incremental_preserve=0",
                 (job_id,),
             ).fetchone()[0])
             config = self._freeze_nl_attempt_budget(database, job_id, config, candidate_count)
@@ -743,7 +1159,7 @@ class JobPreparationService:
                JOIN jobs AS j ON j.job_id=c.job_id WHERE c.dataset_root=?""",
             (str(dataset),),
         ).fetchone()
-        if owner is None or owner["status"] != "succeeded":
+        if owner is None or owner["status"] not in {"succeeded", "succeeded_with_issues"}:
             return
         claiming_job_id = str(owner["job_id"])
         lock = self._locks.get(claiming_job_id)
@@ -758,13 +1174,19 @@ class JobPreparationService:
                    JOIN jobs AS j ON j.job_id=c.job_id WHERE c.dataset_root=?""",
                 (str(dataset),),
             ).fetchone()
-            if current is not None and current["status"] == "succeeded":
+            if current is not None and current["status"] in {"succeeded", "succeeded_with_issues"}:
                 database.connection.execute(
                     "DELETE FROM dataset_claims WHERE dataset_root=? AND job_id=?",
                     (str(dataset), str(current["job_id"])),
                 )
 
     def close(self) -> None:
+        with self._preflight_lock:
+            preflight_threads = tuple(self._preflight_threads.values())
+            for event in self._preflight_cancel.values():
+                event.set()
+        for thread in preflight_threads:
+            thread.join(timeout=5)
         for lock in tuple(self._locks.values()):
             try:
                 lock.release(recovery_complete=True)
@@ -784,11 +1206,45 @@ class JobPreparationService:
         del self._locks[job_id]
         return True
 
+    def release_lock_for_history_deletion(self, job_id: str) -> bool:
+        return release_completed_dataset_lock(self._locks, self.database_path, job_id)
+
     def release_lock_for_repair(self, job_id: str) -> bool:
         """Hand a terminal task's live dataset lock to a forthcoming repair task."""
         lock = self._locks.get(job_id)
         if lock is None:
-            return False
+            database = StateDatabase.open(self.database_path)
+            try:
+                claim = database.connection.execute(
+                    "SELECT lock_path FROM dataset_claims WHERE job_id=?", (job_id,)
+                ).fetchone()
+                # A task with no persisted claim has no lock to hand off.  This
+                # is the normal path for an already-restarted fixture (and for
+                # a task whose claim was released by startup recovery); only a
+                # live claim requires the terminal-state and journal guards.
+                if claim is None:
+                    return False
+                job = database.get_job(job_id)
+                if job["status"] not in {"reviewing", "failed", "succeeded"}:
+                    raise JobPreflightError("only a reviewed, failed, or succeeded task can release its lock for repair")
+                overlay_root = job["overlay_root"]
+                if isinstance(overlay_root, str) and overlay_root:
+                    try:
+                        state = OverlayLayout.open_existing(overlay_root, job_id).journal_state()
+                    except Exception as exc:
+                        raise JobPreflightError("task commit journal cannot be safely inspected") from exc
+                    if state not in {None, "committed", "rolled_back"}:
+                        raise JobPreflightError("task lock cannot be released before commit journal recovery")
+                database.release_dataset_claim(job_id)
+                lock_path = claim["lock_path"]
+            finally:
+                database.close()
+            if isinstance(lock_path, str) and lock_path:
+                try:
+                    Path(lock_path).unlink()
+                except FileNotFoundError:
+                    pass
+            return True
         job = lock.database.get_job(job_id)
         if job["status"] not in {"reviewing", "failed", "succeeded"}:
             raise JobPreflightError("only a reviewed, failed, or succeeded task can release its lock for repair")

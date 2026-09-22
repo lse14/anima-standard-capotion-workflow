@@ -315,6 +315,7 @@ class NlRunnerTests(unittest.TestCase):
                     issue = fixture.database.page_issues("job-nl", limit=1)[0]
                     self.assertEqual("completed_with_issues", status)
                     self.assertEqual((issue_code, 0, 0), (issue["code"], issue["blocking"], issue["retriable"]))
+                    self.assertEqual("simulated API failure", issue["message"])
                     self.assertEqual("failed", fixture.database.get_sample_state("job-nl", 1)["status"])
                     self.assertEqual(0, fixture.database.count_unresolved_blocking_issues("job-nl"))
                     for module_id in ("count_review", "dropout", "token_budget"):
@@ -1088,6 +1089,98 @@ class NlRunnerTests(unittest.TestCase):
                 diagnostics = {row["code"]: row["count"] for row in fixture.database.module_diagnostics("job-nl", "nl")}
                 self.assertEqual(1, diagnostics.get("nl_consecutive_failures", 0))
                 self.assertEqual(1, diagnostics.get("nl_circuit_breaker_paused", 0))
+            finally:
+                fixture.close()
+
+    def test_api_revision_switches_only_at_the_next_batch_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = NlFixture(Path(temporary), baseline_nl="", sample_count=4)
+            try:
+                fixture.config.nl.update({"apiEnabled": True, "reuseOriginalNl": False, "useImage": True, "useFullJson": True, "systemPrompt": "describe"})
+                fixture.refresh_config()
+                old = NlApiCredentials(
+                    "https://old.example/v1", "old-model", "old-secret", providerLabel="gemini-relay", revision=1,
+                    requestPolicy={"maxRequestsPerMinute": 60, "mainAttempts": 1, "backupEnabled": False, "backupAttempts": 1,
+                                   "connectTimeoutSeconds": 10, "writeTimeoutSeconds": 30, "readTimeoutSeconds": 120, "poolTimeoutSeconds": 30},
+                )
+                new = NlApiCredentials(
+                    "https://new.example/v1", "new-model", "new-secret", backupModel="new-backup",
+                    providerLabel="gemini-relay", revision=2,
+                    requestPolicy={"maxRequestsPerMinute": 7, "mainAttempts": 2, "backupEnabled": True, "backupAttempts": 1,
+                                   "connectTimeoutSeconds": 3, "writeTimeoutSeconds": 4, "readTimeoutSeconds": 5, "poolTimeoutSeconds": 6},
+                )
+                pending: list[NlApiCredentials | None] = [None]
+                applied: list[NlApiCredentials] = []
+
+                def after_process(process: int) -> None:
+                    if process == 1:
+                        pending[0] = new
+
+                transport = FakeNlTransport(after_process=after_process)
+                runner = NlRunner(
+                    fixture.database, fixture.scheduler, transport,
+                    WorkingAnnotationView(BaselineView(fixture.dataset), fixture.layout), fixture.writer,
+                    job_id="job-nl", worker_instance_id="nl-worker-1", credentials=old,
+                    runtime_revision_provider=lambda: pending[0],
+                    runtime_revision_applied=applied.append,
+                )
+                self.assertEqual("completed", runner.run())
+                hellos = [request.payload for request in transport.requests if request.method == "hello"]
+                self.assertEqual(2, len(hellos))
+                self.assertEqual(("https://old.example/v1", "old-model"), (hellos[0]["endpoint"], hellos[0]["model"]))
+                self.assertEqual(("https://new.example/v1", "new-model"), (hellos[1]["endpoint"], hellos[1]["model"]))
+                self.assertEqual(
+                    {"maxRequestsPerMinute": 60, "mainAttempts": 1, "backupEnabled": False, "backupAttempts": 1,
+                     "connectTimeoutSeconds": 10, "writeTimeoutSeconds": 30, "readTimeoutSeconds": 120, "poolTimeoutSeconds": 30},
+                    {key: hellos[0]["apiPolicy"][key] for key in ("maxRequestsPerMinute", "mainAttempts", "backupEnabled", "backupAttempts", "connectTimeoutSeconds", "writeTimeoutSeconds", "readTimeoutSeconds", "poolTimeoutSeconds")},
+                )
+                self.assertEqual(
+                    {"maxRequestsPerMinute": 7, "mainAttempts": 2, "backupEnabled": True, "backupAttempts": 1,
+                     "connectTimeoutSeconds": 3, "writeTimeoutSeconds": 4, "readTimeoutSeconds": 5, "poolTimeoutSeconds": 6},
+                    {key: hellos[1]["apiPolicy"][key] for key in ("maxRequestsPerMinute", "mainAttempts", "backupEnabled", "backupAttempts", "connectTimeoutSeconds", "writeTimeoutSeconds", "readTimeoutSeconds", "poolTimeoutSeconds")},
+                )
+                process_requests = [request.payload for request in transport.requests if request.method == "process_batch"]
+                self.assertEqual([3, 2], [request["httpAttemptAllowance"] for request in process_requests])
+                self.assertEqual([new], applied)
+            finally:
+                fixture.close()
+
+    def test_format_breaker_does_not_reuse_generic_outcome_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = NlFixture(Path(temporary), baseline_nl="")
+            try:
+                fixture.config.nl.update({"apiEnabled": True, "reuseOriginalNl": False, "useImage": True, "useFullJson": True, "systemPrompt": "describe"})
+                fixture.refresh_config()
+                for _ in range(20):
+                    fixture.database.record_nl_outcome("job-nl", succeeded=False)
+                transport = FakeNlTransport(issue_code="nl_response_format_invalid")
+                result = fixture.runner(
+                    transport,
+                    NlApiCredentials("https://example.test/v1", "main", "secret", providerLabel="gemini-relay"),
+                ).run()
+                diagnostics = {row["code"]: row["count"] for row in fixture.database.module_diagnostics("job-nl", "nl")}
+                self.assertEqual("paused", result)
+                self.assertIn("nl_circuit_breaker_paused", diagnostics)
+                self.assertNotIn("nl_format_circuit_breaker_paused", diagnostics)
+                self.assertEqual(1, diagnostics.get("nl_format_consecutive_failures"))
+            finally:
+                fixture.close()
+
+    def test_api_task_revision_survives_apply_and_increments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = NlFixture(Path(temporary))
+            try:
+                runtime = {
+                    "revision": 2, "protocol": "openai_chat_completions", "providerLabel": "gemini-relay",
+                    "endpoint": "https://example.test/v1", "model": "main", "backupModel": None,
+                    "credentialRef": "credential", "jsonMode": "prompt_only", "policy": {}, "appliedAt": "now",
+                }
+                fixture.database.set_nl_api_runtime_override("job-nl", {"taskRevision": 1, "runtime": runtime})
+                self.assertEqual(1, fixture.database.get_nl_api_task_revision("job-nl"))
+                fixture.database.apply_nl_api_runtime_override("job-nl", runtime)
+                self.assertEqual(1, fixture.database.get_nl_api_task_revision("job-nl"))
+                fixture.database.set_nl_api_runtime_override("job-nl", {"taskRevision": 2, "runtime": {**runtime, "revision": 3}})
+                self.assertEqual(2, fixture.database.get_nl_api_task_revision("job-nl"))
             finally:
                 fixture.close()
 

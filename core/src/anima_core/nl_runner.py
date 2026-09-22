@@ -6,7 +6,7 @@ import math
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .classify_overlay import ClassifyJsonError, parse_annotation_json
 from .contracts import (
@@ -35,7 +35,7 @@ from .worker_protocol import ProtocolEnvelopeV1, ProtocolError
 
 RUNTIME_ID = "nl"
 OWNER = "nl"
-NONBLOCKING_TERMINAL_NL_CODES = frozenset({"nl_api_unavailable", "nl_response_invalid"})
+NONBLOCKING_TERMINAL_NL_CODES = frozenset({"nl_api_unavailable", "nl_response_invalid", "nl_response_format_invalid"})
 DEFAULT_POLICY = {
     "concurrency": 3, "maxRequestsPerMinute": 60, "maxHttpAttempts": 10_000,
     "mainAttempts": 3, "backupEnabled": False, "backupAttempts": 2,
@@ -196,6 +196,11 @@ class NlApiCredentials:
     model: str
     apiKey: str
     backupModel: str | None = None
+    protocol: str = "openai_chat_completions"
+    providerLabel: str = ""
+    jsonMode: str = "prompt_only"
+    revision: int = 1
+    requestPolicy: dict[str, object] | None = None
 
 
 class NlRunner:
@@ -205,6 +210,8 @@ class NlRunner:
         self, database: StateDatabase, scheduler: BoundedScheduler, transport: NlTransport,
         view: WorkingAnnotationView, writer: NlOverlayWriter, *, job_id: str, worker_instance_id: str,
         credentials: NlApiCredentials | None = None,
+        runtime_revision_provider: Callable[[], NlApiCredentials | None] | None = None,
+        runtime_revision_applied: Callable[[NlApiCredentials], None] | None = None,
     ) -> None:
         self.database = database
         self.scheduler = scheduler
@@ -214,8 +221,12 @@ class NlRunner:
         self.job_id = job_id
         self.worker_instance_id = worker_instance_id
         self.credentials = credentials
+        self.runtime_revision_provider = runtime_revision_provider
+        self.runtime_revision_applied = runtime_revision_applied
         self._hello_done = False
         self._nl_batch_size = 3
+        self._pending_credentials: NlApiCredentials | None = None
+        self._credentials_before_pending: NlApiCredentials | None = credentials
 
     def _fatal(self, code: str, message: str) -> NlRunnerError:
         return NlRunnerError(code, message)
@@ -320,6 +331,8 @@ class NlRunner:
             "endpoint": self.credentials.endpoint, "model": self.credentials.model, "backupModel": self.credentials.backupModel,
             "apiKey": self.credentials.apiKey, "systemPrompt": nl.get("systemPrompt"),
             "apiPolicy": {key: policy[key] for key in WORKER_POLICY_KEYS},
+            "protocol": self.credentials.protocol, "providerLabel": self.credentials.providerLabel,
+            "jsonMode": self.credentials.jsonMode,
         }
         if response_protocol == "nl-count-v2":
             request_payload["responseProtocol"] = response_protocol
@@ -330,8 +343,27 @@ class NlRunner:
             raise self._fatal("nl_protocol_violation", "NL hello result is invalid")
         self._hello_done = True
 
+    def _refresh_runtime_revision(self) -> None:
+        if self.credentials is None or self.runtime_revision_provider is None:
+            return
+        candidate = self.runtime_revision_provider()
+        if candidate is None or candidate.revision <= self.credentials.revision:
+            return
+        self._credentials_before_pending = self.credentials
+        self._pending_credentials = candidate
+        self.credentials = candidate
+        self._hello_done = False
+
+    def _confirm_runtime_revision(self) -> None:
+        if self._pending_credentials is None:
+            return
+        candidate = self._pending_credentials
+        if self.runtime_revision_applied is not None:
+            self.runtime_revision_applied(candidate)
+        self._pending_credentials = None
+
     def _policy(self, nl: dict[str, object]) -> dict[str, object]:
-        value = nl.get("apiPolicy", {})
+        value = self.credentials.requestPolicy if self.credentials and self.credentials.requestPolicy is not None else nl.get("apiPolicy", {})
         if not isinstance(value, dict) or set(value) - set(DEFAULT_POLICY) or "concurrency" in value:
             raise self._fatal("nl_protocol_violation", "NL API policy is invalid")
         policy = {key: value.get(key, default) for key, default in DEFAULT_POLICY.items()}
@@ -526,6 +558,9 @@ class NlRunner:
                     return str(job["status"])
                 if job["status"] != "running" or job["current_module_id"] != "nl":
                     raise self._fatal("nl_protocol_violation", "NL module is not active")
+                self._refresh_runtime_revision()
+                if api_enabled:
+                    policy = self._policy(nl)
                 active = self.scheduler.claim_batch(self.job_id, "nl", self.worker_instance_id, config_hash)
                 if not active:
                     if self.database.count_module_unsettled(self.job_id, "nl"):
@@ -559,6 +594,10 @@ class NlRunner:
                                 repair_start="classify",
                             )
                         else:
+                            if target.strip():
+                                self.database.archive_nl_for_sample(
+                                    self.job_id, lease.sampleId, source="nl_txt", text=target,
+                                )
                             self._not_requested(lease, "input_txt_nl")
                             self.scheduler.complete(lease)
                         active.remove(lease)
@@ -570,20 +609,51 @@ class NlRunner:
                         active.remove(lease)
                         continue
                     original, original_error = self._original_nl(baseline_raw)
+                    if original is not None:
+                        self.database.archive_nl_for_sample(
+                            self.job_id, lease.sampleId, source="original_json", text=original,
+                        )
                     rebuilt_working_json = self.view.overlay.annotation_path(str(row["annotation_key"]), ".json").is_file()
-                    if original_error is not None and not (original_error == "baseline JSON is invalid" and rebuilt_working_json):
+                    # A rebuilt working JSON is the current repair input.  Its
+                    # NL value must be sent to the API when the immutable
+                    # original NL is malformed, regardless of which field
+                    # validation failed.
+                    if original_error is not None and not rebuilt_working_json:
                         self._not_requested(lease, "original_invalid")
                         self._issue(lease, row, "nl_original_invalid", original_error)
                         active.remove(lease)
                         continue
-                    target = original if reuse and original is not None else ("" if not api_enabled else None)
+                    # Preserve a non-blank value already present in a rebuilt
+                    # working overlay (for example a human repair).  It is
+                    # never replaced by an older original/history revision.
+                    working_nl = projection.get("nl")
+                    protected_working = (
+                        rebuilt_working_json and original_error is None
+                        and isinstance(working_nl, str) and bool(working_nl.strip())
+                    )
+                    if protected_working:
+                        target = str(working_nl)
+                        history_source = "manual"
+                    else:
+                        target = None
+                        history_source = "api"
+                        if reuse and original is not None:
+                            target = original
+                            history_source = "original_json"
+                        elif reuse:
+                            history = self.database.verified_nl_history_for_sample(self.job_id, lease.sampleId)
+                            if history is not None:
+                                target = str(history["text"])
+                                history_source = str(history["source"])
+                        if target is None and not api_enabled:
+                            target = ""
                     if target is not None:
                         self._not_requested(
                             lease,
-                            "reused_original_nl" if reuse and original is not None else "api_disabled",
+                            "reused_original_nl" if reuse and original is not None else "reused_history_nl" if reuse and target else "api_disabled",
                         )
                         if target != projection["nl"]:
-                            self.writer.write_value(sample_id=lease.sampleId, lease_id=str(lease.leaseId), annotation_key=str(row["annotation_key"]), projection=projection, nl=target)
+                            self.writer.write_value(sample_id=lease.sampleId, lease_id=str(lease.leaseId), annotation_key=str(row["annotation_key"]), projection=projection, nl=target, history_source=history_source)
                         self.scheduler.complete(lease)
                         active.remove(lease)
                         continue
@@ -611,12 +681,34 @@ class NlRunner:
                 if not request_items:
                     continue
                 if not self._hello_done:
-                    self._hello(
-                        config_hash,
-                        nl,
-                        response_protocol=response_protocol,
-                        prompt_version=str(nl["promptVersion"]),
-                    )
+                    try:
+                        self._hello(
+                            config_hash,
+                            nl,
+                            response_protocol=response_protocol,
+                            prompt_version=str(nl["promptVersion"]),
+                        )
+                    except NlRunnerError:
+                        if self._pending_credentials is None:
+                            raise
+                        previous = self._credentials_before_pending
+                        self._pending_credentials = None
+                        if previous is None:
+                            raise
+                        self.credentials = previous
+                        self._credentials_before_pending = previous
+                        self._hello_done = False
+                        self.database.increment_module_diagnostic(
+                            self.job_id, "nl", "nl_api_revision_switch_failed", severity="warning", amount=1,
+                        )
+                        self._hello(
+                            config_hash,
+                            nl,
+                            response_protocol=response_protocol,
+                            prompt_version=str(nl["promptVersion"]),
+                        )
+                    else:
+                        self._confirm_runtime_revision()
                 payload_items: list[dict[str, object]] = []
                 expected: dict[tuple[int, str], str] = {}
                 for lease, row, projection in request_items:
@@ -674,14 +766,35 @@ class NlRunner:
                             lease,
                             row,
                             code,
-                            "NL worker could not produce a caption",
+                            outcome.message or "NL worker could not produce a caption",
                             blocking=not nonblocking_terminal,
                             retriable=outcome.retriable,
+                            repair_start="nl",
                             allowed_statuses=("request_started",),
                         )
                         processed, failed = self.database.record_nl_outcome(self.job_id, succeeded=False)
+                        format_failed = code == "nl_response_format_invalid"
+                        format_processed, format_failures = self.database.record_nl_format_outcome(
+                            self.job_id, format_failed=format_failed,
+                        )
+                        if format_failed:
+                            self.database.increment_module_diagnostic(
+                                self.job_id, "nl", "nl_format_failures", severity="warning", amount=1,
+                            )
+                            self.database.increment_module_diagnostic(
+                                self.job_id, "nl", "nl_format_consecutive_failures", severity="warning", amount=1,
+                            )
+                        else:
+                            self.database.set_module_diagnostic_count(
+                                self.job_id, "nl", "nl_format_consecutive_failures", severity="warning", count=0,
+                            )
                         if outcome.code == "nl_auth_failed":
                             pause_code = "nl_auth_paused"
+                        elif code == "nl_response_format_invalid" and (
+                            self.database.module_diagnostic_count(self.job_id, "nl", "nl_format_consecutive_failures") >= 10
+                            or (format_processed >= 20 and format_failures * 2 >= format_processed)
+                        ):
+                            pause_code = "nl_format_circuit_breaker_paused"
                         elif failed >= 10 and self.database.module_diagnostic_count(self.job_id, "nl", "nl_consecutive_failures") >= 9:
                             pause_code = "nl_circuit_breaker_paused"
                         elif processed >= 20 and failed * 2 >= processed:

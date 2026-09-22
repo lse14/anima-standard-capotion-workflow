@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .annotation_backup import AnnotationBackupError, restore_to_staging
+from .dataset_workspace import DatasetWorkspace
 from .commit_journal import CommitJournal, CommitJournalError, write as write_journal
 from .directory_commit import DirectoryCommitError, restore_rollback
 from .export_staging import create_hardlink_staging, reveal_staging
@@ -35,9 +36,14 @@ class AnnotationRestoreCoordinator:
         if not dataset.is_dir() or not backup.is_file():
             raise AnnotationRestoreError("dataset or annotation backup is unavailable")
         token = self.layout.job_id.replace("-", "")[:24]
-        parent = dataset.parent
-        staging = parent / f".{dataset.name}.anima-restore-stage-{token}"
-        rollback = parent / f".{dataset.name}.anima-restore-rollback-{token}"
+        if DatasetWorkspace.is_new_overlay(self.layout.root, dataset, self.layout.job_id):
+            workspace = DatasetWorkspace.for_dataset(dataset)
+            staging = workspace.job_root(self.layout.job_id) / "restore-stage"
+            rollback = workspace.job_root(self.layout.job_id) / "restore-rollback"
+        else:
+            parent = dataset.parent
+            staging = parent / f".{dataset.name}.anima-restore-stage-{token}"
+            rollback = parent / f".{dataset.name}.anima-restore-rollback-{token}"
         if staging.exists() or rollback.exists():
             raise AnnotationRestoreError("annotation restore workspace already exists")
         try:

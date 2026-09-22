@@ -44,6 +44,10 @@ class TokenBudgetRunnerContractTests(unittest.TestCase):
         (dataset / "image.json").write_bytes(serialize_annotation_json(annotation))
         config = JobConfig(schemaVersion=schema_version, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
         config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
+        # This fixture exercises Token Budget itself; explicitly opt into
+        # rebuilding the existing JSON so incremental preservation does not
+        # short-circuit the worker before its safety assertions run.
+        config.classify["overwriteJson"] = True
         config.countReview["enabled"] = False  # type: ignore[index]
         catalog, _ = _preflight_support._write_test_resource_library(root, include_ocr=False)
         _preflight_support.JobPreflightTests._write_tokenizer_resource(catalog.root, context_limit=512)

@@ -4,6 +4,8 @@ import {
   holdRoute,
   mutationsFor,
   openApp,
+  openPrecheck,
+  openSetup,
   test,
 } from "./mockApi";
 
@@ -105,6 +107,152 @@ test.describe("workflow characterization", () => {
     await expect(layout).toHaveValue("single_line");
   });
 
+  test("restores the complete draft after refresh without persisting the API secret", async ({ page }) => {
+    await openApp(page, { language: "en" });
+    await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\draft-source");
+    await page.getByLabel("Work mode", { exact: true }).selectOption("full_copy");
+    await page.getByRole("textbox", { name: "Output dataset", exact: true }).fill("E:\\datasets\\draft-output");
+    await page.getByLabel("Overwrite mode", { exact: true }).selectOption("incremental");
+    await page.getByRole("checkbox", { name: "Search subfolders", exact: true }).check();
+
+    await page.locator(".workflow-rail").getByRole("button", { name: /Caption/ }).click();
+    await page.getByLabel("TXT input mode", { exact: true }).selectOption("nl");
+    await page.getByRole("checkbox", { name: "Add trigger terms", exact: true }).check();
+    await page.getByRole("textbox", { name: "Trigger terms (comma separated)", exact: true }).fill("wolf, fox");
+
+    await page.locator(".workflow-rail").getByRole("button", { name: /Classify/ }).click();
+    await page.getByRole("checkbox", { name: "Overwrite JSON", exact: true }).check();
+    await page.getByRole("checkbox", { name: "Overwrite count", exact: true }).check();
+
+    await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
+    await page.getByRole("checkbox", { name: "Enable OCR", exact: true }).check();
+    await page.getByLabel("OCR device", { exact: true }).selectOption("cpu");
+    const tuning = page.locator("fieldset.ocr-tuning");
+    await tuning.nth(0).getByRole("radio", { name: "Manual detection limit", exact: true }).check();
+    await tuning.nth(0).getByRole("spinbutton", { name: "OCR detection limit", exact: true }).fill("2560");
+    await tuning.nth(1).getByRole("radio", { name: "Manual text batch", exact: true }).check();
+    await tuning.nth(1).getByRole("spinbutton", { name: "OCR text batch", exact: true }).fill("3");
+
+    await page.locator(".workflow-rail").getByRole("button", { name: /NL/ }).click();
+    await page.getByRole("textbox", { name: "HTTP attempt budget", exact: true }).fill("17");
+    await page.getByRole("textbox", { name: "API key", exact: true }).fill("do-not-persist-this-secret");
+
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Anima Dataset Tool" })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "Source dataset", exact: true })).toHaveValue("E:\\datasets\\draft-source");
+    await expect(page.getByLabel("Work mode", { exact: true })).toHaveValue("full_copy");
+    await expect(page.getByRole("textbox", { name: "Output dataset", exact: true })).toHaveValue("E:\\datasets\\draft-output");
+    await expect(page.getByLabel("Overwrite mode", { exact: true })).toHaveValue("incremental");
+    await expect(page.getByRole("checkbox", { name: "Search subfolders", exact: true })).toBeChecked();
+
+    await page.locator(".workflow-rail").getByRole("button", { name: /Caption/ }).click();
+    await expect(page.getByLabel("TXT input mode", { exact: true })).toHaveValue("nl");
+    await expect(page.getByRole("checkbox", { name: "Add trigger terms", exact: true })).toBeChecked();
+    await expect(page.getByRole("textbox", { name: "Trigger terms (comma separated)", exact: true })).toHaveValue("wolf, fox");
+    await page.locator(".workflow-rail").getByRole("button", { name: /Classify/ }).click();
+    await expect(page.getByRole("checkbox", { name: "Overwrite JSON", exact: true })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: "Overwrite count", exact: true })).toBeChecked();
+    await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
+    await expect(page.getByRole("checkbox", { name: "Enable OCR", exact: true })).toBeChecked();
+    await expect(page.getByLabel("OCR device", { exact: true })).toHaveValue("cpu");
+    await expect(page.locator("fieldset.ocr-tuning").nth(0).getByRole("spinbutton", { name: "OCR detection limit", exact: true })).toHaveValue("2560");
+    await expect(page.locator("fieldset.ocr-tuning").nth(1).getByRole("spinbutton", { name: "OCR text batch", exact: true })).toHaveValue("3");
+    await page.locator(".workflow-rail").getByRole("button", { name: /NL/ }).click();
+    await expect(page.getByRole("textbox", { name: "HTTP attempt budget", exact: true })).toHaveValue("17");
+
+    const persisted = await page.evaluate(() => Object.values(window.localStorage).join("\n"));
+    expect(persisted).not.toContain("do-not-persist-this-secret");
+  });
+
+  test("saves, loads, and deletes a complete local preset while retaining current paths", async ({ page }) => {
+    await openApp(page, { language: "en" });
+    await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\preset-current-source");
+    await page.getByLabel("Work mode", { exact: true }).selectOption("full_copy");
+    await page.getByRole("textbox", { name: "Output dataset", exact: true }).fill("E:\\datasets\\preset-current-output");
+    await page.locator(".workflow-rail").getByRole("button", { name: /Export/ }).click();
+    await page.getByLabel("Format", { exact: true }).selectOption("json");
+    await page.getByRole("button", { name: /Dataset and configuration/ }).click();
+
+    await page.getByRole("textbox", { name: "Preset name", exact: true }).fill("Local review");
+    await page.getByRole("button", { name: "Save task preset", exact: true }).click();
+    await expect(page.getByRole("option", { name: "Local review", exact: true })).toHaveCount(1);
+    const presetStorage = await page.evaluate(() => JSON.parse(window.localStorage.getItem("anima.ui.annotation-presets.v1") ?? "{}"));
+    expect(presetStorage.presets[0].config).not.toHaveProperty("sourceRoot");
+    expect(presetStorage.presets[0].config).not.toHaveProperty("outputRoot");
+
+    await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\changed-source");
+    await page.getByRole("textbox", { name: "Output dataset", exact: true }).fill("E:\\datasets\\changed-output");
+    await page.locator(".workflow-rail").getByRole("button", { name: /Export/ }).click();
+    await page.getByLabel("Format", { exact: true }).selectOption("flat_txt");
+    await page.getByRole("button", { name: /Dataset and configuration/ }).click();
+    await page.getByRole("combobox", { name: "Task preset", exact: true }).selectOption({ label: "Local review" });
+
+    await expect(page.getByRole("textbox", { name: "Source dataset", exact: true })).toHaveValue("E:\\datasets\\changed-source");
+    await expect(page.getByRole("textbox", { name: "Output dataset", exact: true })).toHaveValue("E:\\datasets\\changed-output");
+    await page.locator(".workflow-rail").getByRole("button", { name: /Export/ }).click();
+    await expect(page.getByLabel("Format", { exact: true })).toHaveValue("json");
+    await page.getByRole("button", { name: /Dataset and configuration/ }).click();
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Delete task preset", exact: true }).click();
+    await expect(page.getByRole("option", { name: "Local review", exact: true })).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByRole("option", { name: "Local review", exact: true })).toHaveCount(0);
+  });
+
+  test("falls back to defaults when local draft storage is malformed or from an unknown version", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem("anima.ui.draft.v1", JSON.stringify({ schemaVersion: 999, draft: {}, ocrExecution: {} }));
+      window.localStorage.setItem("anima.ui.annotation-presets.v1", "not-json");
+    });
+    await openApp(page, { language: "en" });
+    await expect(page.getByRole("textbox", { name: "Source dataset", exact: true })).toHaveValue("");
+    await expect(page.getByLabel("Work mode", { exact: true })).toHaveValue("in_place");
+    await expect(page.getByRole("option", { name: "No task preset", exact: true })).toHaveCount(1);
+  });
+
+  test("keeps Classify JSON and count overwrite independent in incremental mode and explains rebuild", async ({ page, api }) => {
+    await openApp(page, { language: "en" });
+    await page.locator(".workflow-rail").getByRole("button", { name: /Classify/ }).click();
+    const overwriteJson = page.getByRole("checkbox", { name: "Overwrite JSON", exact: true });
+    const overwriteCount = page.getByRole("checkbox", { name: "Overwrite count", exact: true });
+    await expect(overwriteJson).toBeEnabled();
+    await expect(overwriteCount).toBeEnabled();
+    await overwriteJson.check();
+    await expect(overwriteJson).toBeChecked();
+    await expect(overwriteCount).not.toBeChecked();
+
+    await openSetup(page);
+    await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\classify-overwrite");
+    await openPrecheck(page);
+    await page.getByRole("button", { name: "Preflight", exact: true }).click();
+    await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
+    expect((mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: { classify: Record<string, unknown> } }).config.classify).toMatchObject({ overwriteJson: true, overwriteCount: false });
+
+    await page.reload();
+    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and configuration/ }).click();
+    await page.getByLabel("Overwrite mode", { exact: true }).selectOption("rebuild");
+    await page.locator(".workflow-rail").getByRole("button", { name: /Classify/ }).click();
+    await expect(page.getByRole("checkbox", { name: "Overwrite JSON", exact: true })).toBeDisabled();
+    await expect(page.getByRole("checkbox", { name: "Overwrite count", exact: true })).toBeDisabled();
+    await expect(page.locator("[data-classify-overwrite-mode='rebuild']").getByText("Rebuild always overwrites JSON and count.", { exact: true })).toHaveCount(1);
+    await expect(page.locator(".readonly-setting").getByText("Rebuild always overwrites JSON and count.", { exact: true })).toHaveCount(2);
+  });
+
+  test("offers an accessible cancellation action while asynchronous preflight is running", async ({ page, api }) => {
+    await openApp(page, { language: "en" });
+    await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\preflight-cancel");
+    await openPrecheck(page);
+    const releaseProgress = holdRoute(api, "GET /api/jobs/preflight/job-e621-characterization/progress");
+    await page.getByRole("button", { name: "Preflight", exact: true }).click();
+    await expect(page.locator("[data-preflight-progress]")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Cancel preflight", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Cancel preflight", exact: true }).click();
+    await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight/job-e621-characterization/cancel").length).toBe(1);
+    releaseProgress();
+    await expect(page.locator("[data-preflight-progress] .status")).toHaveText("Cancelled");
+  });
+
   test("fills module recommendations once, keeps manual overrides, and protects values on probe failure", async ({ page, api }) => {
     await openApp(page, { language: "en" });
     const recommend = page.getByRole("button", { name: "Recommend from device", exact: true });
@@ -136,10 +284,11 @@ test.describe("workflow characterization", () => {
   test("locks every module batch control after workspace confirmation", async ({ page }) => {
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\batch-lock");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
-    await expect(page.getByRole("button", { name: "Confirm workspace" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Start pipeline", exact: true })).toBeEnabled();
     page.once("dialog", (dialog) => dialog.accept());
-    await page.getByRole("button", { name: "Confirm workspace" }).click();
+    await page.getByRole("button", { name: "Start pipeline", exact: true }).click();
     await page.locator(".workflow-rail").getByRole("button", { name: /Caption/ }).click();
     await expect(page.locator("#caption-batch-size")).toBeDisabled();
     await page.locator(".workflow-rail").getByRole("button", { name: /Export/ }).click();
@@ -155,9 +304,10 @@ test.describe("workflow characterization", () => {
     await expect(page.getByLabel("User supplement", { exact: true })).toHaveCount(0);
     await expect(page.locator("[data-nl-preset-card]")).toHaveCount(3);
     expect(api.promptRequests).toEqual([]);
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
 
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill(sourceRoot);
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
 
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
@@ -166,20 +316,17 @@ test.describe("workflow characterization", () => {
     expect(mutationsFor(api, "POST", "/api/jobs/preflight")[0].body).toEqual({
       config: expectedE621Draft(sourceRoot, "General task preset prompt."),
     });
-    await expect(page.getByRole("button", { name: "Confirm workspace" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Start pipeline", exact: true })).toBeEnabled();
 
     page.once("dialog", (dialog) => dialog.accept());
-    await page.getByRole("button", { name: "Confirm workspace" }).click();
+    await page.getByRole("button", { name: "Start pipeline", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/job-e621-characterization/confirm-workspace").length).toBe(1);
     expect(mutationsFor(api, "POST", "/api/jobs/job-e621-characterization/confirm-workspace")[0].body).toEqual({
       confirmed: true,
       confirmedRebuild: false,
     });
-    await expect(page.locator(".task-monitor > .monitor-heading > .status")).toHaveText("preparing workspace");
-
-    await page.locator(".workflow-rail").getByRole("button", { name: /Export/ }).click();
-    await page.getByRole("button", { name: "Start pipeline" }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/job-e621-characterization/start").length).toBe(1);
+    await expect(page.locator(".task-monitor > .monitor-heading > .status")).toHaveText("running");
   });
 
   test("lets Caption choose v10 TXT input handling and sends the selected mode", async ({ page, api }) => {
@@ -203,8 +350,9 @@ test.describe("workflow characterization", () => {
     await expect(fallback).toHaveCount(0);
     await expect(page.getByRole("checkbox", { name: "Overwrite TXT" })).toBeDisabled();
 
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\txt-input-nl");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     const config = (mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: Record<string, unknown> }).config;
@@ -225,6 +373,49 @@ test.describe("workflow characterization", () => {
     await expect(page.getByRole("tooltip").filter({ hasText: "写入 JSON nl" })).toBeVisible();
     await page.getByRole("button", { name: "缺失或空 TXT 时启用 Tagger 补全说明" }).click();
     await expect(page.getByRole("tooltip").filter({ hasText: "重新创建任务运行" })).toBeVisible();
+  });
+
+  test("explains JSON and TXT input formats in the Setup step", async ({ page }) => {
+    await openApp(page, { language: "en" });
+    const help = page.locator("[data-input-format-help]");
+    await help.locator("summary").click();
+    await expect(help).toContainText("same-stem siblings");
+    await expect(help).toContainText("quality, count");
+    await expect(help).toContainText("artist, character, contributor, copyright");
+    await expect(help).toContainText("Tag TXT");
+    await expect(help).toContainText("NL TXT");
+
+    await page.getByRole("button", { name: "中文", exact: true }).click();
+    const chineseHelp = page.locator("[data-input-format-help]");
+    await expect(chineseHelp.locator("summary")).toHaveText("JSON / TXT 输入格式");
+    await chineseHelp.locator("summary").click();
+    await expect(chineseHelp).toContainText("同 stem 兄弟文件");
+    await expect(chineseHelp).toContainText("原始 E621 JSON");
+    await expect(chineseHelp).toContainText("Tag TXT");
+    await expect(chineseHelp).toContainText("NL TXT");
+  });
+
+  test("labels appearance dropout controls as NL and Tag rates", async ({ page }) => {
+    await openApp(page, { language: "en" });
+    await page.locator(".workflow-rail").getByRole("button", { name: /Dropout/ }).click();
+
+    const nlRates = page.getByLabel("NL dropout rate", { exact: true });
+    const tagRates = page.getByLabel("Tag dropout rate", { exact: true });
+    await expect(nlRates).toHaveCount(3);
+    await expect(tagRates).toHaveCount(3);
+    for (const index of [0, 1, 2]) {
+      await expect(nlRates.nth(index)).toBeVisible();
+      await expect(tagRates.nth(index)).toBeVisible();
+    }
+    await expect(page.getByLabel("Drop description", { exact: true })).toHaveCount(0);
+    await expect(page.getByLabel("Drop appearance tags", { exact: true })).toHaveCount(0);
+
+    await expect(page.getByRole("button", { name: "NL dropout rate information", exact: true })).toHaveCount(3);
+    await expect(page.getByRole("button", { name: "Tag dropout rate information", exact: true })).toHaveCount(3);
+    await page.getByRole("button", { name: "NL dropout rate information", exact: true }).first().click();
+    await expect(page.getByRole("tooltip").filter({ hasText: "JSON nl" })).toBeVisible();
+    await page.getByRole("button", { name: "Tag dropout rate information", exact: true }).first().click();
+    await expect(page.getByRole("tooltip").filter({ hasText: "JSON tags" })).toBeVisible();
   });
 
   test("keeps OCR and NL independent while sending the exact v10 OCR request object", async ({ page, api }) => {
@@ -248,8 +439,9 @@ test.describe("workflow characterization", () => {
     await expect(confidence).toHaveValue("1");
     await page.locator(".workflow-rail").getByRole("button", { name: /NL/ }).click();
     await expect(page.getByRole("checkbox", { name: "Enable NL" })).toBeChecked();
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\ocr-independent");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     const config = (mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: Record<string, unknown> }).config;
@@ -270,8 +462,9 @@ test.describe("workflow characterization", () => {
     await expect(page.getByText("Resources ready", { exact: true })).toBeVisible();
     await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
     await expect(page.getByText("Import-OcrResource.bat -Apply", { exact: true })).toBeVisible();
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\ocr-disabled");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     await page.locator(".workflow-rail").getByRole("button", { name: /OCR/ }).click();
@@ -281,6 +474,7 @@ test.describe("workflow characterization", () => {
   test("creates v10 tasks with independent E621 defaults", async ({ page, api }) => {
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\e621-v10");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     const config = (mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: Record<string, unknown> }).config;
@@ -297,8 +491,9 @@ test.describe("workflow characterization", () => {
     await page.getByRole("button", { name: "Select path", exact: true }).click();
     await expect(page.getByLabel("Classification resource.json", { exact: true })).toHaveValue("E:\\picked\\resource.json");
 
-    await page.locator(".workflow-rail").getByRole("button", { name: /Dataset and preflight/ }).click();
+    await openSetup(page);
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\custom-classify");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
     const config = (mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: Record<string, unknown> }).config;
@@ -312,6 +507,7 @@ test.describe("workflow characterization", () => {
     const releasePreflight = holdRoute(api, "POST /api/jobs/preflight");
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\pending-preflight");
+    await openPrecheck(page);
 
     const preflight = page.getByRole("button", { name: "Preflight", exact: true });
     await preflight.click();
@@ -323,6 +519,7 @@ test.describe("workflow characterization", () => {
     const releasePreflight = holdRoute(api, "POST /api/jobs/preflight");
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\pending-preflight-controls");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect(page.getByRole("button", { name: "Preflight", exact: true })).toBeDisabled();
 
@@ -343,6 +540,7 @@ test.describe("workflow characterization", () => {
     const releasePreflight = holdRoute(api, "POST /api/jobs/preflight");
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\pending-preflight");
+    await openPrecheck(page);
 
     const preflight = page.getByRole("button", { name: "Preflight", exact: true });
     await preflight.click();
@@ -356,9 +554,10 @@ test.describe("workflow characterization", () => {
     const releasePreflight = holdRoute(api, "POST /api/jobs/preflight");
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\pending-preflight");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
 
-    await expect(page.locator(".step-actions").first()).toHaveAttribute("aria-busy", "true");
+    await expect(page.locator(".step-actions[aria-busy]").first()).toHaveAttribute("aria-busy", "true");
     releasePreflight();
   });
 
@@ -366,9 +565,25 @@ test.describe("workflow characterization", () => {
     failRoute(api, "POST /api/jobs/preflight", "preflight unavailable");
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\failed-preflight");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
 
-    await expect(page.locator(".action-feedback").getByRole("alert")).toHaveText("preflight unavailable");
+    await expect(page.locator('.action-feedback p[role="alert"]')).toHaveText("preflight unavailable");
+  });
+
+  test("shows determinate image progress while asynchronous preflight is running", async ({ page, api }) => {
+    await openApp(page, { language: "en" });
+    await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\progress");
+    await openPrecheck(page);
+    await page.getByRole("button", { name: "Preflight", exact: true }).click();
+    await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight/async").length).toBe(1);
+    const releasePreflight = holdRoute(api, "GET /api/jobs/preflight/job-e621-characterization/progress");
+    await expect(page.getByRole("progressbar", { name: "Preflight image progress", exact: true })).toBeVisible();
+    await expect(page.getByText("0 / 3", { exact: true })).toBeVisible();
+    releasePreflight();
+    await expect(page.getByRole("progressbar", { name: "Preflight image progress", exact: true })).toHaveAttribute("value", "3");
+    await expect(page.getByText("3 / 3", { exact: true })).toBeVisible();
+    await expect(page.getByText("Samples", { exact: true })).toBeVisible();
   });
 
   test("renders actionable dataset claim guidance after workspace confirmation conflicts", async ({ page, api }) => {
@@ -376,12 +591,13 @@ test.describe("workflow characterization", () => {
     failRoute(api, "POST /api/jobs/job-e621-characterization/confirm-workspace", detail, 409);
     await openApp(page, { language: "en" });
     await page.getByRole("textbox", { name: "Source dataset", exact: true }).fill("E:\\datasets\\claimed");
+    await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
 
     page.once("dialog", (dialog) => dialog.accept());
-    await page.getByRole("button", { name: "Confirm workspace" }).click();
+    await page.getByRole("button", { name: "Start pipeline", exact: true }).click();
 
-    const alert = page.locator(".action-feedback").getByRole("alert");
+    const alert = page.locator('.action-feedback p[role="alert"]');
     await expect(alert).toHaveText(detail);
     await expect(alert).toContainText("task 3bc585");
     await expect(alert).toContainText("Recent tasks");

@@ -17,6 +17,7 @@ _LOCK_ENTRY = re.compile(
     r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)==(?P<version>\S+)\s+--hash=sha256:(?P<sha256>[0-9a-f]{64})$"
 )
 _SELECTOR = re.compile(r"^(?P<component>[a-z0-9][a-z0-9_.-]*):(?P<variant>[a-z0-9][a-z0-9_.-]*)$")
+_OPTIONAL_COMPONENT_IDS = frozenset(("ocr-cpu", "ocr-gpu", "ocr-models", "policy", "quality-stack"))
 
 
 class ManifestBuildError(ValueError):
@@ -226,6 +227,16 @@ def audit_inventory(inventory: object, requirements_root: str | Path) -> dict[st
     manifest = inventory["manifest"]
     if not isinstance(manifest, dict):
         raise ManifestBuildError("manifest inventory is invalid")
+    components = manifest.get("components")
+    if not isinstance(components, list):
+        raise ManifestBuildError("manifest components are invalid")
+    for component in components:
+        if not isinstance(component, dict):
+            raise ManifestBuildError("manifest component is invalid")
+        if component.get("componentId") in _OPTIONAL_COMPONENT_IDS and component.get("required") is not False:
+            raise ManifestBuildError(
+                "optional component must set required=false: " + str(component.get("componentId"))
+            )
     try:
         contract.load_manifest(
             manifest,

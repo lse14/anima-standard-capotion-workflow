@@ -36,6 +36,7 @@ STATE_DATABASE_API = frozenset({
     "count_current_review_decisions", "count_current_review_targets", "count_in_flight",
     "count_module_samples", "count_module_unsettled", "count_processing_samples", "count_repair_targets",
     "count_unresolved_blocking_issues", "create_repair_link", "delete_job_control_record", "delete_staged_nl",
+    "create_preflight_progress", "update_preflight_progress", "get_preflight_progress",
     "event_page", "event_snapshot_required", "fail_leased_sample_with_issue", "get_count_evidence",
     "get_count_observation", "get_count_review_decision", "get_job", "get_leased_sample", "get_runtime_evidence", "has_repair_children",
     "get_sample_state", "get_sample_with_state", "heartbeat", "increment_module_counts",
@@ -119,6 +120,9 @@ API_JOB_ROUTES = frozenset({
     ("GET", "/api/jobs"),
     ("GET", "/api/jobs/{job_id}"),
     ("POST", "/api/jobs/preflight"),
+    ("POST", "/api/jobs/preflight/async"),
+    ("GET", "/api/jobs/preflight/{job_id}/progress"),
+    ("POST", "/api/jobs/preflight/{job_id}/cancel"),
     ("POST", "/api/jobs/{job_id}/confirm-workspace"),
     ("POST", "/api/jobs/{job_id}/start"),
     ("POST", "/api/jobs/{job_id}/pause"),
@@ -130,6 +134,7 @@ API_JOB_ROUTES = frozenset({
     ("POST", "/api/jobs/{job_id}/cancel"),
     ("PUT", "/api/jobs/{job_id}/pin"),
     ("POST", "/api/jobs/{job_id}/discard"),
+    ("POST", "/api/jobs/{job_id}/delete-history"),
     ("POST", "/api/jobs/{job_id}/restore-original-annotations"),
 })
 

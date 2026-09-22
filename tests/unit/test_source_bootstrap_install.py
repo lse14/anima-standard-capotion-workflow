@@ -110,7 +110,7 @@ def fixture_manifest() -> dict[str, object]:
             {
                 "componentId": component_id,
                 "kind": "runtime",
-                "required": True,
+                "required": component_id not in {"ocr-cpu", "policy"},
                 "targetRelativePath": f".runtime-build/runtimes/{runtime_id}",
                 "variants": variants,
             }
@@ -302,7 +302,7 @@ def fallback_fixture_manifest(*, include_probe_companions: bool = False) -> dict
                 {
                     "componentId": "quality-stack",
                     "kind": "resource",
-                    "required": True,
+                    "required": False,
                     "targetRelativePath": "resource-library/quality-stack",
                     "variants": {"shared": _variant("quality-stack-resource", "models/quality.json")},
                 },
@@ -539,6 +539,8 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                     output = '{"kind":"caption","provider":"CPUExecutionProvider","tags":["alpha"]}\n'
                 elif "Lse14Scorer" in script:
                     output = '{"kind":"quality","device":"cpu","loaded":["clip","fusion","jtp3","waifu"],"score":1.0}\n'
+                elif "apply_policy" in script:
+                    output = '{"kind":"policy","check":"ok","device":"cpu"}\n'
                 elif "tokenizer_count_many" in script:
                     output = '{"kind":"tokenizer","counts":[3,4]}\n'
                 elif "create_paddle_engine" in script:
@@ -716,7 +718,7 @@ class SourceBootstrapInstallTests(unittest.TestCase):
 
         self.assertEqual({"caption-e621", "policy"}, fallback_ids)
         self.assertEqual({"ocr-gpu"}, discarded_gpu)
-        self.assertEqual([], failures)
+        self.assertEqual(["quality-stack"], failures)
 
     def test_cpu_retry_keeps_group_resource_failure_fatal(self) -> None:
         install_module = _install_module()
@@ -772,19 +774,19 @@ class SourceBootstrapInstallTests(unittest.TestCase):
         self.assertEqual(set(), discarded_gpu)
         self.assertEqual([], failures)
 
-    def test_nvidia_plan_has_cpu_and_gpu_ocr_but_cpu_plan_never_selects_cuda(self) -> None:
+    def test_base_installation_plan_never_selects_optional_ocr(self) -> None:
         assemble, manifest_module = _modules()
         manifest = manifest_module.load_manifest(fixture_manifest())
 
         cpu = assemble.installation_plan(manifest, accelerator="cpu")
         nvidia = assemble.installation_plan(manifest, accelerator="nvidia")
 
-        self.assertEqual({"ocr-paddle"}, cpu.runtime_ids & {"ocr-paddle", "ocr-paddle-gpu"})
-        self.assertEqual({"ocr-paddle", "ocr-paddle-gpu"}, nvidia.runtime_ids & {"ocr-paddle", "ocr-paddle-gpu"})
+        self.assertEqual(set(), cpu.runtime_ids & {"ocr-paddle", "ocr-paddle-gpu"})
+        self.assertEqual(set(), nvidia.runtime_ids & {"ocr-paddle", "ocr-paddle-gpu"})
         self.assertNotIn("caption-e621-cuda", cpu.lock_names)
         self.assertNotIn("policy-cuda", cpu.lock_names)
         self.assertIn("caption-e621-cuda", nvidia.lock_names)
-        self.assertIn("policy-cuda", nvidia.lock_names)
+        self.assertNotIn("policy-cuda", nvidia.lock_names)
 
     def test_installation_plan_excludes_optional_delayed_ocr_models(self) -> None:
         assemble, manifest_module = _modules()
@@ -795,6 +797,69 @@ class SourceBootstrapInstallTests(unittest.TestCase):
         plan = assemble.installation_plan(manifest, accelerator="cpu")
 
         self.assertNotIn("ocr-models", {item.component.component_id for item in plan.components})
+
+    def test_base_installation_plan_excludes_optional_ocr_runtimes(self) -> None:
+        assemble, manifest_module = _modules()
+        manifest = manifest_module.load_manifest(fixture_manifest())
+
+        plan = assemble.installation_plan(manifest, accelerator="cpu")
+
+        selected = {item.component.component_id for item in plan.components}
+        self.assertNotIn("ocr-cpu", selected)
+        self.assertNotIn("ocr-gpu", selected)
+
+    def test_base_validation_does_not_require_optional_ocr_runtimes(self) -> None:
+        assemble, manifest_module = _modules()
+        value = fixture_manifest()
+        for component_id in (
+            "e621-indexes",
+            "e621-replacement-indexes",
+            "e621-tagger",
+            "quality-stack",
+            "qwen3-tokenizer",
+        ):
+            value["components"].append(
+                {
+                    "componentId": component_id,
+                    "kind": "resource",
+                    "required": component_id != "quality-stack",
+                    "targetRelativePath": f"resource-library/{component_id}",
+                    "variants": {"shared": _variant(f"{component_id}-resource", f"resources/{component_id}.json")},
+                }
+            )
+        value["components"] = [
+            component
+            for component in value["components"]
+            if component["componentId"] not in {"ocr-cpu", "ocr-gpu"}
+        ]
+        manifest = manifest_module.load_manifest(value)
+
+        assemble.validate_mandatory_e621_components(manifest)
+
+    def test_base_validation_rejects_ocr_components_marked_required(self) -> None:
+        assemble, manifest_module = _modules()
+        value = fixture_manifest()
+        for component_id in (
+            "e621-indexes",
+            "e621-replacement-indexes",
+            "e621-tagger",
+            "quality-stack",
+            "qwen3-tokenizer",
+        ):
+            value["components"].append(
+                {
+                    "componentId": component_id,
+                    "kind": "resource",
+                    "required": component_id != "quality-stack",
+                    "targetRelativePath": f"resource-library/{component_id}",
+                    "variants": {"shared": _variant(f"{component_id}-resource", f"resources/{component_id}.json")},
+                }
+            )
+        next(component for component in value["components"] if component["componentId"] == "ocr-cpu")["required"] = True
+        manifest = manifest_module.load_manifest(value)
+
+        with self.assertRaisesRegex(assemble.ManifestError, "optional component"):
+            assemble.validate_mandatory_e621_components(manifest)
 
     def test_production_plan_requires_all_mandatory_e621_components(self) -> None:
         assemble, manifest_module = _modules()
@@ -811,7 +876,7 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                 {
                     "componentId": component_id,
                     "kind": "resource",
-                    "required": True,
+                    "required": component_id != "quality-stack",
                     "targetRelativePath": f"resource-library/{component_id}",
                     "variants": {"shared": _variant(f"{component_id}-resource", f"resources/{component_id}.json")},
                 }
@@ -840,7 +905,7 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                 {
                     "componentId": component_id,
                     "kind": "resource",
-                    "required": True,
+                    "required": component_id != "quality-stack",
                     "targetRelativePath": f"resource-library/{component_id}",
                     "variants": {"shared": _variant(f"{component_id}-resource", f"resources/{component_id}.json")},
                 }
@@ -1269,11 +1334,11 @@ class SourceBootstrapInstallTests(unittest.TestCase):
         self.assertEqual(manifest.fingerprint, state["installManifestSha256"])
         self.assertEqual("cpu", state["accelerator"])
         self.assertNotIn("ocr-gpu", state["components"])
-        self.assertEqual("cpu", state["components"]["policy"]["variant"])
+        self.assertNotIn("policy", state["components"])
         self.assertEqual("2026-08-11T00:00:00Z", state["completedAtUtc"])
 
         incomplete = dict(records)
-        incomplete.pop("policy")
+        incomplete.pop("core")
         with self.assertRaisesRegex(assemble.AssemblyError, "required component"):
             assemble.build_install_state(manifest, plan, incomplete, completed_at_utc="2026-08-11T00:00:00Z")
 
@@ -1488,7 +1553,7 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                 )
 
             self.assertEqual({"policy": True, "quality-stack": True}, result)
-            self.assertEqual([policy, quality], list(run.call_args.args[0]))
+            self.assertEqual([policy], list(run.call_args.args[0]))
             write_manifest.assert_called_once()
             self.assertIs(policy, write_manifest.call_args.args[1])
 
@@ -1671,6 +1736,40 @@ class SourceBootstrapInstallTests(unittest.TestCase):
             self.assertTrue(result.state_path.is_file())
             self.assertIn("OCR_MODEL_DOWNLOAD.md", "\n".join(result.messages))
 
+    def test_base_install_with_complete_model_archives_does_not_require_ocr_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            root = Path(temporary_name)
+            install_module, manifest, base, fetch, probe, write_runtime_manifest = self._prepare_fixture_install(
+                root,
+                include_delayed_ocr_models=True,
+            )
+            archive_root = root / "ocr-model-archives"
+            archive_root.mkdir()
+            for filename in OCR_MODEL_ARCHIVE_FILENAMES:
+                (archive_root / filename).write_bytes(b"fixture archive")
+
+            with mock.patch.object(
+                install_module,
+                "_import_available_ocr_models",
+                return_value={"resource": "installed"},
+            ) as importer:
+                result = install_module.install_project(
+                    project_root=root,
+                    source_root=root,
+                    manifest=manifest,
+                    accelerator="cpu",
+                    base_runtime=base,
+                    fetch_artifact=fetch,
+                    probe_component=probe,
+                    write_runtime_manifest=write_runtime_manifest,
+                    require_mandatory_e621=False,
+                )
+
+            importer.assert_not_called()
+            self.assertTrue(result.state_path.is_file())
+            self.assertNotIn("OCR model import completed", result.messages)
+            self.assertIn("optional OCR CPU runtime is not installed", "\n".join(result.messages))
+
     def test_ocr_model_import_error_becomes_an_installer_error(self) -> None:
         install_module = _install_module()
         importer = SimpleNamespace(
@@ -1690,6 +1789,9 @@ class SourceBootstrapInstallTests(unittest.TestCase):
             archive_root.mkdir()
             for filename in OCR_MODEL_ARCHIVE_FILENAMES:
                 (archive_root / filename).write_bytes(b"invalid")
+            runtime = root / ".runtime-build" / "runtimes" / "ocr-paddle"
+            runtime.mkdir(parents=True)
+            (runtime / "python.exe").write_bytes(b"fixture python")
             importer = SimpleNamespace(
                 import_available_local_model_resource=mock.Mock(
                     side_effect=RuntimeError("fixture archive hash mismatch")
@@ -1728,7 +1830,6 @@ class SourceBootstrapInstallTests(unittest.TestCase):
             for relative in (
                 "workers/caption/src/anima_caption_worker",
                 "workers/policy/src/anima_policy_worker",
-                "workers/ocr/src/anima_ocr_worker",
             ):
                 source = root / relative
                 source.mkdir(parents=True)
@@ -1753,11 +1854,10 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                 probe_calls.append((item.component.component_id, item.variant.name))
                 self.assertTrue(target.is_dir())
                 if item.component.component_id in {"e621-tagger", "quality-stack"}:
-                    return probe_calls.count((item.component.component_id, item.variant.name)) > 1
+                    return True
                 return (item.component.component_id, item.variant.name) not in {
                     ("caption-e621", "cuda"),
                     ("policy", "cuda"),
-                    ("ocr-gpu", "cuda"),
                 }
 
             result = install_module.install_project(
@@ -1765,6 +1865,7 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                 source_root=root,
                 manifest=manifest,
                 accelerator="nvidia",
+                optional_components={"policy", "quality-stack"},
                 base_runtime=base,
                 fetch_artifact=fetch,
                 probe_component=probe,
@@ -1775,24 +1876,22 @@ class SourceBootstrapInstallTests(unittest.TestCase):
             state = json.loads(result.state_path.read_text(encoding="utf-8"))
             self.assertEqual("cuda", state["components"]["caption-e621"]["variant"])
             self.assertEqual("cpu", state["components"]["policy"]["variant"])
-            self.assertEqual("cpu", state["components"]["ocr-cpu"]["variant"])
+            self.assertNotIn("ocr-cpu", state["components"])
             self.assertNotIn("ocr-gpu", state["components"])
             self.assertIn(("caption-e621", "cuda"), probe_calls)
             self.assertNotIn(("caption-e621", "cpu"), probe_calls)
             self.assertIn(("policy", "cuda"), probe_calls)
             self.assertIn(("policy", "cpu"), probe_calls)
-            self.assertIn(("ocr-gpu", "cuda"), probe_calls)
             self.assertEqual(1, probe_calls.count(("e621-tagger", "shared")))
-            self.assertGreaterEqual(probe_calls.count(("quality-stack", "shared")), 2)
+            self.assertEqual(1, probe_calls.count(("quality-stack", "shared")))
             self.assertTrue(any("Caption CUDA offline probe failed; keeping the CUDA runtime" in message for message in result.messages))
             self.assertTrue(any("policy CUDA offline probe failed" in message for message in result.messages))
-            self.assertTrue(any("OCR GPU offline probe failed" in message for message in result.messages))
-            self.assertFalse(any("GPU runtime installed" in message for message in result.messages))
+            self.assertFalse(any(component_id.startswith("ocr-") for component_id, _ in probe_calls))
 
-    def test_required_quality_or_ocr_probe_failure_never_publishes_state(self) -> None:
+    def test_required_policy_probe_failure_never_publishes_state(self) -> None:
         install_module = _install_module()
         _, manifest_module = _modules()
-        for failed_component in ("policy", "ocr-cpu"):
+        for failed_component in ("policy",):
             with self.subTest(component=failed_component), tempfile.TemporaryDirectory() as temporary_name:
                 root = Path(temporary_name)
                 base = root / "bootstrap-base"
@@ -1802,7 +1901,6 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                 for relative in (
                     "workers/caption/src/anima_caption_worker",
                     "workers/policy/src/anima_policy_worker",
-                    "workers/ocr/src/anima_ocr_worker",
                 ):
                     source = root / relative
                     source.mkdir(parents=True)
@@ -1823,6 +1921,7 @@ class SourceBootstrapInstallTests(unittest.TestCase):
                         source_root=root,
                         manifest=manifest,
                         accelerator="cpu",
+                        optional_components={"policy"},
                         base_runtime=base,
                         fetch_artifact=lambda artifact: artifact_paths[artifact.artifact_id],
                         probe_component=lambda item, _target: item.component.component_id != failed_component,

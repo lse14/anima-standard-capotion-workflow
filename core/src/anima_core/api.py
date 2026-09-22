@@ -85,12 +85,17 @@ def build_control_app(
     resource_catalog = resource_catalog or ResourceCatalog(default_resource_library_root())
     if any(candidate.root != resource_catalog.root for candidate in service_catalogs):
         raise ValueError("control-plane services must share one resource catalog")
-    preparation_service = preparation_service or JobPreparationService(database_path, resource_catalog=resource_catalog)
     pipeline_service = pipeline_service or PipelineService(
         database_path,
         profile_store=profile_store,
         credential_store=credential_store,
         resource_catalog=resource_catalog,
+    )
+    preparation_service = preparation_service or JobPreparationService(
+        database_path,
+        resource_catalog=resource_catalog,
+        install_root=getattr(pipeline_service, "install_root", None),
+        profile_store=profile_store,
     )
     repair_service = repair_service or RepairPreparationService(database_path)
     native_path_picker = native_path_picker or NativePathPicker()

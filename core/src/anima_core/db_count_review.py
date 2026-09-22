@@ -21,7 +21,7 @@ class CountReviewDatabaseMixin:
     """Count evidence, observation, review decision, and batch confirmation operations."""
 
     def inherit_repair_count_evidence(self, repair_job_id: str, parent_job_id: str) -> int:
-        """Copy validated Classify evidence needed by v3/v4 Replace/NL repair targets."""
+        """Copy validated Classify evidence needed by downstream repair targets."""
         from .count_review_protocol import CountEvidenceV1
 
         repair_job = get_job_row(self.connection, repair_job_id)
@@ -48,7 +48,7 @@ class CountReviewDatabaseMixin:
                      FROM repair_targets AS rt
                      LEFT JOIN count_evidence AS e
                        ON e.job_id=? AND e.sample_id=rt.sample_id
-                    WHERE rt.repair_job_id=? AND rt.repair_start_module IN ('replace','nl')"""
+                    WHERE rt.repair_job_id=? AND rt.repair_start_module IN ('ocr','replace','nl')"""
                 + cursor_clause + " ORDER BY rt.sample_id LIMIT ?",
                 parameters,
             ))

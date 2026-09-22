@@ -105,6 +105,9 @@ class NlHelloV1:
     policy: NlApiPolicyV1
     responseProtocol: str = "nl-v1"
     promptVersion: str | None = None
+    protocol: str = "openai_chat_completions"
+    providerLabel: str = ""
+    jsonMode: str = "prompt_only"
 
 
 @dataclass(frozen=True)
@@ -125,11 +128,12 @@ class NlWorkItemV1:
 def parse_hello(value: object) -> NlHelloV1:
     item = _object(value, "nl hello")
     fields = {"schemaVersion", "payloadType", "jobId", "configHash", "endpoint", "model", "backupModel", "apiKey", "systemPrompt", "apiPolicy"}
+    optional = {"responseProtocol", "promptVersion", "protocol", "providerLabel", "jsonMode"}
     if set(item) not in {
         frozenset(fields),
         frozenset(fields | {"responseProtocol"}),
         frozenset(fields | {"responseProtocol", "promptVersion"}),
-    }:
+    } and not (set(item) - set(fields) <= optional):
         raise NlProtocolError("nl hello fields are invalid")
     if item["schemaVersion"] != 1 or item["payloadType"] != "nl_hello_request":
         raise NlProtocolError("nl hello identity is invalid")
@@ -144,6 +148,15 @@ def parse_hello(value: object) -> NlHelloV1:
         or prompt_version not in {"nl-default-prompt-v3", "nl-default-prompt-v4"}
     ):
         raise NlProtocolError("NL prompt version is invalid")
+    protocol = item.get("protocol", "openai_chat_completions")
+    if protocol != "openai_chat_completions":
+        raise NlProtocolError("NL provider protocol is invalid")
+    provider_label = item.get("providerLabel", "")
+    if not isinstance(provider_label, str) or len(provider_label.encode("utf-8")) > 128:
+        raise NlProtocolError("NL provider label is invalid")
+    json_mode = item.get("jsonMode", "prompt_only")
+    if json_mode not in {"prompt_only", "json_object"}:
+        raise NlProtocolError("NL JSON mode is invalid")
     backup = item["backupModel"]
     if backup is not None:
         backup = _string(backup, "backupModel", 512)
@@ -155,7 +168,7 @@ def parse_hello(value: object) -> NlHelloV1:
         _string(item["jobId"], "jobId", 128), _string(item["configHash"], "configHash", 64), endpoint,
         _string(item["model"], "model", 512), backup, _string(item["apiKey"], "apiKey", 16_384),
         _string(item["systemPrompt"], "systemPrompt", 65_536), NlApiPolicyV1.from_dict(item["apiPolicy"]),
-        response_protocol, prompt_version,
+        response_protocol, prompt_version, protocol, provider_label, json_mode,
     )
 
 

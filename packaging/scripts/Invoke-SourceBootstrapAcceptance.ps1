@@ -57,11 +57,15 @@ function Assert-ScenarioInstallState([string]$ScenarioName, [object]$State) {
         return
     }
     if ([string]$State.accelerator -ne 'nvidia') { throw 'NVIDIA acceptance requires an install state with accelerator nvidia' }
-    foreach ($componentId in @('caption-e621', 'policy', 'ocr-gpu')) {
+    foreach ($componentId in @('caption-e621', 'policy')) {
         $component = $State.components.PSObject.Properties[$componentId]
         if ($null -eq $component -or [string]$component.Value.variant -ne 'cuda') {
             throw "NVIDIA acceptance is missing CUDA evidence for $componentId"
         }
+    }
+    $optionalGpu = $State.components.PSObject.Properties['ocr-gpu']
+    if ($null -ne $optionalGpu -and [string]$optionalGpu.Value.variant -ne 'cuda') {
+        throw 'NVIDIA acceptance contains OCR GPU evidence with a non-CUDA variant'
     }
 }
 

@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -174,6 +175,39 @@ class CaptionOverlayFixture:
 
 
 class CaptionOverlayTests(unittest.TestCase):
+    def test_commit_prepared_retries_transient_windows_file_sharing_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CaptionOverlayFixture(Path(temporary))
+            try:
+                relative, digest = fixture.write_prepared()
+                sharing_error = PermissionError(32, "sharing violation")
+                sharing_error.winerror = 32
+                with patch(
+                    "anima_core.overlay.os.replace",
+                    side_effect=[sharing_error, None],
+                ) as replace:
+                    fixture.layout.commit_prepared(relative, digest, "sample", ".txt")
+                self.assertEqual(2, replace.call_count)
+            finally:
+                fixture.close()
+
+    def test_commit_ocr_prepared_retries_transient_windows_file_sharing_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CaptionOverlayFixture(Path(temporary))
+            try:
+                prepared, digest = fixture.layout.write_ocr_prepared("lease-ocr-1", b"{}")
+                relative = os.path.relpath(prepared, fixture.layout.root).replace("/", "\\")
+                sharing_error = PermissionError(32, "sharing violation")
+                sharing_error.winerror = 32
+                with patch(
+                    "anima_core.overlay.os.replace",
+                    side_effect=[sharing_error, None],
+                ) as replace:
+                    fixture.layout.commit_ocr_prepared(relative, digest, "sample.png")
+                self.assertEqual(2, replace.call_count)
+            finally:
+                fixture.close()
+
     def test_writer_serializes_caption_tags_with_the_shared_v10_serializer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CaptionOverlayFixture(Path(temporary))

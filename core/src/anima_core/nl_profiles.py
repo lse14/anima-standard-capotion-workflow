@@ -4,7 +4,8 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -236,36 +237,108 @@ def default_nl_prompt(
     }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class NlApiProfile:
+    """A connection-only profile.
+
+    ``systemPrompt`` and ``apiPolicy`` are retained as constructor-compatible
+    aliases for old local clients.  They are never written to the v2 profile
+    library; task prompt semantics belong to the frozen JobConfig.
+    """
     profileId: str
     endpoint: str
     model: str
     backupModel: str | None
     apiCredentialRef: str
-    systemPrompt: str
-    apiPolicy: dict[str, object]
+    systemPrompt: str = ""
+    apiPolicy: dict[str, object] | None = None
+    name: str | None = None
+    protocol: str = "openai_chat_completions"
+    providerLabel: str = "gemini-relay"
+    jsonMode: str = "prompt_only"
+    revision: int = 1
+    updatedAt: str = ""
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, NlApiProfile):
+            return NotImplemented
+        # Legacy callers compare profiles by the original connection fields;
+        # v2 metadata is deliberately not part of that compatibility contract.
+        return (
+            self.profileId, self.endpoint, self.model, self.backupModel,
+            self.apiCredentialRef, self.policy,
+        ) == (
+            other.profileId, other.endpoint, other.model, other.backupModel,
+            other.apiCredentialRef, other.policy,
+        )
+
+    @property
+    def credentialRef(self) -> str:
+        return self.apiCredentialRef
+
+    @property
+    def policy(self) -> dict[str, object]:
+        return dict(self.apiPolicy or {})
+
+    def persisted_dict(self) -> dict[str, object]:
+        updated = self.updatedAt or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return {
+            "profileId": self.profileId,
+            "name": self.name or self.profileId,
+            "protocol": self.protocol,
+            "providerLabel": self.providerLabel,
+            "endpoint": self.endpoint,
+            "model": self.model,
+            "backupModel": self.backupModel,
+            "credentialRef": self.apiCredentialRef,
+            "jsonMode": self.jsonMode,
+            "policy": self.policy,
+            "revision": self.revision,
+            "updatedAt": updated,
+        }
 
     @classmethod
     def from_dict(cls, value: object) -> "NlApiProfile":
-        if not isinstance(value, dict) or set(value) != {"profileId", "endpoint", "model", "backupModel", "apiCredentialRef", "systemPrompt", "apiPolicy"}:
+        if not isinstance(value, dict):
             raise NlProfileError("NL API profile fields are invalid")
-        profile_id = value["profileId"]
+        profile_id = value.get("profileId")
         if not isinstance(profile_id, str) or not PROFILE_ID.fullmatch(profile_id):
             raise NlProfileError("NL API profile id is invalid")
-        for field in ("endpoint", "model", "apiCredentialRef", "systemPrompt"):
-            item = value[field]
+        legacy = "apiCredentialRef" in value or "systemPrompt" in value or "apiPolicy" in value
+        credential_ref = value.get("apiCredentialRef" if legacy else "credentialRef")
+        policy = value.get("apiPolicy" if legacy else "policy", {})
+        for field, item in (("endpoint", value.get("endpoint")), ("model", value.get("model")), ("credentialRef", credential_ref)):
             if not isinstance(item, str) or not item.strip() or "\x00" in item or len(item.encode("utf-8")) > 65_536:
                 raise NlProfileError(f"NL API profile {field} is invalid")
-        backup = value["backupModel"]
+        backup = value.get("backupModel")
         if backup is not None and (not isinstance(backup, str) or not backup.strip() or "\x00" in backup or len(backup.encode("utf-8")) > 512):
             raise NlProfileError("NL API profile backupModel is invalid")
-        if not isinstance(value["apiPolicy"], dict):
+        if not isinstance(policy, dict):
             raise NlProfileError("NL API profile policy is invalid")
         # Deliberately reject secret-shaped field names before persistence.
-        if any("key" in key.casefold() or "token" in key.casefold() or "secret" in key.casefold() for key in value["apiPolicy"]):
+        if any("key" in key.casefold() or "token" in key.casefold() or "secret" in key.casefold() for key in policy):
             raise NlProfileError("NL API profile policy must not contain credentials")
-        return cls(profile_id, value["endpoint"], value["model"], backup, value["apiCredentialRef"], value["systemPrompt"], dict(value["apiPolicy"]))
+        name = value.get("name", profile_id)
+        protocol = value.get("protocol", "openai_chat_completions")
+        provider = value.get("providerLabel", "gemini-relay")
+        json_mode = value.get("jsonMode", "prompt_only")
+        revision = value.get("revision", 1)
+        updated = value.get("updatedAt", "")
+        if not isinstance(name, str) or not name.strip() or len(name.encode("utf-8")) > 256:
+            raise NlProfileError("NL API profile name is invalid")
+        if protocol != "openai_chat_completions" or not isinstance(provider, str) or not provider.strip() or len(provider.encode("utf-8")) > 128:
+            raise NlProfileError("NL API profile protocol is invalid")
+        if json_mode not in {"prompt_only", "json_object"}:
+            raise NlProfileError("NL API profile jsonMode is invalid")
+        if type(revision) is not int or revision < 1:
+            raise NlProfileError("NL API profile revision is invalid")
+        if not isinstance(updated, str) or len(updated.encode("utf-8")) > 128:
+            raise NlProfileError("NL API profile updatedAt is invalid")
+        return cls(
+            profile_id, value["endpoint"], value["model"], backup, credential_ref,
+            value.get("systemPrompt", "") if legacy else "", dict(policy), name,
+            protocol, provider, json_mode, revision, updated,
+        )
 
 
 class NlApiProfileStore:
@@ -274,39 +347,106 @@ class NlApiProfileStore:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else Path(os.environ["LOCALAPPDATA"]) / "AnimaDatasetTool" / "nl-api-profiles.json"
 
-    def load_all(self) -> tuple[NlApiProfile, ...]:
+    def _load_document(self) -> tuple[str | None, tuple[NlApiProfile, ...]]:
         try:
             raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return ()
+            return None, ()
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise NlProfileError("NL API profile store is invalid JSON") from exc
-        if not isinstance(value, dict) or set(value) != {"schemaVersion", "profiles"} or value["schemaVersion"] != 1 or not isinstance(value["profiles"], list):
+        if not isinstance(value, dict) or value.get("schemaVersion") not in {1, 2} or not isinstance(value.get("profiles"), list):
             raise NlProfileError("NL API profile store is invalid")
         profiles = tuple(NlApiProfile.from_dict(item) for item in value["profiles"])
         if len({profile.profileId for profile in profiles}) != len(profiles):
             raise NlProfileError("NL API profile ids are duplicated")
-        return profiles
+        default = value.get("defaultProfileId")
+        if default is not None and (not isinstance(default, str) or default not in {item.profileId for item in profiles}):
+            raise NlProfileError("NL API default profile is invalid")
+        return default, profiles
 
-    def save(self, profile: NlApiProfile) -> None:
-        profiles = {item.profileId: item for item in self.load_all()}
-        profiles[profile.profileId] = profile
+    def load_all(self) -> tuple[NlApiProfile, ...]:
+        return self._load_document()[1]
+
+    def snapshot_document(self) -> bytes | None:
+        """Capture the exact profile document for a compensating rollback."""
+        try:
+            return self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def restore_document(self, snapshot: bytes | None) -> None:
+        """Restore a document captured by :meth:`snapshot_document` atomically."""
+        if snapshot is None:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                return
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        target = {"schemaVersion": 1, "profiles": [asdict(profiles[key]) for key in sorted(profiles)]}
+        temporary = self.path.with_suffix(self.path.suffix + ".rollback.tmp")
+        try:
+            temporary.write_bytes(snapshot)
+            os.replace(temporary, self.path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def default_profile_id(self) -> str | None:
+        return self._load_document()[0]
+
+    def _write(self, profiles: tuple[NlApiProfile, ...], default_profile_id: str | None) -> None:
+        if default_profile_id is not None and default_profile_id not in {item.profileId for item in profiles}:
+            raise NlProfileError("NL API default profile is invalid")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        target = {
+            "schemaVersion": 2,
+            "defaultProfileId": default_profile_id,
+            "profiles": [item.persisted_dict() for item in sorted(profiles, key=lambda item: item.profileId)],
+        }
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(target, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, self.path)
 
+    def save(self, profile: NlApiProfile, *, expected_revision: int | None = None) -> NlApiProfile:
+        default, current = self._load_document()
+        existing = next((item for item in current if item.profileId == profile.profileId), None)
+        if expected_revision is not None and (existing is None or existing.revision != expected_revision):
+            raise NlProfileError("profile_revision_conflict")
+        revision = (existing.revision + 1) if existing is not None else max(1, profile.revision)
+        saved = NlApiProfile(
+            profile.profileId, profile.endpoint, profile.model, profile.backupModel, profile.apiCredentialRef,
+            profile.systemPrompt, profile.policy, profile.name, profile.protocol, profile.providerLabel,
+            profile.jsonMode, revision, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        profiles = tuple(saved if item.profileId == saved.profileId else item for item in current)
+        if existing is None:
+            profiles = (*profiles, saved)
+        self._write(profiles, default or (saved.profileId if len(profiles) == 1 else None))
+        return saved
+
+    def set_default(self, profile_id: str, *, expected_revision: int | None = None) -> None:
+        default, profiles = self._load_document()
+        profile = next((item for item in profiles if item.profileId == profile_id), None)
+        if profile is None:
+            raise NlProfileError("NL API profile does not exist")
+        if expected_revision is not None and profile.revision != expected_revision:
+            raise NlProfileError("profile_revision_conflict")
+        self._write(profiles, profile_id)
+
     def delete(self, profile_id: str) -> None:
         if not PROFILE_ID.fullmatch(profile_id):
             raise NlProfileError("NL API profile id is invalid")
-        profiles = {item.profileId: item for item in self.load_all()}
+        default, current = self._load_document()
+        profiles = {item.profileId: item for item in current}
         if profile_id not in profiles:
             return
+        if len(profiles) <= 1:
+            raise NlProfileError("profile_last_one")
+        if default == profile_id:
+            raise NlProfileError("profile_default_in_use")
         del profiles[profile_id]
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(json.dumps({"schemaVersion": 1, "profiles": [asdict(profiles[key]) for key in sorted(profiles)]}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, self.path)
+        self._write(tuple(profiles.values()), default)

@@ -25,6 +25,21 @@ def _verify_archive_against_manifest(archive: zipfile.ZipFile) -> None:
                 raise AnnotationBackupError("backup verification failed")
 
 
+def verify_backup(backup_zip: str | Path) -> Path:
+    """Run the same archive and manifest verification used before publication."""
+    backup = Path(backup_zip)
+    if not backup.is_file():
+        raise AnnotationBackupError("backup is unavailable")
+    try:
+        with zipfile.ZipFile(backup) as archive:
+            if archive.testzip() is not None or "manifest.jsonl" not in archive.namelist():
+                raise AnnotationBackupError("backup verification failed")
+            _verify_archive_against_manifest(archive)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise AnnotationBackupError("backup verification failed") from exc
+    return backup
+
+
 def write_backup(dataset_root: str | Path, backup_zip: str | Path, page: Callable[[int | None], Sequence[object]]) -> Path:
     root, target = Path(dataset_root), Path(backup_zip)
     partial = target.with_suffix(target.suffix + ".partial")
@@ -57,10 +72,7 @@ def write_backup(dataset_root: str | Path, backup_zip: str | Path, page: Callabl
             manifest.flush()
             os.fsync(manifest.fileno())
             archive.write(manifest_path, "manifest.jsonl")
-        with zipfile.ZipFile(partial) as archive:
-            if archive.testzip() is not None or "manifest.jsonl" not in archive.namelist():
-                raise AnnotationBackupError("backup verification failed")
-            _verify_archive_against_manifest(archive)
+        verify_backup(partial)
         os.replace(partial, target)
         return target
     except Exception:

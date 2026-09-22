@@ -10,12 +10,40 @@ from .ocr_runtime_binding import OcrExecutionRequestV1, normalize_ocr_execution
 
 class _ProfileBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+    endpoint: str = ""
+    model: str = ""
+    backupModel: str | None = None
+    apiCredentialRef: str | None = None
+    credentialRef: str | None = None
+    systemPrompt: str = ""
+    apiPolicy: dict[str, object] | None = None
+    policy: dict[str, object] | None = None
+    name: str | None = None
+    protocol: str = "openai_chat_completions"
+    providerLabel: str = "gemini-relay"
+    jsonMode: str = "prompt_only"
+    revision: int | None = None
+
+
+class _ProfileCopyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    profileId: str
+    name: str | None = None
+
+
+class _NlApiConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expectedTaskRevision: int = Field(ge=0)
+    expectedProfileRevision: int = Field(ge=1)
+    profileId: str
+    protocol: Literal["openai_chat_completions"] = "openai_chat_completions"
+    providerLabel: str = "gemini-relay"
     endpoint: str
     model: str
     backupModel: str | None = None
-    apiCredentialRef: str
-    systemPrompt: str
-    apiPolicy: dict[str, object]
+    credentialRef: str
+    jsonMode: Literal["prompt_only", "json_object"] = "prompt_only"
+    policy: dict[str, object] = Field(default_factory=dict)
 
 
 class _SecretBody(BaseModel):
@@ -63,6 +91,12 @@ class _AmountBody(BaseModel):
 class _ConfirmBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     confirmed: bool
+
+
+class _ExportRecommitBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    confirmed: bool
+    inventoryFingerprint: str = Field(min_length=64, max_length=64)
 
 
 class _NlManualRetryBody(BaseModel):

@@ -268,8 +268,15 @@ class SchedulerTests(unittest.TestCase):
                 self.assertTrue(scheduler.worker_exited("job-1", "caption", abnormal=True))
                 self.assertTrue(scheduler.worker_exited("job-1", "caption", abnormal=True))
                 self.assertFalse(scheduler.worker_exited("job-1", "caption", abnormal=True))
-                self.assertEqual("failed", database.get_job("job-1")["status"])
-                database.set_job_status("job-1", "running", current_module_id="caption")
+                self.assertEqual("running", database.get_job("job-1")["status"])
+                self.assertEqual("completed_with_issues", database.module_summary("job-1", "caption")["status"])
+                state = database.get_sample_state("job-1", 1)
+                self.assertEqual(("caption", "failed"), (state["current_module_id"], state["status"]))
+                issue = database.page_issues("job-1", limit=10)
+                self.assertEqual(1, len(issue))
+                self.assertEqual(("caption", "module_worker_unavailable", 0), (
+                    issue[0]["module_id"], issue[0]["code"], issue[0]["retriable"],
+                ))
                 scheduler.begin_cancellation("job-1")
                 self.assertEqual(
                     [],
@@ -279,6 +286,46 @@ class SchedulerTests(unittest.TestCase):
                 )
                 scheduler.settle_cancellation("job-1")
                 self.assertEqual("cancelled_recoverable", database.get_job("job-1")["status"])
+            finally:
+                database.close()
+
+    def test_worker_exhaustion_preserves_completed_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self._database(Path(temporary), count=2)
+            try:
+                scheduler = BoundedScheduler(
+                    database, lease_id_factory=iter(("lease-1", "lease-2")).__next__,
+                )
+                scheduler.start_module("job-1", "caption", enabled=True, profile="e621")
+                leases = scheduler.claim_batch(
+                    "job-1", "caption", "worker-1", database.get_job("job-1")["config_hash"],
+                )
+                scheduler.complete(leases[0])
+
+                self.assertTrue(scheduler.worker_exited("job-1", "caption", abnormal=True))
+                self.assertTrue(scheduler.worker_exited("job-1", "caption", abnormal=True))
+                self.assertFalse(scheduler.worker_exited("job-1", "caption", abnormal=True))
+
+                self.assertEqual("completed", database.get_sample_state("job-1", 1)["status"])
+                self.assertEqual("failed", database.get_sample_state("job-1", 2)["status"])
+                summary = database.module_summary("job-1", "caption")
+                self.assertEqual((1, 1, 1), (
+                    summary["completed"], summary["failed"], summary["issue_count"],
+                ))
+            finally:
+                database.close()
+
+    def test_worker_exit_after_cancellation_does_not_consume_restart_budget_or_fail_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self._database(Path(temporary), count=1)
+            try:
+                scheduler = BoundedScheduler(database)
+                scheduler.start_module("job-1", "caption", enabled=True, profile="e621")
+                scheduler.begin_cancellation("job-1")
+
+                self.assertFalse(scheduler.worker_exited("job-1", "caption", abnormal=True))
+                self.assertEqual(0, database.module_summary("job-1", "caption")["worker_restart_count"])
+                self.assertEqual("pending", database.get_sample_state("job-1", 1)["status"])
             finally:
                 database.close()
 

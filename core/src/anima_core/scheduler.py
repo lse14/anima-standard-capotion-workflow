@@ -284,6 +284,17 @@ class BoundedScheduler:
                 if not page:
                     break
                 cursor = page[-1]
+        # The preflight decision is shared by every module, including Export.
+        # Export still commits the baseline directory, but preserved samples
+        # must not acquire an Export worker lease or hit its Token Budget gate.
+        cursor = None
+        while True:
+            page = self.database.skip_incremental_preserved_page(
+                job_id, module_id, after_sample_id=cursor, limit=MAX_PAGE_SIZE,
+            )
+            if not page:
+                break
+            cursor = page[-1]
         self.database.set_module_summary(job_id, module_id, status="running")
         self.database.set_job_status(
             job_id, "exporting" if module_id == "export" else "running", current_module_id=module_id
@@ -384,6 +395,17 @@ class BoundedScheduler:
             allowed_statuses=allowed_statuses,
         )
 
+    def skip_export_with_issue(self, lease: WorkLease, issue: SampleIssue) -> None:
+        if lease.moduleId != "export" or not lease.leaseId:
+            raise SchedulerError("Export issue skip requires an Export lease id")
+        self.database.skip_leased_sample_with_issue(
+            lease.jobId,
+            lease.moduleId,
+            lease.sampleId,
+            lease_id=lease.leaseId,
+            issue=issue,
+        )
+
     def release_unstarted(self, lease: WorkLease) -> None:
         if not lease.leaseId:
             raise SchedulerError("returning a lease requires a lease id")
@@ -436,14 +458,37 @@ class BoundedScheduler:
         return target
 
     def worker_exited(self, job_id: str, module_id: ModuleId, *, abnormal: bool) -> bool:
-        """Return whether a worker may be restarted; the third crash fails the module."""
+        """Return whether to restart; otherwise fail only unfinished samples and continue."""
         if not abnormal:
+            return False
+        job = self.database.get_job(job_id)
+        expected_job_status = "exporting" if module_id == "export" else "running"
+        if job["status"] != expected_job_status or job["current_module_id"] != module_id:
             return False
         attempts = self.database.increment_worker_restart(job_id, module_id)
         if attempts <= 2:
             return True
-        self.database.set_module_summary(job_id, module_id, status="failed", finished=True)
-        self.database.set_job_status(job_id, "failed", current_module_id=module_id)
+        cursor: int | None = None
+        failed = 0
+        while True:
+            try:
+                page = self.database.fail_unsettled_module_samples_page(
+                    job_id, module_id, after_sample_id=cursor, limit=MAX_PAGE_SIZE,
+                )
+            except ValueError:
+                current = self.database.get_job(job_id)
+                if current["status"] != expected_job_status or current["current_module_id"] != module_id:
+                    return False
+                raise
+            if not page:
+                break
+            failed += len(page)
+            cursor = page[-1]
+        self.finish_module(
+            job_id,
+            module_id,
+            with_issues=failed > 0 and module_id != "export",
+        )
         return False
 
     def begin_cancellation(self, job_id: str) -> None:

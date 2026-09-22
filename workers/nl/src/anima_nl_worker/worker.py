@@ -20,6 +20,10 @@ from .validation import NL_IMAGE_NOT_RECEIVED, NlValidationError, validate_compl
 
 
 RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+# Some upstream gateways return an empty or truncated model message even when
+# the HTTP request succeeded. Give that response one bounded recovery attempt;
+# the shared job-level HTTP allowance still remains the hard upper bound.
+RECOVERY_ATTEMPTS = 1
 USER_AGENT = "Anima-Dataset-Tool/1.0"
 PROTOCOL_PROMPT_V2 = """Return exactly one JSON object with exactly these keys: nl, count, layout, sameCharacterRepeated.
 nl must be one non-empty natural-language caption string.
@@ -73,9 +77,13 @@ class NlWorker:
     _rpm_lock: asyncio.Lock | None = None
 
     async def initialize(self, payload: object) -> dict[str, object]:
-        if self.hello is not None:
-            raise NlWorkerError("nl_protocol_violation", "NL worker is already initialized")
         hello = parse_hello(payload)
+        # A repeated hello is the explicit batch-boundary API revision switch.
+        # Core never sends it while process() is running, so replacing the
+        # client here cannot mix revisions within a batch.
+        if self.hello is not None:
+            await self.close()
+            self.cancelled = False
         timeout = httpx.Timeout(hello.policy.readTimeoutSeconds, connect=hello.policy.connectTimeoutSeconds, write=hello.policy.writeTimeoutSeconds, pool=hello.policy.poolTimeoutSeconds)
         limits = httpx.Limits(max_connections=hello.policy.concurrency, max_keepalive_connections=hello.policy.concurrency)
         self.hello = hello
@@ -207,8 +215,13 @@ class NlWorker:
         models = [(self.hello.model, self.hello.policy.mainAttempts)]
         if self.hello.policy.backupEnabled and self.hello.backupModel:
             models.append((self.hello.backupModel, self.hello.policy.backupAttempts))
+        format_retry_used = False
+        legacy_recovery = not self.hello.providerLabel
         for model, attempts in models:
-            for attempt in range(attempts):
+            attempt = 0
+            format_retry_pending = False
+            transport_attempts = attempts + (RECOVERY_ATTEMPTS if legacy_recovery else 0)
+            while attempt < transport_attempts or format_retry_pending:
                 if self.cancelled:
                     return process_issue(item, "nl_cancelled", "NL request was cancelled before start", retriable=True, http_attempts=attempts_used)
                 if not await self._wait_rpm():
@@ -216,8 +229,13 @@ class NlWorker:
                 if not await self._take_attempt():
                     return process_issue(item, "nl_budget_exhausted", "HTTP attempt budget is exhausted", retriable=True, http_attempts=attempts_used)
                 attempts_used += 1
+                if format_retry_pending:
+                    format_retry_pending = False
                 try:
-                    response = await self.client.post(self.hello.endpoint, headers={"Authorization": f"Bearer {self.hello.apiKey}", "User-Agent": USER_AGENT}, json={"model": model, "temperature": self.hello.policy.temperature, "top_p": self.hello.policy.topP, "max_tokens": self.hello.policy.maxTokens, "messages": messages})
+                    request_body: dict[str, object] = {"model": model, "temperature": self.hello.policy.temperature, "top_p": self.hello.policy.topP, "max_tokens": self.hello.policy.maxTokens, "messages": messages}
+                    if self.hello.jsonMode == "json_object":
+                        request_body["response_format"] = {"type": "json_object"}
+                    response = await self.client.post(self.hello.endpoint, headers={"Authorization": f"Bearer {self.hello.apiKey}", "User-Agent": USER_AGENT}, json=request_body)
                     if response.status_code in {401, 403}:
                         return process_issue(item, "nl_auth_failed", f"API returned HTTP {response.status_code}", retriable=False, http_attempts=attempts_used)
                     if response.status_code not in RETRIABLE_STATUSES and response.status_code >= 400:
@@ -226,8 +244,9 @@ class NlWorker:
                         last_message = f"API returned HTTP {response.status_code}"
                         retry_after = response.headers.get("Retry-After")
                         delay = self._retry_delay(retry_after, attempt)
-                        if attempt + 1 < attempts and not self.cancelled:
+                        if attempt + 1 < transport_attempts and not self.cancelled:
                             await asyncio.sleep(delay)
+                            attempt += 1
                             continue
                         break
                     if self.hello.responseProtocol == "nl-count-v2":
@@ -253,11 +272,21 @@ class NlWorker:
                     )
                 except (httpx.TransportError, httpx.TimeoutException) as exc:
                     last_message = f"network failure: {type(exc).__name__}"
-                    if attempt + 1 < attempts and not self.cancelled:
+                    if attempt + 1 < transport_attempts and not self.cancelled:
                         await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                        attempt += 1
                         continue
-                except (NlImageError, NlValidationError) as exc:
+                except NlImageError as exc:
                     return process_issue(item, "nl_response_invalid", str(exc), retriable=False, http_attempts=attempts_used)
+                except NlValidationError as exc:
+                    last_message = str(exc)
+                    if not format_retry_used and not self.cancelled:
+                        format_retry_used = True
+                        format_retry_pending = True
+                        continue
+                    code = "nl_response_format_invalid" if self.hello.providerLabel else "nl_response_invalid"
+                    return process_issue(item, code, last_message, retriable=False, http_attempts=attempts_used)
+                attempt += 1
         return process_issue(item, "nl_api_unavailable", last_message, retriable=False, http_attempts=attempts_used)
 
     async def process(self, items: tuple[NlWorkItemV1, ...], http_attempt_allowance: int) -> list[dict[str, Any]]:

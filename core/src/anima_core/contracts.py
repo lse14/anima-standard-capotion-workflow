@@ -335,7 +335,7 @@ class JobState:
     configHash: str
     status: Literal[
         "draft", "preflighting", "ready", "preparing_workspace", "running", "paused", "interrupted",
-        "reviewing", "exporting", "committing", "cancelling", "cancelled_recoverable", "succeeded", "failed", "discarded"
+        "reviewing", "exporting", "committing", "cancelling", "cancelled_recoverable", "succeeded", "succeeded_with_issues", "failed", "discarded"
     ]
     currentModuleId: ModuleId | None = None
     manifestSchemaVersion: int = 1
@@ -413,13 +413,34 @@ def validate_job_config(
     nl = config.nl
     base_nl_fields = {
         "enabled", "reuseOriginalNl", "apiEnabled", "useImage", "useFullJson", "systemPrompt", "promptVersion",
-        "apiProfileId", "apiPolicy",
+        "apiProfileId", "apiPolicy", "apiRuntime",
     }
-    required_nl_fields = base_nl_fields - {"apiProfileId", "apiPolicy"}
+    required_nl_fields = base_nl_fields - {"apiProfileId", "apiPolicy", "apiRuntime"}
     v6_nl_fields = {"captionPreset", "lengthDistribution", "lengthSeed"}
     allowed_nl_fields = base_nl_fields | (v6_nl_fields if job_config_supports_nl_v4(config.schemaVersion) else set())
     if not isinstance(nl, dict) or not required_nl_fields.issubset(nl) or set(nl) - allowed_nl_fields:
         raise ValueError("nl configuration fields are invalid")
+    if "apiRuntime" in nl:
+        runtime = nl["apiRuntime"]
+        if runtime is not None:
+            if not isinstance(runtime, dict) or set(runtime) != {
+                "revision", "protocol", "providerLabel", "endpoint", "model", "backupModel",
+                "credentialRef", "jsonMode", "policy", "appliedAt",
+            }:
+                raise ValueError("NL apiRuntime is invalid")
+            if type(runtime["revision"]) is not int or runtime["revision"] < 1:
+                raise ValueError("NL apiRuntime revision is invalid")
+            if runtime["protocol"] != "openai_chat_completions" or runtime["jsonMode"] not in {"prompt_only", "json_object"}:
+                raise ValueError("NL apiRuntime protocol or jsonMode is invalid")
+            for field in ("providerLabel", "endpoint", "model", "credentialRef", "appliedAt"):
+                if not isinstance(runtime[field], str) or not runtime[field].strip() or "\x00" in runtime[field]:
+                    raise ValueError(f"NL apiRuntime {field} is invalid")
+            if runtime["backupModel"] is not None and not isinstance(runtime["backupModel"], str):
+                raise ValueError("NL apiRuntime backupModel is invalid")
+            if not isinstance(runtime["policy"], dict):
+                raise ValueError("NL apiRuntime policy is invalid")
+            if any("key" in str(key).casefold() or "token" in str(key).casefold() or "secret" in str(key).casefold() for key in runtime["policy"]):
+                raise ValueError("NL apiRuntime policy must not contain credentials")
     if job_config_supports_nl_v4(config.schemaVersion):
         if not v6_nl_fields.issubset(nl):
             raise ValueError("JobConfig v6 requires NL routing fields")

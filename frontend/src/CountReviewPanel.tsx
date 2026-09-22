@@ -72,7 +72,7 @@ function replaceDecisions(
 
 export function CountReviewPanel({ jobId, jobStatus, currentModuleId, language, onConfirmed }: CountReviewPanelProps) {
   const t = (key: string, values?: Record<string, string | number>) => translate(language, key, values);
-  const [filters, setFilters] = useState<CountReviewFilters>({});
+  const [filters, setFilters] = useState<CountReviewFilters>({ status: "pending" });
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [pageCursors, setPageCursors] = useState([0]);
   const [pageIndex, setPageIndex] = useState(0);
@@ -83,12 +83,20 @@ export function CountReviewPanel({ jobId, jobStatus, currentModuleId, language, 
   const [loading, setLoading] = useState(true);
   const [batchSaving, setBatchSaving] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [reloadRevision, setReloadRevision] = useState(0);
   const afterSampleId = pageCursors[pageIndex] ?? 0;
   const editable = jobStatus === "reviewing" && currentModuleId === "count_review";
   const itemSaving = Object.values(saveStates).some((state) => state === "saving");
+  const confirmBlocker = !editable
+    ? t("countReviewStateBlocker")
+    : loading || !page
+      ? t("countReviewLoading")
+      : page.pendingCount > 0
+        ? t("countReviewPendingBlocker", { count: page.pendingCount })
+        : t("countReviewReady");
 
   useEffect(() => {
     let cancelled = false;
@@ -207,10 +215,19 @@ export function CountReviewPanel({ jobId, jobStatus, currentModuleId, language, 
 
   const confirmAndContinue = async () => {
     if (!editable || !page || page.pendingCount !== 0 || confirming) return;
-    if (!window.confirm(t("countReviewConfirmPrompt"))) return;
-    setConfirming(true);
+    setChecking(true);
     setNotice(null);
     try {
+      const authority = await listCountReview(jobId, {}, 0, 1);
+      if (authority.pendingCount !== 0) {
+        setPage((current) => current ? { ...current, pendingCount: authority.pendingCount } : current);
+        setFilters({ status: "pending" });
+        resetPaging();
+        setNotice(t("countReviewPendingBlocker", { count: authority.pendingCount }));
+        return;
+      }
+      if (!window.confirm(t("countReviewConfirmPrompt"))) return;
+      setConfirming(true);
       await confirmCountReview(jobId);
       setNotice(t("countReviewContinuing"));
       await onConfirmed();
@@ -218,6 +235,7 @@ export function CountReviewPanel({ jobId, jobStatus, currentModuleId, language, 
       setNotice(cause instanceof Error ? cause.message : t("countReviewConfirmFailed"));
     } finally {
       setConfirming(false);
+      setChecking(false);
     }
   };
 
@@ -228,14 +246,22 @@ export function CountReviewPanel({ jobId, jobStatus, currentModuleId, language, 
     setSelected(allPageSelected ? new Set() : new Set(page.items.map((item) => item.sampleId)));
   };
 
-  return <section className="count-review-panel" aria-busy={loading || batchSaving || confirming}>
+  return <section className="count-review-panel" aria-busy={loading || batchSaving || confirming || checking}>
+    <div className="review-workbench-heading">
+      <div><p className="eyebrow">{t("workspaceCountReview")}</p><h2>{t("workspaceCountReview")}</h2><p>{t("countReviewWorkbenchHelp")}</p></div>
+      <span className={`status ${editable ? "reviewing" : "idle"}`}>{t(editable ? "countReviewEditable" : "countReviewReadOnly")}</span>
+    </div>
     <div className="review-summary">
       <dl>
         <div><dt>{t("countReviewTargets")}</dt><dd>{page?.targetCount ?? 0}</dd></div>
         <div><dt>{t("countReviewPending")}</dt><dd>{page?.pendingCount ?? 0}</dd></div>
         <div><dt>{t("countReviewSelected")}</dt><dd>{selectedItems.length}</dd></div>
       </dl>
-      <span className={`status ${editable ? "reviewing" : "idle"}`}>{t(editable ? "countReviewEditable" : "countReviewReadOnly")}</span>
+    </div>
+
+    <div className={`review-command ${page?.pendingCount === 0 && editable ? "ready" : "blocked"}`}>
+      <div><strong>{confirmBlocker}</strong><small>{checking ? t("countReviewChecking") : t("countReviewConfirmPrompt")}</small></div>
+      <button type="button" className="confirm-review" disabled={!editable || loading || checking || confirming || batchSaving || itemSaving || !page || page.pendingCount !== 0} onClick={() => void confirmAndContinue()}>{confirming || checking ? t(confirming ? "countReviewConfirming" : "countReviewChecking") : t("countReviewConfirmContinue")}</button>
     </div>
 
     <div className="review-filters" aria-label={t("countReviewFilters")}>
@@ -356,7 +382,6 @@ export function CountReviewPanel({ jobId, jobStatus, currentModuleId, language, 
           setPageIndex((value) => value + 1);
         }}>{t("nextPage")}</button>
       </div>
-      <button type="button" className="confirm-review" disabled={!editable || loading || confirming || batchSaving || itemSaving || !page || page.pendingCount !== 0} onClick={() => void confirmAndContinue()}>{confirming ? t("countReviewConfirming") : t("countReviewConfirmContinue")}</button>
     </div>
   </section>;
 }

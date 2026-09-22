@@ -14,7 +14,7 @@ from .custom_classification_resource import (
 )
 from .db import MAX_PAGE_SIZE, StateDatabase
 from .job_preflight import config_from_dict
-from .locks import DatasetLock
+from .locks import DatasetLock, release_completed_dataset_lock
 from .overlay import BaselineView, OverlayLayout, WorkingAnnotationView
 from .path_safety import PathSafetyError, ensure_within, windows_key
 
@@ -112,6 +112,35 @@ class RepairPreparationService:
                 "parent frozen custom classification resource is invalid"
             ) from exc
 
+    @staticmethod
+    def _inherit_target_annotations(
+        database: StateDatabase,
+        parent: object,
+        parent_job_id: str,
+        repair_job_id: str,
+        dataset: Path,
+        child_layout: OverlayLayout,
+    ) -> None:
+        parent_overlay = parent["overlay_root"]
+        if not isinstance(parent_overlay, str) or not parent_overlay:
+            raise RepairPreparationError("parent annotation overlay is unavailable")
+        try:
+            parent_layout = OverlayLayout.open_existing(parent_overlay, parent_job_id)
+            parent_view = WorkingAnnotationView(BaselineView(dataset), parent_layout)
+            rows = database.connection.execute(
+                """SELECT s.sample_id,s.annotation_key
+                   FROM repair_targets AS target
+                   JOIN samples AS s ON s.job_id=target.repair_job_id AND s.sample_id=target.sample_id
+                  WHERE target.repair_job_id=? ORDER BY s.sample_id""",
+                (repair_job_id,),
+            )
+            for row in rows:
+                raw = parent_view.read(str(row["annotation_key"]), ".json")
+                if raw is not None:
+                    child_layout.write_annotation(str(row["annotation_key"]), ".json", raw)
+        except (OSError, OverlayError, ValueError) as exc:
+            raise RepairPreparationError("parent target annotations are unavailable") from exc
+
     def prepare(self, parent_job_id: str) -> RepairPreparationResult:
         database = StateDatabase.open(self.database_path)
         layout: OverlayLayout | None = None
@@ -148,12 +177,14 @@ class RepairPreparationService:
             target_count = database.count_repair_targets(repair_job_id)
             if target_count == 0:
                 raise RepairPreparationError("task has no eligible retriable sample issues")
-            try:
-                database.inherit_repair_count_evidence(repair_job_id, parent_job_id)
-            except ValueError as exc:
-                raise RepairPreparationError(str(exc)) from exc
+            if isinstance(config.countReview, dict) and config.countReview.get("enabled") is True:
+                try:
+                    database.inherit_repair_count_evidence(repair_job_id, parent_job_id)
+                except ValueError as exc:
+                    raise RepairPreparationError(str(exc)) from exc
             layout = OverlayLayout.create(dataset, repair_job_id)
             self._inherit_custom_classification_resource(parent, config, layout)
+            self._inherit_target_annotations(database, parent, parent_job_id, repair_job_id, dataset, layout)
             database.set_workspace_metadata(repair_job_id, dataset_root=str(dataset), dataset_root_key=windows_key(dataset), overlay_root=str(layout.root))
             database.set_job_status(repair_job_id, "preparing_workspace", current_module_id="workspace")
             self._locks[repair_job_id] = acquired
@@ -346,8 +377,8 @@ class RepairPreparationService:
             if len(issues_by_id) != len(requested_issue_ids):
                 raise RepairPreparationError("manual NL retry requires unresolved current-page NL issues")
             issues = [issues_by_id[issue_id] for issue_id in requested_issue_ids]
-            if any(issue["module_id"] != "nl" or bool(issue["retriable"]) for issue in issues):
-                raise RepairPreparationError("manual NL retry requires unresolved non-retriable NL issues")
+            if any(issue["module_id"] != "nl" for issue in issues):
+                raise RepairPreparationError("manual NL retry requires unresolved NL issues")
             selected_sample_ids = [int(issue["sample_id"]) for issue in issues]
             if len(set(selected_sample_ids)) != len(selected_sample_ids):
                 raise RepairPreparationError("manual NL retry requires at most one issue per sample")
@@ -455,3 +486,42 @@ class RepairPreparationService:
             finally:
                 lock.database.close()
         self._locks.clear()
+
+    def release_lock_for_history_deletion(self, job_id: str) -> bool:
+        return release_completed_dataset_lock(self._locks, self.database_path, job_id)
+
+    def release_lock_for_repair(self, job_id: str) -> bool:
+        """Release a repair task lock while its parent is being repaired."""
+        lock = self._locks.get(job_id)
+        if lock is None:
+            return False
+        job = lock.database.get_job(job_id)
+        if job["status"] not in {"reviewing", "failed", "succeeded"}:
+            raise RepairPreparationError(
+                "only a reviewed, failed, or succeeded task can release its lock for repair"
+            )
+        overlay_root = job["overlay_root"]
+        if isinstance(overlay_root, str) and overlay_root:
+            try:
+                state = OverlayLayout.open_existing(overlay_root, job_id).journal_state()
+            except Exception as exc:
+                raise RepairPreparationError("task commit journal cannot be safely inspected") from exc
+            if state not in {None, "committed", "rolled_back"}:
+                raise RepairPreparationError("task lock cannot be released before commit journal recovery")
+        lock.release(recovery_complete=True)
+        lock.database.close()
+        del self._locks[job_id]
+        return True
+
+    def restore_lock_after_repair_failure(self, job_id: str) -> None:
+        """Restore a repair-owned lock after a child repair could not be prepared."""
+        if job_id in self._locks:
+            return
+        database = StateDatabase.open(self.database_path)
+        try:
+            job = database.get_job(job_id)
+            dataset = Path(str(job["dataset_root"]))
+            self._locks[job_id] = DatasetLock.acquire(database, dataset, job_id)
+        except Exception:
+            database.close()
+            raise
