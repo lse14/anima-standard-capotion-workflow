@@ -166,6 +166,10 @@ if ($LASTEXITCODE -ne 0) { throw 'NL prompt v3 resource assembly failed' }
     --v4-source-root (Join-Path $repo 'packaging\resources') `
     --install-root $install
 if ($LASTEXITCODE -ne 0) { throw 'NL prompt v4 fragment resource assembly failed' }
+& $builder -B -I (Join-Path $repo 'packaging\scripts\assemble_nl_prompt_resource.py') `
+    --moss-source-root (Join-Path $repo 'packaging\resources') `
+    --install-root $install
+if ($LASTEXITCODE -ne 0) { throw 'MOSS NL prompt resource assembly failed' }
 
 $profileOutput = Join-Path $install 'manifests\profiles'
 New-Item -ItemType Directory -Path $profileOutput -Force | Out-Null

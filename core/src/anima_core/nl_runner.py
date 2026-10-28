@@ -12,6 +12,11 @@ from .classify_overlay import ClassifyJsonError, parse_annotation_json
 from .contracts import (
     CURRENT_JOB_CONFIG_SCHEMA_VERSION,
     MODULE_BATCH_SIZE_BOUNDS,
+    NL_MOSS_CAPTION_PRESETS,
+    NL_MOSS_PROMPT_VERSION,
+    NL_MOSS_RESPONSE_PROTOCOL,
+    NL_STANDARD_CAPTION_PRESETS,
+    NL_V4_PROMPT_VERSION,
     SampleIssue,
     WorkLease,
     job_config_supports_caption_input_txt_mode,
@@ -80,9 +85,9 @@ def build_short_rewrite_item(
         or not PureWindowsPath(image_path).is_absolute()
     ):
         raise ValueError("short rewrite image path is invalid")
-    if caption_preset not in {"general", "style", "character"}:
+    if caption_preset not in NL_STANDARD_CAPTION_PRESETS | NL_MOSS_CAPTION_PRESETS:
         raise ValueError("short rewrite caption preset is invalid")
-    if caption_preset == "character":
+    if caption_preset in {"character", "moss-character"}:
         if not isinstance(primary_character_name, str) or not primary_character_name or len(primary_character_name.encode("utf-8")) > 512:
             raise ValueError("short rewrite primary character name is invalid")
     elif primary_character_name is not None:
@@ -240,9 +245,15 @@ class NlRunner:
         config_schema_version = config.get("schemaVersion") if isinstance(config, dict) else None
         expected_prompt_version = (
             "nl-default-prompt-v1" if config_schema_version == 2
-            else "nl-default-prompt-v4" if job_config_supports_nl_v4(config_schema_version)
+            else NL_V4_PROMPT_VERSION if job_config_supports_nl_v4(config_schema_version)
             else "nl-default-prompt-v3" if config_schema_version == 5
             else "nl-default-prompt-v2"
+        )
+        actual_prompt_version = config.get("nl", {}).get("promptVersion") if isinstance(config, dict) and isinstance(config.get("nl"), dict) else None
+        prompt_version_valid = (
+            actual_prompt_version in {expected_prompt_version, NL_MOSS_PROMPT_VERSION}
+            if job_config_supports_nl_v4(config_schema_version)
+            else actual_prompt_version == expected_prompt_version
         )
         if (
             not isinstance(config, dict)
@@ -251,7 +262,7 @@ class NlRunner:
             or "profile" in config
             or not isinstance(config.get("nl"), dict)
             or config_schema_version != int(job["config_schema_version"])
-            or config["nl"].get("promptVersion") != expected_prompt_version
+            or not prompt_version_valid
         ):
             raise self._fatal("nl_protocol_violation", "frozen NL configuration is invalid")
         batches = config.get("moduleBatchSize")
@@ -334,9 +345,9 @@ class NlRunner:
             "protocol": self.credentials.protocol, "providerLabel": self.credentials.providerLabel,
             "jsonMode": self.credentials.jsonMode,
         }
-        if response_protocol == "nl-count-v2":
+        if response_protocol in {"nl-count-v2", NL_MOSS_RESPONSE_PROTOCOL}:
             request_payload["responseProtocol"] = response_protocol
-            if prompt_version in {"nl-default-prompt-v3", "nl-default-prompt-v4"}:
+            if prompt_version in {"nl-default-prompt-v3", NL_V4_PROMPT_VERSION, NL_MOSS_PROMPT_VERSION}:
                 request_payload["promptVersion"] = prompt_version
         payload = self._exchange("hello", request_payload, config_hash)
         if payload != {"schemaVersion": 1, "payloadType": "nl_hello_result", "ready": True, "concurrency": policy.get("concurrency", 3)}:
@@ -502,13 +513,16 @@ class NlRunner:
         if job_config_supports_nl_v4(config_schema_version):
             try:
                 preset = str(nl["captionPreset"])
+                expected_presets = NL_MOSS_CAPTION_PRESETS if nl.get("promptVersion") == NL_MOSS_PROMPT_VERSION else NL_STANDARD_CAPTION_PRESETS
+                if preset not in expected_presets:
+                    raise ValueError("NL caption preset family does not match prompt version")
                 distribution = dict(nl["lengthDistribution"])
                 tier = stable_length_tier(
                     seed=str(nl["lengthSeed"]),
                     relative_image_path=str(row["relative_image_path"]),
                     distribution=distribution,
                 )
-                primary = character_name(str(row["relative_image_path"])) if preset == "character" else None
+                primary = character_name(str(row["relative_image_path"])) if preset in {"character", "moss-character"} else None
                 if primary is not None and len(primary.encode("utf-8")) > 512:
                     raise ValueError("primary character name exceeds its bound")
                 supplement = nl.get("systemPrompt")
@@ -540,13 +554,17 @@ class NlRunner:
 
     def run(self) -> str:
         config_hash, nl, dataset_root, config_schema_version, ocr, input_txt_mode = self._config()
-        response_protocol = "nl-v1" if config_schema_version == 2 else "nl-count-v2"
+        prompt_version = str(nl["promptVersion"])
+        moss_mode = prompt_version == NL_MOSS_PROMPT_VERSION
+        response_protocol = NL_MOSS_RESPONSE_PROTOCOL if moss_mode else "nl-v1" if config_schema_version == 2 else "nl-count-v2"
         if nl.get("enabled") is not True:
             raise self._fatal("nl_protocol_violation", "NL runner cannot execute a disabled module")
-        reuse = nl.get("reuseOriginalNl") is True
-        input_txt_nl = input_txt_mode == "nl"
+        reuse = nl.get("reuseOriginalNl") is True and not moss_mode
+        input_txt_nl = input_txt_mode == "nl" and not moss_mode
         api_enabled = nl.get("apiEnabled") is True and not input_txt_nl
         use_image, use_json = nl.get("useImage") is True, nl.get("useFullJson") is True
+        if moss_mode and (not api_enabled or not use_image):
+            raise self._fatal("nl_protocol_violation", "MOSS output requires the NL API and image input")
         if api_enabled and not use_image:
             raise self._fatal("nl_protocol_violation", "API-enabled NL requires image input")
         policy = self._policy(nl) if api_enabled else None
@@ -570,17 +588,23 @@ class NlRunner:
                 request_items: list[tuple[WorkLease, object, dict[str, object]]] = []
                 for lease in active[:]:
                     row = self.database.get_leased_sample(self.job_id, "nl", lease.sampleId, lease_id=str(lease.leaseId), worker_instance_id=self.worker_instance_id)
-                    try:
-                        projection = parse_annotation_json(self.view.read(str(row["annotation_key"]), ".json"))
-                    except ClassifyJsonError as exc:
-                        self._not_requested(lease, "working_json_invalid")
-                        self._issue(lease, row, "nl_working_json_invalid", str(exc), repair_start="classify")
-                        active.remove(lease)
-                        continue
-                    if projection is None:
-                        self._not_requested(lease, "working_json_missing")
-                        self._issue(lease, row, "nl_working_json_missing", "working JSON is missing or blank", severity="warning", blocking=False, repair_start="classify")
-                        active.remove(lease)
+                    if moss_mode and not use_json:
+                        projection: dict[str, object] = {}
+                    else:
+                        try:
+                            projection = parse_annotation_json(self.view.read(str(row["annotation_key"]), ".json"))
+                        except ClassifyJsonError as exc:
+                            self._not_requested(lease, "working_json_invalid")
+                            self._issue(lease, row, "nl_working_json_invalid", str(exc), repair_start="classify")
+                            active.remove(lease)
+                            continue
+                        if projection is None:
+                            self._not_requested(lease, "working_json_missing")
+                            self._issue(lease, row, "nl_working_json_missing", "working JSON is missing or blank", severity="warning", blocking=False, repair_start="classify")
+                            active.remove(lease)
+                            continue
+                    if moss_mode:
+                        request_items.append((lease, row, projection))
                         continue
                     if input_txt_nl:
                         target = projection.get("nl")
@@ -735,6 +759,8 @@ class NlRunner:
                     self._pause("nl_http_budget_paused")
                     return "paused"
                 for lease, _, _ in request_items:
+                    if moss_mode:
+                        self._not_requested(lease, "moss_output")
                     self.database.mark_nl_request_started(self.job_id, lease.sampleId, lease_id=str(lease.leaseId))
                 allowance = min(maximum - used, len(request_items) * (int(policy["mainAttempts"]) + (int(policy["backupAttempts"]) if policy["backupEnabled"] else 0)))
                 outcomes = parse_outcomes(
@@ -759,7 +785,7 @@ class NlRunner:
                             pause_code = "nl_http_budget_paused"
                         active.remove(lease)
                         continue
-                    if outcome.nl is None:
+                    if outcome.code is not None:
                         code = outcome.code or "nl_processing_failed"
                         nonblocking_terminal = code in NONBLOCKING_TERMINAL_NL_CODES
                         self._issue(
@@ -801,15 +827,26 @@ class NlRunner:
                             pause_code = "nl_circuit_breaker_paused"
                         self.database.increment_module_diagnostic(self.job_id, "nl", "nl_consecutive_failures", severity="warning", amount=1)
                     else:
-                        self.database.stage_nl_response(
-                            self.job_id,
-                            lease.sampleId,
-                            lease_id=outcome.leaseId,
-                            nl=outcome.nl,
-                            sha256=hashlib.sha256(outcome.nl.encode("utf-8")).hexdigest(),
-                            observation=outcome.observation.to_dict() if outcome.observation is not None else None,
-                        )
-                        self.writer.commit_staged(self.job_id, lease.sampleId, outcome.leaseId)
+                        if outcome.mossJson is not None:
+                            self.writer.write_moss_value(
+                                sample_id=lease.sampleId,
+                                lease_id=outcome.leaseId,
+                                relative_image_path=outcome.relativeImagePath,
+                                moss=outcome.mossJson,
+                                allowed_statuses=("request_started",),
+                            )
+                        elif outcome.nl is not None:
+                            self.database.stage_nl_response(
+                                self.job_id,
+                                lease.sampleId,
+                                lease_id=outcome.leaseId,
+                                nl=outcome.nl,
+                                sha256=hashlib.sha256(outcome.nl.encode("utf-8")).hexdigest(),
+                                observation=outcome.observation.to_dict() if outcome.observation is not None else None,
+                            )
+                            self.writer.commit_staged(self.job_id, lease.sampleId, outcome.leaseId)
+                        else:
+                            raise self._fatal("nl_protocol_violation", "NL worker returned an empty success outcome")
                         self.scheduler.complete(lease)
                         self.database.record_nl_outcome(self.job_id, succeeded=True)
                         self.database.set_module_diagnostic_count(self.job_id, "nl", "nl_consecutive_failures", severity="warning", count=0)

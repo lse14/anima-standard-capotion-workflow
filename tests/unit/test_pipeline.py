@@ -2272,6 +2272,69 @@ class PipelineTests(unittest.TestCase):
                     pipeline.close()
                     preparation.close()
 
+    def test_moss_nl_skips_dropout_even_when_dropout_features_are_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            artist = dataset / "1_Artist"
+            artist.mkdir(parents=True)
+            Image.new("RGB", (3, 3), "white").save(artist / "image.png")
+            (artist / "image.json").write_bytes(serialize_annotation_json({
+                "quality": [], "count": "solo", "character": "", "series": "", "artist": "",
+                "appearance": [], "tags": [], "environment": [], "nl": "A person.",
+            }))
+            config = JobConfig(
+                workMode="in_place",
+                overwriteMode="incremental",
+                sourceRoot=str(dataset),
+            )
+            config.caption["enabled"] = False
+            config.classify["enabled"] = False
+            config.replace["enabled"] = False
+            config.ocr["enabled"] = False
+            config.countReview["enabled"] = False  # type: ignore[index]
+            config.nl.update({
+                "enabled": True,
+                "apiEnabled": True,
+                "reuseOriginalNl": False,
+                "useImage": True,
+                "useFullJson": False,
+                "promptVersion": "nl-default-prompt-moss-v1",
+                "captionPreset": "moss-general",
+                "systemPrompt": "MOSS prompt is composed from the selected preset.",
+            })
+            config.dropout["enabled"] = True
+            config.dropout["artist"]["enabled"] = True
+            config.dropout["quality"]["enabled"] = False
+            config.dropout["appearanceNl"]["enabled"] = False
+            config.classify["overwriteJson"] = True
+            config.tokenBudget["enabled"] = False  # type: ignore[index]
+            preparation = JobPreparationService(root / "state.db")
+            pipeline = PipelineService(root / "state.db", install_root=ROOT / ".runtime-build")
+            try:
+                job_id = preparation.preflight(config.to_dict()).jobId
+                preparation.confirm_workspace(job_id, confirmed=True, confirmed_rebuild=False)
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    scheduler = BoundedScheduler(database)
+                    for module_id in ("caption", "classify", "replace", "ocr", "nl", "count_review"):
+                        scheduler.start_module(job_id, module_id, enabled=False, profile="e621")
+                finally:
+                    database.close()
+
+                with patch("anima_core.pipeline.pipeline_module_ids", return_value=("dropout",)):
+                    pipeline._run(job_id)
+
+                database = StateDatabase.open(root / "state.db")
+                try:
+                    summary = database.module_summary(job_id, "dropout")
+                    self.assertEqual("skipped", summary["status"])
+                finally:
+                    database.close()
+            finally:
+                pipeline.close()
+                preparation.close()
+
     def test_v10_input_nl_dispatches_without_resolving_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

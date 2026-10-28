@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Literal
 
 from .nl_profiles import (
+    MOSS_CHARACTER_PROMPT_VERSION,
+    MOSS_GENERAL_PROMPT_VERSION,
+    MOSS_STYLE_PROMPT_VERSION,
     V4_BASE_PROMPT_VERSION,
     V4_CHARACTER_PROMPT_VERSION,
     V4_GENERAL_PROMPT_VERSION,
@@ -18,7 +21,7 @@ from .nl_profiles import (
 )
 
 
-NlPresetType = Literal["general", "style", "character"]
+NlPresetType = Literal["general", "style", "character", "moss-general", "moss-style", "moss-character"]
 PRESET_TYPES: tuple[NlPresetType, ...] = ("general", "style", "character")
 BUILTIN_PRESET_IDS: tuple[str, ...] = (
     "builtin:nl-preset-v1-general",
@@ -26,6 +29,12 @@ BUILTIN_PRESET_IDS: tuple[str, ...] = (
     "builtin:nl-preset-v1-character",
 )
 BUILTIN_V4_BASE_PRESET_ID = "builtin:nl-default-prompt-v4-base"  # v1 diagnostic compatibility alias
+MOSS_BUILTIN_PRESET_IDS: tuple[str, ...] = (
+    "builtin:nl-preset-moss-v1-general",
+    "builtin:nl-preset-moss-v1-style",
+    "builtin:nl-preset-moss-v1-character",
+)
+MOSS_PRESET_TYPES: tuple[NlPresetType, ...] = ("moss-general", "moss-style", "moss-character")
 MAX_CUSTOM_PRESETS = 100
 MAX_STORE_BYTES = 8 * 1024 * 1024
 MAX_NAME_BYTES = 256
@@ -37,7 +46,12 @@ _BUILTINS: tuple[tuple[str, str, NlPresetType, str], ...] = (
     (BUILTIN_PRESET_IDS[1], "Style", "style", V4_STYLE_PROMPT_VERSION),
     (BUILTIN_PRESET_IDS[2], "Character", "character", V4_CHARACTER_PROMPT_VERSION),
 )
-_BUILTIN_BY_ID = {item[0]: item for item in _BUILTINS}
+_MOSS_BUILTINS: tuple[tuple[str, str, NlPresetType, str], ...] = (
+    (MOSS_BUILTIN_PRESET_IDS[0], "MOSS General", "moss-general", MOSS_GENERAL_PROMPT_VERSION),
+    (MOSS_BUILTIN_PRESET_IDS[1], "MOSS Style", "moss-style", MOSS_STYLE_PROMPT_VERSION),
+    (MOSS_BUILTIN_PRESET_IDS[2], "MOSS Character", "moss-character", MOSS_CHARACTER_PROMPT_VERSION),
+)
+_BUILTIN_BY_ID = {item[0]: item for item in (*_BUILTINS, *_MOSS_BUILTINS)}
 
 
 class PromptPresetError(ValueError):
@@ -90,8 +104,8 @@ def _validate_text(value: object, *, field: str, limit: int) -> str:
 
 
 def _validate_type(value: object) -> NlPresetType:
-    if value not in PRESET_TYPES:
-        raise PromptPresetValidationError("prompt preset type must be general, style, or character")
+    if value not in (*PRESET_TYPES, *MOSS_PRESET_TYPES):
+        raise PromptPresetValidationError("prompt preset type is invalid")
     return value  # type: ignore[return-value]
 
 
@@ -257,10 +271,11 @@ class NlPromptPresetStore:
             "sizeBytes": preset.sizeBytes,
         }
 
-    def list_summaries(self) -> tuple[dict[str, object], ...]:
+    def list_summaries(self, *, include_moss: bool = False) -> tuple[dict[str, object], ...]:
         overrides, custom = self._load_records()
         result: list[dict[str, object]] = []
-        for preset_id, name, preset_type, prompt_version in _BUILTINS:
+        builtins = (*_BUILTINS, *_MOSS_BUILTINS) if include_moss else _BUILTINS
+        for preset_id, name, preset_type, prompt_version in builtins:
             prompt = overrides.get(preset_id) or load_default_system_prompt(prompt_version=prompt_version)
             result.append(self._summary(_preset(
                 preset_id=preset_id, name=name, built_in=True, preset_type=preset_type, prompt_text=prompt,

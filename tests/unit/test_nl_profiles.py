@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT / "core" / "src"))
 from anima_core.nl_profiles import (
     DEFAULT_PROMPT_VERSION,
     LEGACY_PROMPT_VERSION,
+    MOSS_BASE_PROMPT_VERSION,
+    MOSS_CHARACTER_PROMPT_VERSION,
+    MOSS_GENERAL_PROMPT_VERSION,
+    MOSS_STYLE_PROMPT_VERSION,
     V4_BASE_PROMPT_VERSION,
     NlApiProfile,
     NlApiProfileStore,
@@ -110,6 +114,39 @@ class NlDefaultPromptTests(unittest.TestCase):
             for preset in ("general", "style", "character"):
                 with self.subTest(preset=preset):
                     self.assertTrue(load_default_system_prompt(install, prompt_version=f"nl-default-prompt-v4-{preset}"))
+
+    def test_moss_variant_resources_compose_the_shared_base_verbatim(self) -> None:
+        base = (ROOT / "packaging" / "resources" / f"{MOSS_BASE_PROMPT_VERSION}.txt").read_text(encoding="utf-8").replace("\r\n", "\n").strip()
+        for version in (MOSS_GENERAL_PROMPT_VERSION, MOSS_STYLE_PROMPT_VERSION, MOSS_CHARACTER_PROMPT_VERSION):
+            with self.subTest(version=version):
+                variant = (ROOT / "packaging" / "resources" / f"{version}.txt").read_text(encoding="utf-8").replace("\r\n", "\n").strip()
+                self.assertEqual(f"{base}\n\n{variant}", load_default_system_prompt(prompt_version=version))
+                self.assertEqual(ROOT / "packaging" / "resources" / f"{version}.txt", default_prompt_path(prompt_version=version))
+
+    def test_moss_fragment_assembler_publishes_four_hashed_resources_and_core_accepts_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            install = Path(temporary) / "install"
+            script = ROOT / "packaging" / "scripts" / "assemble_nl_prompt_resource.py"
+            completed = subprocess.run(
+                [sys.executable, "-B", "-I", str(script), "--moss-source-root", str(ROOT / "packaging" / "resources"), "--install-root", str(install)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            names = {"base", "general", "style", "character"}
+            copied = {path.stem.rsplit("-", 1)[-1] for path in (install / "resources").glob("nl-default-prompt-moss-v1-*.txt")}
+            manifests = {path.stem.rsplit("-", 1)[-1] for path in (install / "manifests" / "resources").glob("nl-default-prompt-moss-v1-*.json")}
+            self.assertEqual(names, copied)
+            self.assertEqual(names, manifests)
+            for name in names:
+                resource = install / "resources" / f"nl-default-prompt-moss-v1-{name}.txt"
+                manifest = json.loads((install / "manifests" / "resources" / f"nl-default-prompt-moss-v1-{name}.json").read_text(encoding="utf-8"))
+                self.assertEqual(resource.stat().st_size, manifest["sizeBytes"])
+                self.assertEqual(hashlib.sha256(resource.read_bytes()).hexdigest(), manifest["sha256"])
+            for version in (MOSS_GENERAL_PROMPT_VERSION, MOSS_STYLE_PROMPT_VERSION, MOSS_CHARACTER_PROMPT_VERSION):
+                self.assertTrue(load_default_system_prompt(install, prompt_version=version))
 
     def test_v5_v3_prompt_is_addressable_without_changing_the_v2_default(self) -> None:
         self.assertTrue(hasattr(nl_profiles, "V5_PROMPT_VERSION"))

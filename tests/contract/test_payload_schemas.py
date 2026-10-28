@@ -608,6 +608,24 @@ def _payloads() -> list[tuple[str, str, dict]]:
             }],
         }),
         ("nl-worker-v1", "nl_hello_request", _hello("nl")),
+        ("nl-worker-v1", "nl_moss_hello_request", {
+            **_hello("nl"),
+            "responseProtocol": "nl-moss-v1",
+            "promptVersion": "nl-default-prompt-moss-v1",
+        }),
+        ("nl-worker-v1", "nl_moss_process_result", {
+            "schemaVersion": 1,
+            "payloadType": "nl_process_result",
+            "items": [{
+                "schemaVersion": 1, "payloadType": "nl_moss_result", "sampleId": 1,
+                "leaseId": "lease-1", "relativeImagePath": "sample.png", "requestId": "request-1",
+                "usage": {"total_tokens": 10}, "httpAttempts": 1,
+                "moss": {
+                    "caption": {"long": "A cat sits by a window.", "medium": "A cat by a window.", "short": "A cat."},
+                    "watermark": [], "borders": ["none"],
+                },
+            }],
+        }),
         ("export-worker-v1", "export_hello_request", _hello("export")),
         ("export-worker-v1", "export_hello_result", EXPORT_HELLO_RESULT),
         ("export-worker-v1", "export_process_request", EXPORT_PROCESS_REQUEST),

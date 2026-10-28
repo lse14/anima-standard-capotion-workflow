@@ -15,8 +15,14 @@ import httpx
 
 from .images import NlImageError, encode_image_data_url
 from .protocol import NlHelloV1, NlWorkItemV1, parse_hello, process_issue, process_result
-from .prompt_resources import compose_v4_prompt, load_v4_fragments
-from .validation import NL_IMAGE_NOT_RECEIVED, NlValidationError, validate_completion_response, validate_completion_response_v2
+from .prompt_resources import compose_moss_prompt, compose_v4_prompt, load_moss_fragments, load_v4_fragments
+from .validation import (
+    NL_IMAGE_NOT_RECEIVED,
+    NlValidationError,
+    validate_completion_response,
+    validate_completion_response_moss,
+    validate_completion_response_v2,
+)
 
 
 RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
@@ -46,6 +52,7 @@ Preserve original language, case, punctuation, and complete visible text when qu
 For every dialogue, thought, or narration bubble, describe the bubble type, bubble position, approximate glyph style, and complete quoted text. Apply the same carrier, position, approximate glyph style, and full-text treatment to signs, clothing, interfaces, and other visible text.
 Do not output OCR coordinates, confidence, engine metadata, or hidden metadata. Do not add Markdown, code fences, labels, or text outside the JSON object."""
 PROTOCOL_PROMPT_V4 = "NL_PROMPT_BASE"
+MOSS_PROMPT_VERSION = "nl-default-prompt-moss-v1"
 
 
 class NlWorkerError(RuntimeError):
@@ -106,6 +113,24 @@ class NlWorker:
 
     def _messages(self, item: NlWorkItemV1) -> list[dict[str, object]]:
         assert self.hello is not None
+        if self.hello.promptVersion == MOSS_PROMPT_VERSION:
+            if item.captionPreset is None or item.userSupplement is None:
+                raise NlWorkerError("nl_protocol_violation", "MOSS NL work item routing fields are missing")
+            system_prompt = compose_moss_prompt(
+                fragments=load_moss_fragments(),
+                caption_preset=item.captionPreset,
+                primary_character_name=item.primaryCharacterName,
+                user_supplement=item.userSupplement,
+            )
+            context = json.dumps(
+                {"jsonContext": item.jsonContext, "ocrContext": item.ocrContext},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            content: list[dict[str, object]] = [{"type": "text", "text": "MOSS_NL_CONTEXT_JSON:\n" + context}]
+            if item.imagePath is not None:
+                content.append({"type": "image_url", "image_url": {"url": encode_image_data_url(item.imagePath)}})
+            return [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
         if self.hello.promptVersion == "nl-default-prompt-v4":
             if item.captionPreset is None or item.lengthTier is None or item.userSupplement is None:
                 raise NlWorkerError("nl_protocol_violation", "NL v4 work item routing fields are missing")
@@ -249,7 +274,12 @@ class NlWorker:
                             attempt += 1
                             continue
                         break
-                    if self.hello.responseProtocol == "nl-count-v2":
+                    moss: dict[str, object] | None = None
+                    if self.hello.responseProtocol == "nl-moss-v1":
+                        moss, request_id, usage = validate_completion_response_moss(response.content)
+                        nl = None
+                        observation = None
+                    elif self.hello.responseProtocol == "nl-count-v2":
                         nl, observation, request_id, usage = validate_completion_response_v2(response.content)
                     else:
                         nl, request_id, usage = validate_completion_response(response.content)
@@ -265,6 +295,7 @@ class NlWorker:
                     return process_result(
                         item,
                         nl=nl,
+                        moss=moss,
                         request_id=request_id,
                         usage=usage,
                         http_attempts=attempts_used,
@@ -292,12 +323,16 @@ class NlWorker:
     async def process(self, items: tuple[NlWorkItemV1, ...], http_attempt_allowance: int) -> list[dict[str, Any]]:
         if self.hello is None or self.client is None:
             raise NlWorkerError("nl_protocol_violation", "NL worker is not initialized")
-        expects_ocr_context = self.hello.promptVersion in {"nl-default-prompt-v3", "nl-default-prompt-v4"}
+        expects_ocr_context = self.hello.promptVersion in {"nl-default-prompt-v3", "nl-default-prompt-v4", MOSS_PROMPT_VERSION}
         if any(item.hasOcrContext != expects_ocr_context for item in items):
             raise NlWorkerError("nl_protocol_violation", "NL work item OCR context shape does not match hello")
-        expects_v4 = self.hello.promptVersion == "nl-default-prompt-v4"
-        if any((item.captionPreset is not None) != expects_v4 for item in items):
+        expects_preset = self.hello.promptVersion in {"nl-default-prompt-v4", MOSS_PROMPT_VERSION}
+        if any((item.captionPreset is not None) != expects_preset for item in items):
             raise NlWorkerError("nl_protocol_violation", "NL work item preset shape does not match hello")
+        if self.hello.promptVersion == "nl-default-prompt-v4" and any(item.captionPreset not in {"general", "style", "character"} for item in items):
+            raise NlWorkerError("nl_protocol_violation", "NL v4 work item preset family does not match hello")
+        if self.hello.promptVersion == MOSS_PROMPT_VERSION and any(item.captionPreset not in {"moss-general", "moss-style", "moss-character"} for item in items):
+            raise NlWorkerError("nl_protocol_violation", "MOSS work item preset family does not match hello")
         semaphore = asyncio.Semaphore(self.hello.policy.concurrency)
         self._attempts_remaining = http_attempt_allowance
         self._attempt_lock = asyncio.Lock()

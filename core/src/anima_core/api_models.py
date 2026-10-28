@@ -54,7 +54,7 @@ class _SecretBody(BaseModel):
 class _NlPromptPresetBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str
-    type: Literal["general", "style", "character"] = "general"
+    type: Literal["general", "style", "character", "moss-general", "moss-style", "moss-character"] = "general"
     promptText: str | None = None
     basePrompt: str | None = None
 

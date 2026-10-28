@@ -33,6 +33,7 @@ from anima_core.replace_provenance import (
     provenance_database_path,
 )
 from anima_core.scheduler import BoundedScheduler
+from anima_core.moss_sidecar import serialize_moss_json
 
 
 def _ocr_sidecar(relative_image_path: str, *, status: str = "success") -> bytes:
@@ -62,6 +63,43 @@ def _ocr_sidecar(relative_image_path: str, *, status: str = "success") -> bytes:
 
 
 class ExportCommitTests(unittest.TestCase):
+    def test_moss_sidecar_is_schema_checked_and_exported_without_marking_its_image_unlabeled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database, service, job_id, dataset, layout = self._prepared_job(Path(temporary))
+            try:
+                config = json.loads(str(database.get_job(job_id)["config_json"]))
+                config["nl"].update({
+                    "enabled": True,
+                    "apiEnabled": True,
+                    "useImage": True,
+                    "promptVersion": "nl-default-prompt-moss-v1",
+                    "captionPreset": "moss-general",
+                })
+                database.connection.execute(
+                    "UPDATE jobs SET config_json=? WHERE job_id=?",
+                    (json.dumps(config), job_id),
+                )
+                moss = {
+                    "caption": {
+                        "long": "A cat rests by a bright window.",
+                        "medium": "A cat rests by a window.",
+                        "short": "A cat rests.",
+                    },
+                    "watermark": [],
+                    "borders": ["none"],
+                }
+                sidecar = serialize_moss_json(moss)
+                layout.write_moss_sidecar("sample.png", sidecar)
+                self._complete_export(database, job_id, layout, format_value="both")
+
+                result = ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+
+                self.assertEqual(0, result.unlabeled)
+                self.assertEqual(sidecar, (dataset / "moss_annotations" / "sample.png.moss.json").read_bytes())
+            finally:
+                database.close()
+                service.close()
+
     def test_commit_journal_reads_v1_and_strict_v2(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -23,7 +23,7 @@
         "artist": {
           "type": "object",
           "required": ["enabled", "dropoutProbability"],
-          "properties": {"enabled": {"type": "boolean"}, "dropoutProbability": {"$ref": "#/$defs/probability"}},
+          "properties": {"enabled": {"type": "boolean"}, "dropoutProbability": {"$ref": "#/$defs/probability"}, "addAtPrefix": {"type": "boolean"}},
           "additionalProperties": false
         },
         "quality": {

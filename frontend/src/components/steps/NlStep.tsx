@@ -5,7 +5,7 @@ import { ModuleBatchField } from "../ModuleBatchField";
 import { NlApiTools, NlPromptPresetLibrary } from "../NlApiTools";
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
-type NlPresetType = "general" | "style" | "character";
+type NlPresetType = "general" | "style" | "character" | "moss-general" | "moss-style" | "moss-character";
 
 type NlProfileForm = {
   profileId: string;
@@ -73,6 +73,7 @@ export function NlStep({
   const apiCollapsed = !draft.nl.enabled || !draft.nl.apiEnabled;
   const unlimitedRpm = draft.nl.apiPolicy.maxRequestsPerMinute === "unlimited";
   const invalidDistribution = distributionError(draft.nl.lengthDistribution);
+  const mossMode = draft.nl.promptVersion === "nl-default-prompt-moss-v1" || draft.nl.captionPreset.startsWith("moss-");
   const [promptDirty, setPromptDirty] = useState(false);
   const [keyVisible, setKeyVisible] = useState(false);
   useEffect(() => {
@@ -88,9 +89,9 @@ export function NlStep({
       <h3>{t("nlGenerationSettings")}</h3>
       <div className="form-grid">
         <ToggleField id="nl-enabled" label={t("enableNl")} checked={draft.nl.enabled} disabled={taskLocked} guidance={{ description: t("fieldHelp_enableNl") }} copy={guidanceCopy} onChange={(enabled) => onNlChange({ enabled })} />
-        <ToggleField id="nl-reuse-original" label={t("reuseOriginalNl")} checked={draft.nl.reuseOriginalNl} disabled={taskLocked || !draft.nl.enabled} guidance={{ description: t("fieldHelp_reuseOriginalNl") }} copy={guidanceCopy} onChange={(reuseOriginalNl) => onNlChange({ reuseOriginalNl })} />
-        <ToggleField id="nl-api-enabled" label={t("generateNl")} checked={draft.nl.apiEnabled} disabled={taskLocked || !draft.nl.enabled} guidance={{ description: t("fieldHelp_generateNl") }} copy={guidanceCopy} onChange={(apiEnabled) => onNlChange({ apiEnabled })} />
-        <ToggleField id="nl-use-image" label={t("useImage")} checked={draft.nl.useImage} disabled={taskLocked || !draft.nl.enabled || !draft.nl.apiEnabled} guidance={{ description: t("fieldHelp_useImage") }} copy={guidanceCopy} onChange={(useImage) => onNlChange({ useImage })} />
+        <ToggleField id="nl-reuse-original" label={t("reuseOriginalNl")} checked={mossMode ? false : draft.nl.reuseOriginalNl} disabled={taskLocked || !draft.nl.enabled || mossMode} guidance={{ description: t("fieldHelp_reuseOriginalNl") }} copy={guidanceCopy} onChange={(reuseOriginalNl) => onNlChange({ reuseOriginalNl })} />
+        <ToggleField id="nl-api-enabled" label={t("generateNl")} checked={mossMode || draft.nl.apiEnabled} disabled={taskLocked || !draft.nl.enabled || mossMode} guidance={{ description: t("fieldHelp_generateNl") }} copy={guidanceCopy} onChange={(apiEnabled) => onNlChange({ apiEnabled })} />
+        <ToggleField id="nl-use-image" label={t("useImage")} checked={mossMode || draft.nl.useImage} disabled={taskLocked || !draft.nl.enabled || mossMode || !draft.nl.apiEnabled} guidance={{ description: t("fieldHelp_useImage") }} copy={guidanceCopy} onChange={(useImage) => onNlChange({ useImage })} />
         <ToggleField id="nl-use-json" label={t("useJsonContext")} checked={draft.nl.useFullJson} disabled={taskLocked || !draft.nl.enabled || !draft.nl.apiEnabled} guidance={{ description: t("fieldHelp_useJsonContext") }} copy={guidanceCopy} onChange={(useFullJson) => onNlChange({ useFullJson })} />
       </div>
       <ModuleBatchField id="nl-batch-size" label={t("batchSize")} value={batchSize} defaultValue={3} recommended={batchRecommended} recommendationReason={batchReason} minimum={1} maximum={16} disabled={taskLocked || !draft.nl.enabled} t={t} guidanceCopy={guidanceCopy} onChange={onBatchSizeChange} />
@@ -98,22 +99,43 @@ export function NlStep({
 
     <section className="settings-section nl-prompt-section">
       <h3>{t("nlPromptPresets")}</h3>
+      <FormField label={t("nlOutputFormat")} id="nl-output-format" copy={guidanceCopy} guidance={{ description: t("fieldHelp_nlOutputFormat") }}>
+        <select id="nl-output-format" disabled={taskLocked || !draft.nl.enabled} value={mossMode ? "moss" : "standard"} onChange={(event) => {
+          const moss = event.target.value === "moss";
+          onNlChange({
+            promptVersion: moss ? "nl-default-prompt-moss-v1" : "nl-default-prompt-v4",
+            captionPreset: moss ? "moss-general" : "general",
+            ...(moss ? { apiEnabled: true, useImage: true, reuseOriginalNl: false } : {}),
+          });
+        }}>
+          <option value="standard">{t("nlOutputFormat_standard")}</option>
+          <option value="moss">{t("nlOutputFormat_moss")}</option>
+        </select>
+      </FormField>
       <NlPromptPresetLibrary
         disabled={taskLocked || !draft.nl.enabled}
+        includeMoss={mossMode}
         promptText={draft.nl.systemPrompt}
         presetType={draft.nl.captionPreset as NlPresetType}
         t={t}
         guidanceCopy={guidanceCopy}
-        onPromptChange={(systemPrompt) => onNlChange({ systemPrompt, promptVersion: "nl-default-prompt-v4" })}
-        onPresetTypeChange={(captionPreset) => onNlChange({ captionPreset, promptVersion: "nl-default-prompt-v4" })}
+        onPromptChange={(systemPrompt) => onNlChange({ systemPrompt })}
+        onPresetTypeChange={(captionPreset) => {
+          const moss = captionPreset.startsWith("moss-");
+          onNlChange({
+            captionPreset,
+            promptVersion: moss ? "nl-default-prompt-moss-v1" : "nl-default-prompt-v4",
+            ...(moss ? { apiEnabled: true, useImage: true, reuseOriginalNl: false } : {}),
+          });
+        }}
         onDirtyChange={setPromptDirty}
       />
-      <div className="form-grid nl-length-settings">
+      {!mossMode && <div className="form-grid nl-length-settings">
         {(["short", "medium", "long"] as const).map((tier) => <FormField key={tier} id={`nl-length-${tier}`} label={t(`lengthTier_${tier}`)} copy={guidanceCopy} guidance={{ description: t("fieldHelp_lengthTiers"), defaultValue: String(defaults.nl.lengthDistribution[tier]), range: "0-100 integer; total 100" }}>
           <input id={`nl-length-${tier}`} disabled={taskLocked} type="number" min="0" max="100" step="1" value={draft.nl.lengthDistribution[tier]} onChange={(event) => onNlChange({ lengthDistribution: { ...draft.nl.lengthDistribution, [tier]: Number(event.target.value) } })} />
         </FormField>)}
-      </div>
-      {invalidDistribution && <small className="resource-error" role="alert">{t("lengthDistributionInvalid")}</small>}
+      </div>}
+      {!mossMode && invalidDistribution && <small className="resource-error" role="alert">{t("lengthDistributionInvalid")}</small>}
     </section>
 
     <section className={`settings-section nl-api-section${apiCollapsed ? " is-collapsed" : ""}`}>

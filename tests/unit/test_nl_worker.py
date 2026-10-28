@@ -22,7 +22,7 @@ from PIL import Image
 
 from anima_nl_worker.images import encode_image_data_url
 from anima_nl_worker.protocol import NlProtocolError, parse_hello, parse_process
-from anima_nl_worker.validation import NlValidationError, normalize_endpoint, validate_completion_response, validate_completion_response_v2, validate_nl
+from anima_nl_worker.validation import NlValidationError, normalize_endpoint, validate_completion_response, validate_completion_response_moss, validate_completion_response_v2, validate_nl
 from anima_nl_worker import worker as worker_module
 from anima_nl_worker.worker import NlWorker, PROTOCOL_PROMPT_V2
 
@@ -71,6 +71,36 @@ def _v6_process() -> dict[str, object]:
         "ocrContext": None,
     })
     return payload
+
+
+def _moss_hello() -> dict[str, object]:
+    hello = _hello()
+    hello.update({"responseProtocol": "nl-moss-v1", "promptVersion": "nl-default-prompt-moss-v1"})
+    return hello
+
+
+def _moss_process() -> dict[str, object]:
+    payload = _process()
+    payload["items"][0].update({
+        "captionPreset": "moss-general",
+        "lengthTier": "medium",
+        "primaryCharacterName": None,
+        "userSupplement": "Keep the response factual.",
+        "ocrContext": {"items": [["top-left", "Visible text"]]},
+    })
+    return payload
+
+
+def _moss_value() -> dict[str, object]:
+    return {
+        "caption": {
+            "long": "A cat sits on a windowsill beneath visible text.",
+            "medium": "A cat sits on a windowsill.",
+            "short": "A cat sits on a windowsill.",
+        },
+        "watermark": [{"box_2d": [10, 20, 30, 40], "label": "logo"}],
+        "borders": ["none"],
+    }
 
 
 class _Response:
@@ -305,6 +335,77 @@ class NlWorkerTests(unittest.TestCase):
         self.assertEqual("A character stands in a room.", nl)
         self.assertEqual("solo", observation["countValue"])
         self.assertEqual("single_scene", observation["layoutValue"])
+
+    def test_moss_response_validation_serializes_the_exact_schema(self) -> None:
+        output, request_id, usage = validate_completion_response_moss(_StructuredResponse(_moss_value()).content)
+        self.assertEqual(("req-v2", 20), (request_id, usage["total_tokens"]))
+        self.assertEqual(_moss_value(), output)
+
+        invalid_values: list[tuple[str, object]] = []
+        extra = _moss_value()
+        extra["extra"] = True
+        invalid_values.append(("extra-field", extra))
+        wrong_box = _moss_value()
+        wrong_box["watermark"] = [{"box_2d": [0, 0, 1001, 100], "label": "logo"}]
+        invalid_values.append(("out-of-range-box", wrong_box))
+        reversed_box = _moss_value()
+        reversed_box["watermark"] = [{"box_2d": [20, 30, 10, 40], "label": "logo"}]
+        invalid_values.append(("reversed-box", reversed_box))
+        duplicate_border = _moss_value()
+        duplicate_border["borders"] = ["left", "left"]
+        invalid_values.append(("duplicate-border", duplicate_border))
+        mixed_none = _moss_value()
+        mixed_none["borders"] = ["none", "left"]
+        invalid_values.append(("mixed-none-border", mixed_none))
+        for label, value in invalid_values:
+            with self.subTest(case=label), self.assertRaises(NlValidationError):
+                validate_completion_response_moss(_StructuredResponse(value).content)
+
+    def test_moss_prompt_routes_tag_and_ocr_context_through_the_three_part_prompt(self) -> None:
+        async def scenario() -> list[dict[str, object]]:
+            worker = NlWorker()
+            await worker.initialize(_moss_hello())
+            item = parse_process(_moss_process())[0][0]
+            try:
+                return worker._messages(item)
+            finally:
+                await worker.close()
+
+        messages = asyncio.run(scenario())
+        system = str(messages[0]["content"])
+        user = messages[1]["content"]
+        self.assertIn("MOSS_NL_PROMPT_BASE", system)
+        self.assertIn("MOSS_NL_PROMPT_PRESET", system)
+        self.assertIn('"captionPreset":"moss-general"', system)
+        context = json.loads(str(user[0]["text"]).split("\n", 1)[1])
+        self.assertEqual({"nl": "", "tags": ["cat"]}, json.loads(str(context["jsonContext"])))
+        self.assertEqual({"items": [["top-left", "Visible text"]]}, context["ocrContext"])
+
+    def test_moss_protocol_requires_moss_routing_fields_and_response(self) -> None:
+        hello = parse_hello(_moss_hello())
+        self.assertEqual(("nl-moss-v1", "nl-default-prompt-moss-v1"), (hello.responseProtocol, hello.promptVersion))
+        item = parse_process(_moss_process())[0][0]
+        self.assertEqual(("moss-general", "medium", True), (item.captionPreset, item.lengthTier, item.hasOcrContext))
+        bad = _moss_process()
+        bad["items"][0]["captionPreset"] = "moss-character"
+        with self.assertRaises(NlProtocolError):
+            parse_process(bad)
+
+    def test_moss_worker_returns_a_distinct_complete_json_outcome(self) -> None:
+        client = _SequenceClient([_StructuredResponse(_moss_value())])
+        with patch("anima_nl_worker.worker.httpx.AsyncClient", return_value=client):
+            async def scenario() -> dict[str, object]:
+                worker = NlWorker()
+                await worker.initialize(_moss_hello())
+                items, allowance = parse_process(_moss_process())
+                result = (await worker.process(items, allowance))[0]
+                await worker.close()
+                return result
+
+            result = asyncio.run(scenario())
+        self.assertEqual("nl_moss_result", result["payloadType"])
+        self.assertEqual(_moss_value(), result["moss"])
+        self.assertNotIn("nl", result)
 
     def test_protocol_requires_exact_bounded_context(self) -> None:
         hello = parse_hello(_hello())

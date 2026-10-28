@@ -31,6 +31,24 @@ def _custom_id(index: int) -> str:
 
 
 class NlPromptPresetStoreTests(unittest.TestCase):
+    def test_moss_builtins_are_opt_in_and_use_the_three_moss_types(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = NlPromptPresetStore(Path(temporary) / "presets.json")
+            standard = store.list_summaries()
+            self.assertEqual(("general", "style", "character"), tuple(item["type"] for item in standard[:3]))
+            self.assertFalse(any(str(item["type"]).startswith("moss-") for item in standard))
+            moss = store.list_summaries(include_moss=True)
+            moss_types = tuple(item["type"] for item in moss if str(item["type"]).startswith("moss-"))
+            self.assertEqual(("moss-general", "moss-style", "moss-character"), moss_types)
+            for preset_id in (
+                "builtin:nl-preset-moss-v1-general",
+                "builtin:nl-preset-moss-v1-style",
+                "builtin:nl-preset-moss-v1-character",
+            ):
+                preset = store.get(preset_id)
+                self.assertTrue(preset.builtIn)
+                self.assertTrue(preset.promptText.startswith("You are an image recaptioner."))
+
     def test_v4_presets_follow_reference_caption_rules(self) -> None:
         resource_root = ROOT / "packaging" / "resources"
         common_required = (

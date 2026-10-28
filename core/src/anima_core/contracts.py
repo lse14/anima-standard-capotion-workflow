@@ -26,6 +26,11 @@ OCR_JOB_CONFIG_SCHEMA_VERSIONS = frozenset({5, 6, 7, 8, 9, 10})
 OCR_DEVICE_JOB_CONFIG_SCHEMA_VERSIONS = frozenset({7, 8, 9, 10})
 CAPTION_INPUT_TXT_MODE_SCHEMA_VERSIONS = frozenset({8, 9, 10})
 NL_V4_JOB_CONFIG_SCHEMA_VERSIONS = frozenset({6, 7, 8, 9, 10})
+NL_V4_PROMPT_VERSION = "nl-default-prompt-v4"
+NL_MOSS_PROMPT_VERSION = "nl-default-prompt-moss-v1"
+NL_MOSS_RESPONSE_PROTOCOL = "nl-moss-v1"
+NL_STANDARD_CAPTION_PRESETS = frozenset({"general", "style", "character"})
+NL_MOSS_CAPTION_PRESETS = frozenset({"moss-general", "moss-style", "moss-character"})
 TOKEN_BUDGET_JOB_CONFIG_SCHEMA_VERSIONS = frozenset({6, 7, 8, 9, 10})
 MODULE_BATCH_SIZE_BOUNDS: dict[str, tuple[int, int]] = {
     "caption": (1, 64),
@@ -200,7 +205,7 @@ class JobConfig:
         "enabled": False,
         "policyVersion": "dataset-batch-policy-v1",
         "seed": "anima-policy-default-v1",
-        "artist": {"enabled": True, "dropoutProbability": 0.0},
+        "artist": {"enabled": True, "dropoutProbability": 0.0, "addAtPrefix": True},
         "quality": {
             "enabled": True,
             "dropoutProbability": 0.0,
@@ -404,11 +409,15 @@ def validate_job_config(
         if config.countReview.get("protocolVersion") != "count-review-v1":
             raise ValueError("countReview protocolVersion is invalid")
         expected_prompt_version = (
-            "nl-default-prompt-v4" if job_config_supports_nl_v4(config.schemaVersion)
+            NL_V4_PROMPT_VERSION if job_config_supports_nl_v4(config.schemaVersion)
             else "nl-default-prompt-v3" if config.schemaVersion == 5
             else "nl-default-prompt-v2"
         )
-        if config.nl.get("promptVersion") != expected_prompt_version:
+        actual_prompt_version = config.nl.get("promptVersion")
+        if job_config_supports_nl_v4(config.schemaVersion):
+            if actual_prompt_version not in {expected_prompt_version, NL_MOSS_PROMPT_VERSION}:
+                raise ValueError("NL prompt version is invalid")
+        elif actual_prompt_version != expected_prompt_version:
             raise ValueError(f"JobConfig v{config.schemaVersion} must use {expected_prompt_version}")
     nl = config.nl
     base_nl_fields = {
@@ -444,8 +453,15 @@ def validate_job_config(
     if job_config_supports_nl_v4(config.schemaVersion):
         if not v6_nl_fields.issubset(nl):
             raise ValueError("JobConfig v6 requires NL routing fields")
-        if nl.get("captionPreset") not in {"general", "style", "character"}:
+        preset_values = NL_MOSS_CAPTION_PRESETS if nl.get("promptVersion") == NL_MOSS_PROMPT_VERSION else NL_STANDARD_CAPTION_PRESETS
+        if nl.get("captionPreset") not in preset_values:
             raise ValueError("nl captionPreset is invalid")
+        if (
+            nl.get("enabled") is True
+            and nl.get("promptVersion") == NL_MOSS_PROMPT_VERSION
+            and (nl.get("apiEnabled") is not True or nl.get("useImage") is not True)
+        ):
+            raise ValueError("MOSS NL requires API generation with image input")
         distribution = nl.get("lengthDistribution")
         if not isinstance(distribution, dict) or set(distribution) != {"short", "medium", "long"}:
             raise ValueError("nl lengthDistribution is invalid")
@@ -699,7 +715,7 @@ def validate_job_config(
     artist = dropout.get("artist")
     quality = dropout.get("quality")
     appearance_nl = dropout.get("appearanceNl")
-    if not isinstance(artist, dict) or set(artist) != {"enabled", "dropoutProbability"}:
+    if not isinstance(artist, dict) or set(artist) - {"enabled", "dropoutProbability", "addAtPrefix"} or not {"enabled", "dropoutProbability"}.issubset(artist):
         raise ValueError("dropout artist configuration is invalid")
     if not isinstance(quality, dict) or set(quality) - {
         "enabled", "dropoutProbability", "device", "batchSize", *RESOURCE_REFERENCE_FIELDS
@@ -712,6 +728,8 @@ def validate_job_config(
     for name, section in (("artist", artist), ("quality", quality), ("appearanceNl", appearance_nl)):
         if type(section.get("enabled")) is not bool:
             raise ValueError(f"dropout {name} enabled must be boolean")
+    if "addAtPrefix" in artist and type(artist["addAtPrefix"]) is not bool:
+        raise ValueError("dropout artist addAtPrefix must be boolean")
 
     def probability(value: object, field_name: str) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):

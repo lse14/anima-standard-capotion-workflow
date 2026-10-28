@@ -12,8 +12,9 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "core" / "src"))
 
-from anima_core.contracts import JobConfig, validate_job_config
+from anima_core.contracts import JobConfig, NL_MOSS_PROMPT_VERSION, validate_job_config
 from anima_core.db import StateDatabase
+from anima_core.moss_sidecar import parse_moss_json
 from anima_core.nl_overlay import NlOverlayWriter
 from anima_core.nl_protocol import NlProtocolError, validate_nl
 from anima_core.nl_runner import NlApiCredentials, NlRunner, NlRunnerError, build_short_rewrite_item, nl_http_attempt_budget, nl_request_projection, pending_api_decisions
@@ -27,6 +28,18 @@ from anima_core.worker_protocol import ProtocolEnvelopeV1
 
 def _projection(nl: str = "old caption") -> dict[str, object]:
     return {"quality": [], "count": "solo", "character": "", "series": "", "artist": "", "appearance": [], "tags": ["cat"], "environment": [], "nl": nl}
+
+
+def _moss_output() -> dict[str, object]:
+    return {
+        "caption": {
+            "long": "A cat sits beside a sunlit window.",
+            "medium": "A cat sits beside a window.",
+            "short": "A cat by a window.",
+        },
+        "watermark": [],
+        "borders": ["none"],
+    }
 
 
 def _ocr_success_sidecar(
@@ -109,6 +122,7 @@ class FakeNlTransport:
         http_attempts: int = 1,
         observation: dict[str, object] | None = None,
         nl: str = "A cat sits in warm sunlight near a window.",
+        moss: dict[str, object] | None = None,
     ) -> None:
         self.hello = 0
         self.process = 0
@@ -118,6 +132,7 @@ class FakeNlTransport:
         self.http_attempts = http_attempts
         self.observation = observation or _observation()
         self.nl = nl
+        self.moss = moss or _moss_output()
         self.response_protocol = "nl-v1"
         self.requests: list[ProtocolEnvelopeV1] = []
 
@@ -138,7 +153,9 @@ class FakeNlTransport:
                 items.append({"schemaVersion": 1, "payloadType": "nl_issue", "sampleId": item["sampleId"], "leaseId": item["leaseId"], "relativeImagePath": item["relativeImagePath"], "code": self.issue_code, "severity": "error", "blocking": True, "retriable": False, "message": "simulated API failure", "httpAttempts": self.http_attempts})
             else:
                 result = {"schemaVersion": 1, "payloadType": "nl_result", "sampleId": item["sampleId"], "leaseId": item["leaseId"], "relativeImagePath": item["relativeImagePath"], "nl": self.nl, "requestId": "request-1", "usage": {"total_tokens": 10}, "httpAttempts": self.http_attempts}
-                if self.response_protocol == "nl-count-v2":
+                if self.response_protocol == "nl-moss-v1":
+                    result = {"schemaVersion": 1, "payloadType": "nl_moss_result", "sampleId": item["sampleId"], "leaseId": item["leaseId"], "relativeImagePath": item["relativeImagePath"], "moss": self.moss, "requestId": "request-1", "usage": {"total_tokens": 10}, "httpAttempts": self.http_attempts}
+                elif self.response_protocol == "nl-count-v2":
                     result.update({"payloadType": "nl_result_v2", "observation": self.observation})
                 items.append(result)
         response = self._response(request, "result", {"schemaVersion": 1, "payloadType": "nl_process_result", "items": items})
@@ -826,6 +843,52 @@ class NlRunnerTests(unittest.TestCase):
                 observation = fixture.database.page_count_observations("job-nl", limit=1)[0]
                 self.assertEqual(("nl-count-v2", 1, 1), (transport.response_protocol, transport.process, transport.hello))
                 self.assertEqual(("observed", "duo", "multi_view", 1), (observation["status"], observation["count_value"], observation["layout_value"], observation["same_character_repeated"]))
+            finally:
+                fixture.close()
+
+    def test_moss_mode_writes_only_the_valid_sidecar_and_ignores_nl_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = NlFixture(Path(temporary), baseline_nl="preserve this NL")
+            try:
+                baseline_path = fixture.dataset / "sample.json"
+                baseline_digest = hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+                fixture.config.nl.update({
+                    "promptVersion": NL_MOSS_PROMPT_VERSION,
+                    "captionPreset": "moss-general",
+                    "apiEnabled": True,
+                    "reuseOriginalNl": True,
+                    "useImage": True,
+                    "useFullJson": False,
+                })
+                fixture.config.caption["inputTxtMode"] = "nl"
+                fixture.refresh_config()
+                transport = FakeNlTransport()
+
+                status = fixture.runner(
+                    transport,
+                    NlApiCredentials("https://example.test/v1", "model", "secret"),
+                ).run()
+
+                sidecar = fixture.layout.moss_sidecar_path("sample.png")
+                self.assertEqual("completed", status)
+                self.assertTrue(sidecar.is_file())
+                self.assertEqual(_moss_output(), parse_moss_json(sidecar.read_bytes()))
+                self.assertFalse(fixture.layout.annotation_path("sample", ".json").exists())
+                self.assertEqual(baseline_digest, hashlib.sha256(baseline_path.read_bytes()).hexdigest())
+                self.assertEqual(0, fixture.database.connection.execute(
+                    "SELECT COUNT(*) FROM nl_history WHERE job_id='job-nl'"
+                ).fetchone()[0])
+                observation = fixture.database.page_count_observations("job-nl", limit=1)[0]
+                self.assertEqual(("not_requested", "moss_output"), (
+                    observation["status"], observation["not_requested_reason"],
+                ))
+                hello = next(request for request in transport.requests if request.method == "hello")
+                self.assertEqual(("nl-moss-v1", NL_MOSS_PROMPT_VERSION), (
+                    hello.payload["responseProtocol"], hello.payload["promptVersion"],
+                ))
+                process = next(request for request in transport.requests if request.method == "process_batch")
+                self.assertEqual("moss-general", process.payload["items"][0]["captionPreset"])
+                self.assertIsNone(process.payload["items"][0]["jsonContext"])
             finally:
                 fixture.close()
 

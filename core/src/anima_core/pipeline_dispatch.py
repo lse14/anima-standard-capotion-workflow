@@ -486,7 +486,8 @@ class PipelineDispatchMixin:
         if not isinstance(nl, dict):
             raise PipelineError("frozen NL configuration is invalid")
         writer = NlOverlayWriter(database, layout, view, job_id)
-        if nl.get("apiEnabled") is not True or _is_input_txt_nl(config):
+        moss_mode = nl.get("promptVersion") == "nl-default-prompt-moss-v1"
+        if nl.get("apiEnabled") is not True or (_is_input_txt_nl(config) and not moss_mode):
             return NlRunner(database, scheduler, _NoExchangeTransport(), view, writer, job_id=job_id,
                 worker_instance_id=worker_instance_id).run()
         credentials = self._nl_credentials(config, database, job_id=job_id)

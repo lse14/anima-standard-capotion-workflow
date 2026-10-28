@@ -16,7 +16,7 @@ JournalState = Literal[
 ]
 CommitPhase = Literal[
     "preparing", "creating_stage", "writing_annotations", "copying_unlabeled",
-    "copying_ocr", "applying_provenance", "verifying_baseline",
+    "copying_ocr", "copying_moss", "applying_provenance", "verifying_baseline",
     "writing_backup", "switching_directories", "cleanup",
 ]
 LEGACY_STATES = frozenset({
@@ -29,13 +29,13 @@ STATES = frozenset({
 })
 PHASES = frozenset({
     "preparing", "creating_stage", "writing_annotations", "copying_unlabeled",
-    "copying_ocr", "applying_provenance", "verifying_baseline",
+    "copying_ocr", "copying_moss", "applying_provenance", "verifying_baseline",
     "writing_backup", "switching_directories", "cleanup",
 })
 STATE_PHASES = {
     "declared": frozenset({"preparing", "creating_stage"}),
     "staging": frozenset({
-        "writing_annotations", "copying_unlabeled", "copying_ocr",
+        "writing_annotations", "copying_unlabeled", "copying_ocr", "copying_moss",
         "applying_provenance",
     }),
     "staged": frozenset({"verifying_baseline", "writing_backup"}),

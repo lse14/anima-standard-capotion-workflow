@@ -88,7 +88,7 @@ export type NlDraft = {
   useFullJson: boolean;
   systemPrompt: string;
   promptVersion: string;
-  captionPreset: "general" | "style" | "character";
+  captionPreset: "general" | "style" | "character" | "moss-general" | "moss-style" | "moss-character";
   lengthDistribution: { short: number; medium: number; long: number };
   lengthSeed: string;
   apiProfileId: string;
@@ -109,6 +109,7 @@ export type CountReviewDraft = {
 export type DropoutArtistDraft = {
   enabled: boolean;
   dropoutProbability: number;
+  addAtPrefix?: boolean;
 };
 
 export type DropoutQualityDraft = {
@@ -194,7 +195,7 @@ export function newDraft(): Draft {
     countReview: { enabled: true, protocolVersion: "count-review-v1" },
     dropout: {
       enabled: false, policyVersion: "dataset-batch-policy-v1", seed: "anima-policy-default-v1",
-      artist: { enabled: true, dropoutProbability: 0 }, quality: { enabled: true, dropoutProbability: 0, device: "auto", batchSize: 4, resourceId: "lse14-scorer-5k-v1" },
+      artist: { enabled: true, dropoutProbability: 0, addAtPrefix: true }, quality: { enabled: true, dropoutProbability: 0, device: "auto", batchSize: 4, resourceId: "lse14-scorer-5k-v1" },
       appearanceNl: { enabled: true, solo: { dropNl: 0.7, dropAppearance: 0.05 }, nonSolo: { dropNl: 0.05, dropAppearance: 0.7 }, unknown: { dropNl: 0.15, dropAppearance: 0.15 } },
     },
     tokenBudget: { enabled: true, maxTokens: 512, resourceId: "tokenizer-qwen3-0.6b-anima-v1" },

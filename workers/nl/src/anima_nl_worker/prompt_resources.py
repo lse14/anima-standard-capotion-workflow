@@ -7,10 +7,12 @@ from pathlib import Path
 
 
 FRAGMENT_NAMES = ("base", "general", "style", "character", "short", "medium", "long")
+MOSS_FRAGMENT_NAMES = ("base", "general", "style", "character")
 MAX_FRAGMENT_BYTES = 65_536
 MAX_SUPPLEMENT_BYTES = 16_384
 MAX_CHARACTER_NAME_BYTES = 512
 PRESETS = frozenset({"general", "style", "character"})
+MOSS_PRESETS = frozenset({"moss-general", "moss-style", "moss-character"})
 TIERS = frozenset({"short", "medium", "long"})
 
 
@@ -90,13 +92,33 @@ def load_v4_fragments() -> dict[str, str]:
     raise PromptResourceError("NL v4 prompt resources are unavailable")
 
 
+def load_moss_fragments() -> dict[str, str]:
+    for root, installed in _roots():
+        resource_root = root / "resources" if installed else root
+        first = resource_root / "nl-default-prompt-moss-v1-base.txt"
+        if not first.is_file():
+            continue
+        fragments: dict[str, str] = {}
+        for name in MOSS_FRAGMENT_NAMES:
+            resource_id = f"nl-default-prompt-moss-v1-{name}"
+            path = resource_root / f"{resource_id}.txt"
+            if not path.is_file():
+                raise PromptResourceError("MOSS NL prompt fragment set is incomplete")
+            data = path.read_bytes()
+            fragments[name] = _validate_text(data, f"moss-{name}")
+            if installed:
+                _verify_manifest(root / "manifests" / "resources" / f"{resource_id}.json", data, resource_id)
+        return fragments
+    raise PromptResourceError("MOSS NL prompt resources are unavailable")
+
+
 def compose_v4_prompt(
     *, fragments: dict[str, str], caption_preset: str, length_tier: str,
     primary_character_name: str | None, user_supplement: str,
 ) -> str:
     if caption_preset not in PRESETS or length_tier not in TIERS:
         raise PromptResourceError("NL v4 preset or length tier is invalid")
-    if caption_preset == "character":
+    if caption_preset in {"character", "moss-character"}:
         if not isinstance(primary_character_name, str) or not primary_character_name.strip():
             raise PromptResourceError("character preset requires a primary character name")
         if len(primary_character_name.encode("utf-8")) > MAX_CHARACTER_NAME_BYTES:
@@ -120,4 +142,34 @@ def compose_v4_prompt(
         "NL_PROMPT_LENGTH:\n" + fragments[length_tier],
         "NL_PROMPT_LENGTH_DATA_JSON:\n" + length_data,
         "NL_PROMPT_SUPPLEMENT:\n" + supplement_data,
+    ))
+
+
+def compose_moss_prompt(
+    *, fragments: dict[str, str], caption_preset: str,
+    primary_character_name: str | None, user_supplement: str,
+) -> str:
+    if caption_preset not in MOSS_PRESETS:
+        raise PromptResourceError("MOSS NL preset is invalid")
+    if caption_preset == "moss-character":
+        if not isinstance(primary_character_name, str) or not primary_character_name.strip():
+            raise PromptResourceError("MOSS character preset requires a primary character name")
+        if len(primary_character_name.encode("utf-8")) > MAX_CHARACTER_NAME_BYTES:
+            raise PromptResourceError("primary character name exceeds its bound")
+    elif primary_character_name is not None:
+        raise PromptResourceError("non-character MOSS preset must not include a primary character name")
+    if not isinstance(user_supplement, str) or "\x00" in user_supplement or len(user_supplement.encode("utf-8")) > MAX_SUPPLEMENT_BYTES:
+        raise PromptResourceError("NL user supplement exceeds its bound")
+    if set(fragments) != set(MOSS_FRAGMENT_NAMES):
+        raise PromptResourceError("MOSS NL prompt fragment set is incomplete")
+    preset_data = json.dumps(
+        {"captionPreset": caption_preset, "primaryCharacterName": primary_character_name},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    supplement_data = json.dumps({"userSupplement": user_supplement}, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((
+        "MOSS_NL_PROMPT_BASE:\n" + fragments["base"],
+        "MOSS_NL_PROMPT_PRESET:\n" + fragments[caption_preset.removeprefix("moss-")],
+        "MOSS_NL_PROMPT_PRESET_DATA_JSON:\n" + preset_data,
+        "MOSS_NL_PROMPT_SUPPLEMENT:\n" + supplement_data,
     ))

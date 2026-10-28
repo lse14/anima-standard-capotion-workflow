@@ -13,6 +13,19 @@ sys.path.insert(0, str(ROOT / "core/src"))
 sys.path.insert(0, str(ROOT / "tests/unit"))
 from test_nl_runner import NlFixture, FakeNlTransport, _projection
 from anima_core.overlay import OverlayLayout
+from anima_core.moss_sidecar import parse_moss_json
+
+
+def _moss_output():
+    return {
+        "caption": {
+            "long": "A cat sits beside a sunlit window.",
+            "medium": "A cat sits beside a window.",
+            "short": "A cat by a window.",
+        },
+        "watermark": [],
+        "borders": ["none"],
+    }
 
 
 class NlHistoryAcceptanceTests(unittest.TestCase):
@@ -71,6 +84,55 @@ class NlHistoryAcceptanceTests(unittest.TestCase):
                 self.assertTrue(f.writer.recover_prepared("job-nl", 1, row["prepared_artifact_relative_path"], row["prepared_artifact_sha256"]))
                 self.assertTrue(f.writer.recover_prepared("job-nl", 1, row["prepared_artifact_relative_path"], row["prepared_artifact_sha256"]))
                 self.assertEqual(before, f.database.connection.execute("SELECT COUNT(*) FROM nl_history").fetchone()[0])
+            finally:
+                f.close()
+
+    def test_prepared_moss_recovery_only_commits_the_moss_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = NlFixture(Path(temp))
+            try:
+                baseline_path = f.dataset / "sample.json"
+                baseline_bytes = baseline_path.read_bytes()
+                f.config.nl.update({
+                    "promptVersion": "nl-default-prompt-moss-v1",
+                    "captionPreset": "moss-general",
+                    "apiEnabled": True,
+                    "reuseOriginalNl": False,
+                    "useImage": True,
+                    "useFullJson": False,
+                })
+                f.refresh_config()
+                lease = f.scheduler.claim_batch("job-nl", "nl", "test", f.config.config_hash)[0]
+                f.database.mark_nl_request_started("job-nl", 1, lease_id=str(lease.leaseId))
+                with patch.object(OverlayLayout, "commit_moss_prepared", side_effect=OSError("crash")):
+                    with self.assertRaises(OSError):
+                        f.writer.write_moss_value(
+                            sample_id=1,
+                            lease_id=lease.leaseId,
+                            relative_image_path="sample.png",
+                            moss=_moss_output(),
+                        )
+
+                row = f.database.get_sample_state("job-nl", 1)
+                self.assertEqual("prepared", row["status"])
+                self.assertEqual(0, f.database.connection.execute(
+                    "SELECT COUNT(*) FROM nl_history WHERE job_id='job-nl'"
+                ).fetchone()[0])
+                self.assertTrue(f.writer.recover_prepared(
+                    "job-nl", 1, row["prepared_artifact_relative_path"], row["prepared_artifact_sha256"]
+                ))
+                self.assertTrue(f.writer.recover_prepared(
+                    "job-nl", 1, row["prepared_artifact_relative_path"], row["prepared_artifact_sha256"]
+                ))
+
+                self.assertEqual(baseline_bytes, baseline_path.read_bytes())
+                self.assertEqual(_moss_output(), parse_moss_json(
+                    f.layout.moss_sidecar_path("sample.png").read_bytes()
+                ))
+                self.assertFalse(f.layout.annotation_path("sample", ".json").exists())
+                self.assertEqual(0, f.database.connection.execute(
+                    "SELECT COUNT(*) FROM nl_history WHERE job_id='job-nl'"
+                ).fetchone()[0])
             finally:
                 f.close()
 

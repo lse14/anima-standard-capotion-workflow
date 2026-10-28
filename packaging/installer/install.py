@@ -239,6 +239,7 @@ def _assemble_nl_prompt_resources(source_root: Path, install_root: Path) -> None
         for resource_id in _NL_PROMPT_RESOURCE_IDS:
             module.assemble(resource_root / f"{resource_id}.txt", install_root)
         module.assemble_v4(resource_root, install_root)
+        module.assemble_moss(resource_root, install_root)
     except Exception as exc:
         raise AssemblyError(f"NL prompt resource assembly failed: {exc}") from exc
 

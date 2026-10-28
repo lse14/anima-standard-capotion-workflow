@@ -23,6 +23,7 @@ from .path_safety import (
 OVERLAY_MARKER = "overlay-manifest.json"
 RESOLVED_JOURNAL_STATES = frozenset({"resolved", "committed", "rolled_back"})
 OCR_ANNOTATIONS_DIRECTORY = "ocr_annotations"
+MOSS_ANNOTATIONS_DIRECTORY = "moss_annotations"
 
 
 class OverlayError(RuntimeError):
@@ -67,6 +68,7 @@ class OverlayLayout:
         try:
             (overlay / "annotations").mkdir()
             (overlay / OCR_ANNOTATIONS_DIRECTORY).mkdir()
+            (overlay / MOSS_ANNOTATIONS_DIRECTORY).mkdir()
             (overlay / "prepared").mkdir()
             (overlay / "commit").mkdir()
             (overlay / "resources").mkdir()
@@ -121,6 +123,20 @@ class OverlayLayout:
         except PathSafetyError as exc:
             raise OverlayError("OCR sidecar path is unsafe") from exc
 
+    def moss_sidecar_path(self, relative_image_path: str) -> Path:
+        try:
+            relative = safe_relative_path(relative_image_path)
+            image_path = Path(relative.replace("\\", os.sep))
+            if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                raise OverlayError("MOSS sidecar path requires a supported image extension")
+            sidecar_relative = safe_relative_path(f"{MOSS_ANNOTATIONS_DIRECTORY}\\{relative}.moss.json")
+            return ensure_within(
+                self.root / MOSS_ANNOTATIONS_DIRECTORY,
+                self.root / Path(sidecar_relative.replace("\\", os.sep)),
+            )
+        except PathSafetyError as exc:
+            raise OverlayError("MOSS sidecar path is unsafe") from exc
+
     def prepared_path(self, module_id: str, lease_id: str, suffix: str) -> Path:
         if module_id not in {"caption", "classify", "replace", "ocr", "nl", "count_review", "dropout", "token_budget", "export"}:
             raise OverlayError("unsupported module")
@@ -138,6 +154,11 @@ class OverlayLayout:
     def write_ocr_sidecar(self, relative_image_path: str, data: bytes) -> Path:
         self.ocr_sidecar_path(relative_image_path)
         relative = safe_relative_path(f"{OCR_ANNOTATIONS_DIRECTORY}\\{relative_image_path}.ocr.json")
+        return atomic_write_bytes(self.root, relative, data)
+
+    def write_moss_sidecar(self, relative_image_path: str, data: bytes) -> Path:
+        self.moss_sidecar_path(relative_image_path)
+        relative = safe_relative_path(f"{MOSS_ANNOTATIONS_DIRECTORY}\\{relative_image_path}.moss.json")
         return atomic_write_bytes(self.root, relative, data)
 
     def write_resource(self, relative_path: str, data: bytes) -> Path:
@@ -189,6 +210,27 @@ class OverlayLayout:
         if not prepared.is_file() or sha256_file(prepared) != expected_sha256:
             raise OverlayError("OCR prepared artifact is missing or has an invalid digest")
         destination = self.ocr_sidecar_path(relative_image_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        replace_with_sharing_retry(prepared, destination)
+        return destination
+
+    def write_moss_prepared(self, lease_id: str, data: bytes) -> tuple[Path, str]:
+        return self.write_prepared("nl", lease_id, ".json", data)
+
+    def commit_moss_prepared(
+        self,
+        prepared_relative_path: str,
+        expected_sha256: str,
+        relative_image_path: str,
+    ) -> Path:
+        prepared = self.resolve_prepared(prepared_relative_path)
+        try:
+            ensure_within(self.root / "prepared" / "nl", prepared)
+        except PathSafetyError as exc:
+            raise OverlayError("MOSS prepared artifact is outside the NL staging directory") from exc
+        if not prepared.is_file() or sha256_file(prepared) != expected_sha256:
+            raise OverlayError("MOSS prepared artifact is missing or has an invalid digest")
+        destination = self.moss_sidecar_path(relative_image_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         replace_with_sharing_retry(prepared, destination)
         return destination

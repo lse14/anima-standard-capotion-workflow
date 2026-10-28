@@ -28,6 +28,7 @@ type Feedback = { kind: "discovery"; result: ModelDiscoveryResult } | { kind: "t
 
 export type NlPromptPresetLibraryProps = {
   disabled: boolean;
+  includeMoss?: boolean;
   promptText: string;
   presetType: NlPresetType;
   t: Translate;
@@ -42,7 +43,7 @@ function promptTextOf(detail: NlPromptPresetDetail): string {
 }
 
 export function NlPromptPresetLibrary({
-  disabled, promptText, presetType, t, guidanceCopy, onPromptChange, onPresetTypeChange, onDirtyChange,
+  disabled, includeMoss = false, promptText, presetType, t, guidanceCopy, onPromptChange, onPresetTypeChange, onDirtyChange,
 }: NlPromptPresetLibraryProps) {
   const [presets, setPresets] = useState<NlPromptPresetSummary[]>([]);
   const [details, setDetails] = useState<Record<string, NlPromptPresetDetail>>({});
@@ -83,13 +84,14 @@ export function NlPromptPresetLibrary({
   };
 
   const loadAll = async (preferredId?: string) => {
-    const summaries = await listNlPromptPresets();
-    const details = await Promise.all(summaries.presets.map((item) => getNlPromptPreset(item.presetId)));
-    setPresets(summaries.presets);
+    const summaries = await listNlPromptPresets(includeMoss);
+    const visibleSummaries = includeMoss ? summaries.presets.filter((item) => item.type.startsWith("moss-")) : summaries.presets.filter((item) => !item.type.startsWith("moss-"));
+    const details = await Promise.all(visibleSummaries.map((item) => getNlPromptPreset(item.presetId)));
+    setPresets(visibleSummaries);
     setDetails(Object.fromEntries(details.map((item) => [item.presetId, item])));
     const preferred = preferredId && details.find((item) => item.presetId === preferredId);
     const matching = details.find((item) => promptTextOf(item) === promptText && item.type === presetType);
-    const general = details.find((item) => item.type === "general") ?? details[0];
+    const general = details.find((item) => item.type === (includeMoss ? "moss-general" : "general")) ?? details[0];
     const next = preferred ?? matching ?? general;
     if (next) applyDetail(next);
   };
@@ -102,7 +104,7 @@ export function NlPromptPresetLibrary({
       if (active) setLoading(false);
     });
     return () => { active = false; };
-  }, []);
+  }, [includeMoss]);
 
   const selectPreset = async (presetId: string) => {
     if (pending || presetId === selectedId) return;
@@ -136,7 +138,7 @@ export function NlPromptPresetLibrary({
 
   const cancelCreate = () => {
     if (dirty && !window.confirm(t("confirmDiscardPreset"))) return;
-    const general = presets.find((item) => item.type === "general") ?? presets[0];
+    const general = presets.find((item) => item.type === (includeMoss ? "moss-general" : "general")) ?? presets[0];
     if (general) void selectPreset(general.presetId);
   };
 
@@ -149,8 +151,8 @@ export function NlPromptPresetLibrary({
       const detail = creating
         ? await createNlPromptPreset(body)
         : await updateNlPromptPreset(selectedId, body);
-      const nextSummaries = await listNlPromptPresets();
-      setPresets(nextSummaries.presets);
+      const nextSummaries = await listNlPromptPresets(includeMoss);
+      setPresets(includeMoss ? nextSummaries.presets.filter((item) => item.type.startsWith("moss-")) : nextSummaries.presets.filter((item) => !item.type.startsWith("moss-")));
       setDetails((current) => ({ ...current, [detail.presetId]: detail }));
       applyDetail(detail);
     } catch (cause) {
@@ -217,6 +219,7 @@ export function NlPromptPresetLibrary({
             <option value="general">{t("captionPreset_general")}</option>
             <option value="style">{t("captionPreset_style")}</option>
             <option value="character">{t("captionPreset_character")}</option>
+            {includeMoss && <><option value="moss-general">{t("captionPreset_moss_general")}</option><option value="moss-style">{t("captionPreset_moss_style")}</option><option value="moss-character">{t("captionPreset_moss_character")}</option></>}
           </select>
         </FormField>
         <FormField label={t("promptText")} id="nl-prompt-text" wide copy={guidanceCopy} guidance={{ description: t("fieldHelp_promptText") }}>

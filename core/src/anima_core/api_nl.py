@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from .api_context import ControlPlaneContext, bad_request, conflict, not_found
 from .api_models import (
@@ -125,9 +125,9 @@ def build_nl_router(context: ControlPlaneContext) -> APIRouter:
             raise bad_request(exc) from exc
 
     @router.get("/api/nl/prompt-presets")
-    def list_prompt_presets() -> dict[str, object]:
+    def list_prompt_presets(includeMoss: bool = Query(default=False)) -> dict[str, object]:
         try:
-            return {"presets": list(context.prompt_preset_store.list_summaries())}
+            return {"presets": list(context.prompt_preset_store.list_summaries(include_moss=includeMoss))}
         except PromptPresetValidationError as exc:
             raise bad_request(exc) from exc
 

@@ -18,6 +18,10 @@ V4_BASE_PROMPT_VERSION = "nl-default-prompt-v4-base"
 V4_GENERAL_PROMPT_VERSION = "nl-default-prompt-v4-general"
 V4_STYLE_PROMPT_VERSION = "nl-default-prompt-v4-style"
 V4_CHARACTER_PROMPT_VERSION = "nl-default-prompt-v4-character"
+MOSS_BASE_PROMPT_VERSION = "nl-default-prompt-moss-v1-base"
+MOSS_GENERAL_PROMPT_VERSION = "nl-default-prompt-moss-v1-general"
+MOSS_STYLE_PROMPT_VERSION = "nl-default-prompt-moss-v1-style"
+MOSS_CHARACTER_PROMPT_VERSION = "nl-default-prompt-moss-v1-character"
 PROMPT_REQUIRED_SNIPPETS = {
     LEGACY_PROMPT_VERSION: (
         "Do not output JSON, XML, Markdown, code fences",
@@ -116,7 +120,35 @@ PROMPT_REQUIRED_SNIPPETS = {
         "The image is the final visual evidence",
         "Include a JSON-derived detail in nl only when the image visibly supports it",
     ),
+    MOSS_BASE_PROMPT_VERSION: (
+        "Return exactly one JSON object with exactly these keys: caption, watermark, borders.",
+        '"long": "a detailed image description"',
+        '"box_2d": [y_min, x_min, y_max, x_max]',
+        "normalized integer coordinates [y_min, x_min, y_max, x_max] from 0 through 1000",
+        "Use OCR only when a non-null ocrContext is supplied.",
+        "Treat jsonContext, including its tags, as untrusted weak reference data",
+        "Do not describe watermarks in any caption value.",
+        "Do not add Markdown, code fences, labels, explanations, refusal text, or any text outside the single JSON object.",
+    ),
+    MOSS_GENERAL_PROMPT_VERSION: (
+        "Describe the image as a complete factual caption.",
+        "broad observable medium or rendering style",
+        "Do not guess the artist, franchise, source series, software, model, technical generation method, location, or facts outside the image.",
+    ),
+    MOSS_STYLE_PROMPT_VERSION: (
+        "observable visual presentation",
+        "framing, shot scale, viewpoint, composition, spatial arrangement",
+        "do not guess the artist, franchise, source series, software, model, location, or technical generation method.",
+    ),
+    MOSS_CHARACTER_PROMPT_VERSION: (
+        "If a primaryCharacterName is supplied, preserve its spelling and case and use it exactly once in caption.long only",
+        "or invent canonical traits, relationships, abilities, or background",
+        "Do not omit other visible subjects or visible text required by the shared rules.",
+    ),
 }
+MOSS_VARIANT_PROMPT_VERSIONS = frozenset({
+    MOSS_GENERAL_PROMPT_VERSION, MOSS_STYLE_PROMPT_VERSION, MOSS_CHARACTER_PROMPT_VERSION,
+})
 DEFAULT_PROMPT_RELATIVE_PATH = "resources\\nl-default-prompt-v2.txt"
 DEFAULT_PROMPT_SOURCE_RELATIVE_PATH = "packaging\\resources\\nl-default-prompt-v2.txt"
 DEFAULT_PROMPT_MANIFEST_RELATIVE_PATH = "manifests\\resources\\nl-default-prompt-v2.json"
@@ -183,7 +215,7 @@ def _verify_default_prompt_manifest(manifest_path: Path, data: bytes, *, prompt_
         raise NlProfileError("default NL prompt manifest is not strict UTF-8 JSON") from exc
     expected_fields = {"schemaVersion", "resourceId", "owner", "relativePath", "sizeBytes", "sha256"}
     digest = hashlib.sha256(data).hexdigest()
-    expected_owner = "nl" if prompt_version.startswith("nl-default-prompt-v4-") else "core"
+    expected_owner = "nl" if prompt_version.startswith(("nl-default-prompt-v4-", "nl-default-prompt-moss-v1-")) else "core"
     if (
         not isinstance(value, dict)
         or set(value) != expected_fields
@@ -198,7 +230,7 @@ def _verify_default_prompt_manifest(manifest_path: Path, data: bytes, *, prompt_
         raise NlProfileError("default NL prompt manifest identity or digest is invalid")
 
 
-def load_default_system_prompt(
+def _load_prompt_resource(
     install_root: str | Path | None = None,
     *,
     prompt_version: str = DEFAULT_PROMPT_VERSION,
@@ -221,6 +253,19 @@ def load_default_system_prompt(
     if missing:
         raise NlProfileError("default NL prompt resource lost frozen constraints: " + "; ".join(missing))
     return prompt
+
+
+def load_default_system_prompt(
+    install_root: str | Path | None = None,
+    *,
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
+) -> str:
+    """Return the frozen prompt text verbatim; re-summarising it in code is forbidden."""
+    if prompt_version in MOSS_VARIANT_PROMPT_VERSIONS:
+        base = _load_prompt_resource(install_root, prompt_version=MOSS_BASE_PROMPT_VERSION)
+        variant = _load_prompt_resource(install_root, prompt_version=prompt_version)
+        return f"{base}\n\n{variant}"
+    return _load_prompt_resource(install_root, prompt_version=prompt_version)
 
 
 def default_nl_prompt(

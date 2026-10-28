@@ -72,6 +72,17 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertEqual("kannos, @Crow", result["artist"])
 
+    def test_artist_prefix_can_be_disabled(self) -> None:
+        payload = _payload()
+        result, _ = apply_policy(
+            payload,
+            annotation_key=r"1_Crow\image",
+            relative_image_path=r"1_Crow\image.png",
+            config=replace(_config(), artistAddAtPrefix=False),
+            aesthetic_score=4.0,
+        )
+        self.assertEqual("Crow", result["artist"])
+
     def test_artist_setting_deduplicates_case_insensitively(self) -> None:
         payload = _payload()
         payload["artist"] = "kannos, @crow"

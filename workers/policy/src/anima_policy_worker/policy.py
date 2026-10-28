@@ -44,6 +44,7 @@ class PolicyConfig:
     solo: CoupledProbabilities
     nonSolo: CoupledProbabilities
     unknown: CoupledProbabilities
+    artistAddAtPrefix: bool = True
     policyVersion: Literal["dataset-batch-policy-v1"] = POLICY_VERSION
 
     def __post_init__(self) -> None:
@@ -53,6 +54,7 @@ class PolicyConfig:
             ("artistEnabled", self.artistEnabled),
             ("qualityEnabled", self.qualityEnabled),
             ("appearanceNlEnabled", self.appearanceNlEnabled),
+            ("artistAddAtPrefix", self.artistAddAtPrefix),
         ):
             if type(value) is not bool:
                 raise PolicyError(f"{name} must be boolean")
@@ -73,7 +75,13 @@ class PolicyDecision:
     appearanceNlAction: Literal["drop_nl", "drop_appearance", "keep_both", "unchanged"]
 
 
-def artist_from_image_path(relative_image_path: str) -> str:
+def _format_artist_name(artist: str, *, add_at_prefix: bool) -> str:
+    if type(add_at_prefix) is not bool:
+        raise PolicyError("add_at_prefix must be boolean")
+    return f"@{artist}" if add_at_prefix else artist
+
+
+def artist_from_image_path(relative_image_path: str, *, add_at_prefix: bool = True) -> str:
     if not isinstance(relative_image_path, str) or not relative_image_path:
         raise PolicyError("relative image path is empty")
     path = PureWindowsPath(relative_image_path.replace("/", "\\"))
@@ -87,13 +95,14 @@ def artist_from_image_path(relative_image_path: str) -> str:
     artist = match.group("artist")
     if not artist or artist != artist.strip() or any(character in artist for character in "\r\n\x00"):
         raise PolicyError("artist directory suffix is invalid")
-    return f"@{artist}"
+    return _format_artist_name(artist, add_at_prefix=add_at_prefix)
 
 
 def artist_from_validated_image_path(
     relative_image_path: str,
     *,
     artist_root_name: str | None = None,
+    add_at_prefix: bool = True,
 ) -> str:
     """Extract the artist from a path already accepted by import preflight."""
     normalized = relative_image_path.replace("/", "\\")
@@ -103,7 +112,7 @@ def artist_from_validated_image_path(
             raise PolicyError("flat image is missing its validated artist root name")
         first = artist_root_name
     artist = first.split("_", 1)[1]
-    return f"@{artist}"
+    return _format_artist_name(artist, add_at_prefix=add_at_prefix)
 
 
 def merge_artists(existing: str, appended: str) -> str:
@@ -192,6 +201,7 @@ def apply_policy(
             artist_from_validated_image_path(
                 relative_image_path,
                 artist_root_name=artist_root_name,
+                add_at_prefix=config.artistAddAtPrefix,
             ),
         )
         artist_dropped = stable_random(config, annotation_key, "artist") < config.artistDropoutProbability

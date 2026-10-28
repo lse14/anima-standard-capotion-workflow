@@ -7,6 +7,7 @@ from fastapi import APIRouter, Query
 from .api_context import ControlPlaneContext, bad_request, conflict, not_found
 from .api_models import _TokenBudgetApplyBody, _TokenBudgetRecountBody, _TokenBudgetRewriteShortBody
 from .db import DEFAULT_PAGE_SIZE, StateDatabase
+from .contracts import NL_MOSS_PROMPT_VERSION, NL_MOSS_RESPONSE_PROTOCOL
 from .token_budget_review import (
     IsolatedTokenBudgetCounter,
     TokenBudgetReviewConflictError,
@@ -50,6 +51,10 @@ class _IsolatedShortRewriter:
                 raise ValueError("NL HTTP attempt budget is invalid")
             if not isinstance(nl.get("systemPrompt"), str):
                 raise ValueError("NL supplement is invalid")
+            prompt_version = nl.get("promptVersion", "nl-default-prompt-v4")
+            response_protocol = NL_MOSS_RESPONSE_PROTOCOL if prompt_version == NL_MOSS_PROMPT_VERSION else "nl-count-v2"
+            if prompt_version not in {"nl-default-prompt-v4", NL_MOSS_PROMPT_VERSION}:
+                raise ValueError("NL prompt version is invalid")
         except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("NL profile or frozen policy is unavailable") from exc
         allowance = min(160, max(1, int(policy["maxHttpAttempts"])))
@@ -69,7 +74,7 @@ class _IsolatedShortRewriter:
                         "backupModel": profile.backupModel, "apiKey": api_key,
                         "systemPrompt": nl["systemPrompt"],
                         "apiPolicy": {key: policy[key] for key in WORKER_POLICY_KEYS},
-                        "responseProtocol": "nl-count-v2", "promptVersion": "nl-default-prompt-v4",
+                        "responseProtocol": response_protocol, "promptVersion": prompt_version,
                     }, jobId=self.job_id, configHash=str(job["config_hash"]),
                 )
                 response = transport.exchange(hello)
@@ -97,7 +102,7 @@ class _IsolatedShortRewriter:
                 ):
                     raise RuntimeError("NL worker result is invalid")
                 expected = {(int(item["sampleId"]), str(item["leaseId"])): str(item["relativeImagePath"])}
-                outcomes = parse_outcomes(result.payload, expected, response_protocol="nl-count-v2")
+                outcomes = parse_outcomes(result.payload, expected, response_protocol=response_protocol)
                 if len(outcomes) != 1 or outcomes[0].nl is None:
                     raise RuntimeError("NL short rewrite did not produce a caption")
                 shutdown_id = f"nl-review-shutdown-{uuid.uuid4().hex}"

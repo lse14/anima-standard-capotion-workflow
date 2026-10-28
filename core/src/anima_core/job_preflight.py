@@ -757,7 +757,7 @@ class JobPreparationService:
             ).fetchone()
             projection = dict(database.preflight_projection_counts(job_id))
             samples, scoped = int(counts["samples"]), int(counts["scoped"])
-            if job_config_supports_nl_v4(config.schemaVersion) and config.nl.get("captionPreset") == "character":
+            if job_config_supports_nl_v4(config.schemaVersion) and config.nl.get("captionPreset") in {"character", "moss-character"}:
                 self._validate_named_folder_manifest(
                     database, job_id, feature_name="character preset", name_placeholder="character"
                 )

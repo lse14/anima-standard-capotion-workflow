@@ -139,7 +139,9 @@ def parse_hello(value: object) -> PolicyHelloV1:
     artist = _object(raw_policy["artist"], "artist")
     quality = _object(raw_policy["quality"], "quality")
     appearance_nl = _object(raw_policy["appearanceNl"], "appearanceNl")
-    _exact_keys(artist, {"enabled", "dropoutProbability"}, "artist")
+    artist_required = {"enabled", "dropoutProbability"}
+    if not artist_required.issubset(artist) or set(artist) - {*artist_required, "addAtPrefix"}:
+        raise PolicyProtocolError("artist fields are invalid")
     quality_required = {"enabled", "dropoutProbability", "device", "batchSize"}
     if not quality_required.issubset(quality) or set(quality) - {*quality_required, "resourceId"}:
         raise PolicyProtocolError("quality fields are invalid")
@@ -147,6 +149,8 @@ def parse_hello(value: object) -> PolicyHelloV1:
     for field, raw in (("artist.enabled", artist["enabled"]), ("quality.enabled", quality["enabled"]), ("appearanceNl.enabled", appearance_nl["enabled"])):
         if type(raw) is not bool:
             raise PolicyProtocolError(f"{field} must be boolean")
+    if "addAtPrefix" in artist and type(artist["addAtPrefix"]) is not bool:
+        raise PolicyProtocolError("artist.addAtPrefix must be boolean")
     device = quality["device"]
     if device not in {"auto", "cuda", "cpu"}:
         raise PolicyProtocolError("quality.device is invalid")
@@ -181,6 +185,7 @@ def parse_hello(value: object) -> PolicyHelloV1:
             solo=_coupled(appearance_nl["solo"], "appearanceNl.solo"),
             nonSolo=_coupled(appearance_nl["nonSolo"], "appearanceNl.nonSolo"),
             unknown=_coupled(appearance_nl["unknown"], "appearanceNl.unknown"),
+            artistAddAtPrefix=artist.get("addAtPrefix", True),
         )
     except PolicyError as exc:
         raise PolicyProtocolError(str(exc)) from exc

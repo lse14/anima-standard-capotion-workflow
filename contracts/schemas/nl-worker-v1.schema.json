@@ -2,6 +2,66 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "anima://contracts/nl-worker-v1",
   "$defs": {
+    "moss": {
+      "type": "object", "required": ["caption", "watermark", "borders"],
+      "properties": {
+        "caption": {"type": "object", "required": ["long", "medium", "short"], "properties": {
+          "long": {"type": "string", "minLength": 1, "maxLength": 16384},
+          "medium": {"type": "string", "minLength": 1, "maxLength": 16384},
+          "short": {"type": "string", "minLength": 1, "maxLength": 16384}
+        }, "additionalProperties": false},
+        "watermark": {"type": "array", "maxItems": 1024, "items": {"type": "object", "required": ["box_2d", "label"], "properties": {
+          "box_2d": {"type": "array", "minItems": 4, "maxItems": 4, "prefixItems": [
+            {"type": "integer", "minimum": 0, "maximum": 1000}, {"type": "integer", "minimum": 0, "maximum": 1000},
+            {"type": "integer", "minimum": 0, "maximum": 1000}, {"type": "integer", "minimum": 0, "maximum": 1000}
+          ]},
+          "label": {"type": "string", "minLength": 1, "maxLength": 16384}
+        }, "additionalProperties": false}},
+        "borders": {"oneOf": [
+          {"const": ["none"]},
+          {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"enum": ["left", "right", "up", "down"]}}
+        ]}
+      },
+      "additionalProperties": false
+    },
+    "nlMossResult": {
+      "type": "object", "required": ["schemaVersion", "payloadType", "sampleId", "leaseId", "relativeImagePath", "requestId", "usage", "httpAttempts", "moss"], "properties": {
+        "schemaVersion": {"const": 1}, "sampleId": {"type": "integer", "minimum": 1}, "leaseId": {"type": "string", "minLength": 1, "maxLength": 128}, "relativeImagePath": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "payloadType": {"const": "nl_moss_result"}, "requestId": {"type": ["string", "null"], "maxLength": 512},
+        "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}, "completion_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}, "total_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}}, "additionalProperties": false},
+        "httpAttempts": {"type": "integer", "minimum": 1, "maximum": 5}, "moss": {"$ref": "#/$defs/moss"}
+      }, "additionalProperties": false
+    },
+    "nlResult": {
+      "type": "object", "required": ["schemaVersion", "payloadType", "sampleId", "leaseId", "relativeImagePath", "requestId", "usage", "httpAttempts", "nl"], "properties": {
+        "schemaVersion": {"const": 1}, "sampleId": {"type": "integer", "minimum": 1}, "leaseId": {"type": "string", "minLength": 1, "maxLength": 128}, "relativeImagePath": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "payloadType": {"const": "nl_result"}, "requestId": {"type": ["string", "null"], "maxLength": 512},
+        "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}, "completion_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}, "total_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}}, "additionalProperties": false},
+        "httpAttempts": {"type": "integer", "minimum": 1, "maximum": 5}, "nl": {"type": "string", "minLength": 1, "maxLength": 16384}
+      }, "additionalProperties": false
+    },
+    "nlCountResult": {
+      "type": "object", "required": ["schemaVersion", "payloadType", "sampleId", "leaseId", "relativeImagePath", "requestId", "usage", "httpAttempts", "nl", "observation"], "properties": {
+        "schemaVersion": {"const": 1}, "sampleId": {"type": "integer", "minimum": 1}, "leaseId": {"type": "string", "minLength": 1, "maxLength": 128}, "relativeImagePath": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "payloadType": {"const": "nl_result_v2"}, "requestId": {"type": ["string", "null"], "maxLength": 512},
+        "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}, "completion_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}, "total_tokens": {"type": "integer", "minimum": 0, "maximum": 1000000}}, "additionalProperties": false},
+        "httpAttempts": {"type": "integer", "minimum": 1, "maximum": 5}, "nl": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "observation": {"type": "object", "required": ["schemaVersion", "status", "countValue", "layoutValue", "sameCharacterRepeated", "warningCodes", "notRequestedReason"], "properties": {
+          "schemaVersion": {"const": 1}, "status": {"enum": ["observed", "invalid"]}, "countValue": {"type": ["string", "null"], "enum": ["solo", "duo", "trio", "group", "unknown", null]},
+          "layoutValue": {"type": ["string", "null"], "enum": ["single_scene", "multi_view", "character_sheet", "multi_panel", "unknown", null]},
+          "sameCharacterRepeated": {"type": ["boolean", "null"]}, "warningCodes": {"type": "array", "uniqueItems": true, "items": {"enum": ["count_observation_invalid", "count_observation_unknown"]}},
+          "notRequestedReason": {"const": null}
+        }, "additionalProperties": false}
+      }, "additionalProperties": false
+    },
+    "nlIssue": {
+      "type": "object", "required": ["schemaVersion", "payloadType", "sampleId", "leaseId", "relativeImagePath", "code", "severity", "blocking", "retriable", "message", "httpAttempts"], "properties": {
+        "schemaVersion": {"const": 1}, "sampleId": {"type": "integer", "minimum": 1}, "leaseId": {"type": "string", "minLength": 1, "maxLength": 128}, "relativeImagePath": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "payloadType": {"const": "nl_issue"}, "code": {"type": "string", "minLength": 1}, "severity": {"const": "error"},
+        "blocking": {"const": true}, "retriable": {"type": "boolean"}, "message": {"type": "string", "maxLength": 1024},
+        "httpAttempts": {"type": "integer", "minimum": 0, "maximum": 5}
+      }, "additionalProperties": false
+    },
     "legacyItem": {
       "type": "object",
       "required": ["schemaVersion", "sampleId", "leaseId", "relativeImagePath", "imagePath", "jsonContext"],
@@ -49,7 +109,7 @@
         "leaseId": {"type": "string", "minLength": 1, "maxLength": 128},
         "relativeImagePath": {"type": "string", "minLength": 1, "maxLength": 16384},
         "imagePath": {"type": ["string", "null"]},
-        "captionPreset": {"enum": ["general", "style", "character"]},
+        "captionPreset": {"enum": ["general", "style", "character", "moss-general", "moss-style", "moss-character"]},
         "lengthTier": {"enum": ["short", "medium", "long"]},
         "primaryCharacterName": {"type": ["string", "null"], "maxLength": 512},
         "userSupplement": {"type": "string", "maxLength": 16384},
@@ -57,8 +117,8 @@
         "ocrContext": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/ocrContext"}]}
       },
       "allOf": [
-        {"if": {"properties": {"captionPreset": {"const": "character"}}, "required": ["captionPreset"]}, "then": {"properties": {"primaryCharacterName": {"type": "string", "minLength": 1}}, "required": ["primaryCharacterName"]}},
-        {"if": {"properties": {"captionPreset": {"enum": ["general", "style"]}}, "required": ["captionPreset"]}, "then": {"properties": {"primaryCharacterName": {"type": "null"}}, "required": ["primaryCharacterName"]}}
+        {"if": {"properties": {"captionPreset": {"enum": ["character", "moss-character"]}}, "required": ["captionPreset"]}, "then": {"properties": {"primaryCharacterName": {"type": "string", "minLength": 1}}, "required": ["primaryCharacterName"]}},
+        {"if": {"properties": {"captionPreset": {"enum": ["general", "style", "moss-general", "moss-style"]}}, "required": ["captionPreset"]}, "then": {"properties": {"primaryCharacterName": {"type": "null"}}, "required": ["primaryCharacterName"]}}
       ],
       "additionalProperties": false
     },
@@ -97,6 +157,11 @@
       "additionalProperties": false
     },
     {
+      "type": "object", "required": ["schemaVersion", "payloadType", "jobId", "configHash", "endpoint", "model", "backupModel", "apiKey", "systemPrompt", "apiPolicy", "responseProtocol", "promptVersion"],
+      "properties": {"schemaVersion": {"const": 1}, "payloadType": {"const": "nl_hello_request"}, "jobId": {"type": "string", "minLength": 1}, "configHash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "endpoint": {"type": "string", "minLength": 1}, "model": {"type": "string", "minLength": 1}, "backupModel": {"type": ["string", "null"]}, "apiKey": {"type": "string", "minLength": 1}, "systemPrompt": {"type": "string", "minLength": 1}, "apiPolicy": {"$ref": "#/$defs/policy"}, "responseProtocol": {"const": "nl-moss-v1"}, "promptVersion": {"const": "nl-default-prompt-moss-v1"}},
+      "additionalProperties": false
+    },
+    {
       "type": "object", "required": ["schemaVersion", "payloadType", "ready", "concurrency"],
       "properties": {"schemaVersion": {"const": 1}, "payloadType": {"const": "nl_hello_result"}, "ready": {"const": true}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 16}},
       "additionalProperties": false
@@ -104,6 +169,11 @@
     {
       "type": "object", "required": ["schemaVersion", "payloadType", "items", "httpAttemptAllowance"],
       "properties": {"schemaVersion": {"const": 1}, "payloadType": {"const": "nl_process_request"}, "httpAttemptAllowance": {"type": "integer", "minimum": 1, "maximum": 160}, "items": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"oneOf": [{"$ref": "#/$defs/legacyItem"}, {"$ref": "#/$defs/v5Item"}, {"$ref": "#/$defs/v6Item"}]}}},
+      "additionalProperties": false
+    },
+    {
+      "type": "object", "required": ["schemaVersion", "payloadType", "items"],
+      "properties": {"schemaVersion": {"const": 1}, "payloadType": {"const": "nl_process_result"}, "items": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"oneOf": [{"$ref": "#/$defs/nlResult"}, {"$ref": "#/$defs/nlCountResult"}, {"$ref": "#/$defs/nlMossResult"}, {"$ref": "#/$defs/nlIssue"}]}}},
       "additionalProperties": false
     }
   ]

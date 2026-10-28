@@ -192,7 +192,7 @@
     "dropoutArtist": {
       "type": "object",
       "required": ["enabled", "dropoutProbability"],
-      "properties": {"enabled": {"type": "boolean"}, "dropoutProbability": {"type": "number", "minimum": 0, "maximum": 1}},
+      "properties": {"enabled": {"type": "boolean"}, "dropoutProbability": {"type": "number", "minimum": 0, "maximum": 1}, "addAtPrefix": {"type": "boolean"}},
       "additionalProperties": false
     },
     "dropoutQuality": {

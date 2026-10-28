@@ -18,7 +18,7 @@ from anima_caption_format import normalize_annotation
 from anima_caption_format.normalizer import CaptionDisplayPolicy, FIELDS
 
 from .classify_overlay import ClassifyJsonError, parse_annotation_json
-from .contracts import canonical_json, job_config_supports_token_budget
+from .contracts import NL_MOSS_CAPTION_PRESETS, NL_STANDARD_CAPTION_PRESETS, canonical_json, job_config_supports_token_budget
 from .db import StateDatabase
 from .launcher import WorkerLauncher, WorkerLaunchError
 from .overlay import BaselineView, OverlayError, OverlayLayout, WorkingAnnotationView
@@ -771,7 +771,7 @@ class TokenBudgetReviewService:
         try:
             config = json.loads(str(job["config_json"]))
             nl = config["nl"]
-            if not isinstance(nl, dict) or nl.get("captionPreset") not in {"general", "style", "character"}:
+            if not isinstance(nl, dict) or nl.get("captionPreset") not in NL_STANDARD_CAPTION_PRESETS | NL_MOSS_CAPTION_PRESETS:
                 raise ValueError("invalid NL configuration")
             supplement = nl.get("systemPrompt")
             if not isinstance(supplement, str):
@@ -819,7 +819,7 @@ class TokenBudgetReviewService:
             if row["current_module_id"] not in {None, "token_budget"} or row["status"] not in {"pending", "failed"}:
                 raise TokenBudgetReviewConflictError("Token Budget rewrite sample state changed")
             preset = str(nl["captionPreset"])
-            primary = character_name(str(row["relative_image_path"])) if preset == "character" else None
+            primary = character_name(str(row["relative_image_path"])) if preset in {"character", "moss-character"} else None
             context = dict(current)
             context["nl"] = ""
             try:

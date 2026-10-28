@@ -479,6 +479,12 @@ class ControlPlaneApiTests(unittest.TestCase):
         self.assertEqual(("general", "style", "character"), tuple(item["type"] for item in built_in[:3]))
         self.assertTrue(all(item["builtIn"] for item in built_in[:3]))
         self.assertIn("observable", get_preset(built_in[0]["presetId"])["promptText"])
+        moss_built_in = list_presets(includeMoss=True)["presets"]
+        self.assertEqual(
+            ("moss-general", "moss-style", "moss-character"),
+            tuple(item["type"] for item in moss_built_in if str(item["type"]).startswith("moss-")),
+        )
+        self.assertIn("watermark", get_preset("builtin:nl-preset-moss-v1-general")["promptText"])
         created = create_preset(preset_body(name="Custom", type="style", promptText="Base A"))
         self.assertFalse(created["builtIn"])
         updated = update_preset(created["presetId"], preset_body(name="Renamed", type="character", promptText="Base B"))

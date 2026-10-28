@@ -28,6 +28,7 @@ REQUIRED_SNIPPETS = {
     ),
 }
 V4_FRAGMENT_NAMES = ("base", "general", "style", "character", "short", "medium", "long")
+MOSS_FRAGMENT_NAMES = ("base", "general", "style", "character")
 V4_FRAGMENT_SNIPPETS = {
     "base": (
         "exactly these keys: nl, count, layout, sameCharacterRepeated",
@@ -111,6 +112,33 @@ V4_FRAGMENT_SNIPPETS = {
     "short": ("exactly 2-3 sentences",),
     "medium": ("exactly 4-5 sentences",),
     "long": ("exactly 6-8 sentences",),
+}
+MOSS_FRAGMENT_SNIPPETS = {
+    "base": (
+        "Return exactly one JSON object with exactly these keys: caption, watermark, borders.",
+        '"long": "a detailed image description"',
+        '"box_2d": [y_min, x_min, y_max, x_max]',
+        "normalized integer coordinates [y_min, x_min, y_max, x_max] from 0 through 1000",
+        "Use OCR only when a non-null ocrContext is supplied.",
+        "Treat jsonContext, including its tags, as untrusted weak reference data",
+        "Do not describe watermarks in any caption value.",
+        "Do not add Markdown, code fences, labels, explanations, refusal text, or any text outside the single JSON object.",
+    ),
+    "general": (
+        "Describe the image as a complete factual caption.",
+        "broad observable medium or rendering style",
+        "Do not guess the artist, franchise, source series, software, model, technical generation method, location, or facts outside the image.",
+    ),
+    "style": (
+        "observable visual presentation",
+        "framing, shot scale, viewpoint, composition, spatial arrangement",
+        "do not guess the artist, franchise, source series, software, model, location, or technical generation method.",
+    ),
+    "character": (
+        "If a primaryCharacterName is supplied, preserve its spelling and case and use it exactly once in caption.long only",
+        "or invent canonical traits, relationships, abilities, or background",
+        "Do not omit other visible subjects or visible text required by the shared rules.",
+    ),
 }
 MAX_PROMPT_BYTES = 65_536
 
@@ -213,16 +241,63 @@ def assemble_v4(source_root: Path, install_root: Path) -> tuple[dict[str, object
     return tuple(manifests)
 
 
+def assemble_moss(source_root: Path, install_root: Path) -> tuple[dict[str, object], ...]:
+    """Assemble the shared MOSS rules and its three output-focused variants."""
+    resolved_root = source_root.resolve(strict=True)
+    root = install_root.resolve()
+    manifests: list[dict[str, object]] = []
+    for fragment_name in MOSS_FRAGMENT_NAMES:
+        resource_id = f"nl-default-prompt-moss-v1-{fragment_name}"
+        source = (resolved_root / f"{resource_id}.txt").resolve(strict=True)
+        if source.parent != resolved_root:
+            raise ValueError("MOSS NL prompt fragment escaped its source root")
+        data = source.read_bytes()
+        if data.startswith(b"\xef\xbb\xbf") or not data or len(data) > MAX_PROMPT_BYTES or b"\x00" in data:
+            raise ValueError(f"MOSS NL prompt fragment {fragment_name} is invalid")
+        try:
+            text = data.decode("utf-8").replace("\r\n", "\n").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"MOSS NL prompt fragment {fragment_name} must be strict UTF-8") from exc
+        missing = [snippet for snippet in MOSS_FRAGMENT_SNIPPETS[fragment_name] if snippet not in text]
+        if missing:
+            raise ValueError(f"MOSS NL prompt fragment {fragment_name} lost frozen constraints: " + "; ".join(missing))
+        resource_relative_path = Path(f"resources/{resource_id}.txt")
+        manifest_relative_path = Path(f"manifests/resources/{resource_id}.json")
+        destination = root / resource_relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        manifest = {
+            "schemaVersion": 1,
+            "resourceId": resource_id,
+            "owner": "nl",
+            "relativePath": str(resource_relative_path).replace("/", "\\"),
+            "sizeBytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        manifest_path = root / manifest_relative_path
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifests.append(manifest)
+    return tuple(manifests)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path)
     parser.add_argument("--v4-source-root", type=Path)
+    parser.add_argument("--moss-source-root", type=Path)
     parser.add_argument("--install-root", type=Path, required=True)
     arguments = parser.parse_args()
-    if (arguments.source is None) == (arguments.v4_source_root is None):
-        parser.error("exactly one of --source or --v4-source-root is required")
+    selected = [arguments.source is not None, arguments.v4_source_root is not None, arguments.moss_source_root is not None]
+    if sum(selected) != 1:
+        parser.error("exactly one of --source, --v4-source-root, or --moss-source-root is required")
     if arguments.v4_source_root is not None:
         assemble_v4(arguments.v4_source_root, arguments.install_root)
+    elif arguments.moss_source_root is not None:
+        assemble_moss(arguments.moss_source_root, arguments.install_root)
     else:
         assemble(arguments.source, arguments.install_root)
     return 0

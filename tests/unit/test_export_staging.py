@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'core'/'src'))
 from anima_core import export_staging
 from anima_core.export_staging import create_hardlink_staging,replace_business_annotation,reveal_staging
+from anima_core.moss_sidecar import serialize_moss_json
 
 
 def _ocr_sidecar(relative_image_path, *, status='success'):
@@ -20,6 +21,18 @@ def _ocr_sidecar(relative_image_path, *, status='success'):
  return json.dumps(value,separators=(',',':')).encode('utf-8')
 
 class ExportStagingTests(unittest.TestCase):
+ def test_moss_sidecar_requires_the_moss_json_schema(self):
+  with tempfile.TemporaryDirectory() as t:
+   root=Path(t);source=root/'dataset';source.mkdir();(source/'image.png').write_bytes(b'image');stage=create_hardlink_staging(source,root/'.dataset.stage')
+   replace=getattr(export_staging,'replace_moss_sidecar',None)
+   self.assertTrue(callable(replace),'MOSS staging replacement API is missing')
+   value={'caption':{'long':'A cat.','medium':'A cat.','short':'A cat.'},'watermark':[],'borders':['none']}
+   payload=serialize_moss_json(value)
+   target=replace(stage,'image.png',payload)
+   self.assertEqual(payload,target.read_bytes())
+   for malformed in (b'{}',payload.replace(b'"none"',b'"left","none"')):
+    with self.subTest(malformed=malformed),self.assertRaises(export_staging.StagingError):replace(stage,'image.png',malformed)
+
  def test_hardlinked_staging_preserves_source(self):
   with tempfile.TemporaryDirectory() as t:
    root=Path(t);source=root/'d';source.mkdir();(source/'nested').mkdir();file=source/'nested'/'a.png';file.write_bytes(b'x');stage=create_hardlink_staging(source,root/'.d.stage')

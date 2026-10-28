@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
 
 from .classify_overlay import ClassifyJsonError, parse_annotation_json, serialize_annotation_json
 from .db import StateDatabase
+from .moss_sidecar import MossSidecarError, parse_moss_json, serialize_moss_json
 from .overlay import OverlayError, OverlayLayout, WorkingAnnotationView
 from .path_safety import safe_relative_path, sha256_file, windows_paths_equal
 
@@ -27,6 +29,13 @@ class NlOverlayWriter:
             raise OverlayError("NL overlay does not match the immutable job")
         if not isinstance(job["overlay_root"], str) or not windows_paths_equal(self.layout.root, str(job["overlay_root"])):
             raise OverlayError("NL overlay root does not match the persisted job")
+
+    def _moss_enabled(self) -> bool:
+        try:
+            config = json.loads(str(self.database.get_job(self.job_id)["config_json"]))
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise OverlayError("frozen NL configuration is invalid") from exc
+        return isinstance(config, dict) and isinstance(config.get("nl"), dict) and config["nl"].get("promptVersion") == "nl-default-prompt-moss-v1"
 
     def commit_staged(self, job_id: str, sample_id: int, lease_id: str) -> bool:
         if job_id != self.job_id:
@@ -73,6 +82,24 @@ class NlOverlayWriter:
             self.database.archive_nl_for_sample(self.job_id, sample_id, source=history_source, text=nl)
         self.layout.commit_prepared(relative, digest, annotation_key, ".json")
 
+    def write_moss_value(
+        self, *, sample_id: int, lease_id: str, relative_image_path: str,
+        moss: dict[str, object], allowed_statuses: tuple[str, ...] = ("request_started",),
+    ) -> None:
+        if not self._moss_enabled():
+            raise OverlayError("MOSS output requires a MOSS NL configuration")
+        try:
+            data = serialize_moss_json(moss)
+        except MossSidecarError as exc:
+            raise OverlayError("MOSS output is invalid") from exc
+        prepared, digest = self.layout.write_moss_prepared(lease_id, data)
+        relative = os.path.relpath(prepared, self.layout.root).replace("/", "\\")
+        self.database.stage_prepared_artifact(
+            self.job_id, sample_id, lease_id=lease_id, relative_path=relative, sha256=digest,
+            allowed_statuses=allowed_statuses,
+        )
+        self.layout.commit_moss_prepared(relative, digest, relative_image_path)
+
     def recover_prepared(self, job_id: str, sample_id: int, prepared_relative_path: str, expected_sha256: str) -> bool:
         if job_id != self.job_id or not SHA256.fullmatch(expected_sha256):
             raise OverlayError("NL recovery identity is invalid")
@@ -81,14 +108,29 @@ class NlOverlayWriter:
             raise OverlayError("NL recovery state is not prepared")
         if not isinstance(row["prepared_artifact_relative_path"], str) or safe_relative_path(str(row["prepared_artifact_relative_path"])) != safe_relative_path(prepared_relative_path) or row["prepared_artifact_sha256"] != expected_sha256:
             raise OverlayError("NL recovery metadata does not match SQLite")
-        target = self.layout.annotation_path(str(row["annotation_key"]), ".json")
+        moss = self._moss_enabled()
+        target = self.layout.moss_sidecar_path(str(row["relative_image_path"])) if moss else self.layout.annotation_path(str(row["annotation_key"]), ".json")
         prepared = self.layout.resolve_prepared(prepared_relative_path)
         if target.is_file() and sha256_file(target) == expected_sha256:
+            if moss:
+                try:
+                    parse_moss_json(target.read_bytes())
+                except (OSError, MossSidecarError) as exc:
+                    raise OverlayError("committed MOSS sidecar is invalid") from exc
             if prepared.is_file() and sha256_file(prepared) == expected_sha256:
                 prepared.unlink()
             return True
         if not prepared.is_file() or sha256_file(prepared) != expected_sha256:
             return False
+        if moss:
+            try:
+                parse_moss_json(prepared.read_bytes())
+            except (OSError, MossSidecarError) as exc:
+                raise OverlayError("prepared MOSS sidecar is invalid") from exc
+            committed = self.layout.commit_moss_prepared(
+                prepared_relative_path, expected_sha256, str(row["relative_image_path"]),
+            )
+            return sha256_file(committed) == expected_sha256
         try:
             recovered = parse_annotation_json(prepared.read_bytes())
         except (OSError, ClassifyJsonError):

@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from .count_review_protocol import CountObservationV1, CountReviewProtocolError
+from .moss_sidecar import MossSidecarError, serialize_moss_json as _serialize_moss_json, validate_moss_json as _validate_moss_json
 from .path_safety import PathSafetyError, safe_relative_path
 
 
@@ -43,6 +44,20 @@ def validate_nl(value: object) -> str:
     return nl
 
 
+def serialize_moss_json(value: object) -> bytes:
+    try:
+        return _serialize_moss_json(value)
+    except MossSidecarError as exc:
+        raise NlProtocolError(str(exc)) from exc
+
+
+def validate_moss_json(value: object) -> dict[str, object]:
+    try:
+        return _validate_moss_json(value)
+    except MossSidecarError as exc:
+        raise NlProtocolError(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class NlOutcomeV1:
     sampleId: int
@@ -54,6 +69,7 @@ class NlOutcomeV1:
     httpAttempts: int
     observation: CountObservationV1 | None = None
     message: str | None = None
+    mossJson: dict[str, object] | None = None
 
 
 def _valid_usage(value: object) -> bool:
@@ -70,7 +86,7 @@ def parse_outcomes(
     *,
     response_protocol: str = "nl-v1",
 ) -> tuple[NlOutcomeV1, ...]:
-    if response_protocol not in {"nl-v1", "nl-count-v2"}:
+    if response_protocol not in {"nl-v1", "nl-count-v2", "nl-moss-v1"}:
         raise NlProtocolError("NL response protocol is invalid")
     if not isinstance(payload, dict) or set(payload) != {"schemaVersion", "payloadType", "items"} or payload.get("schemaVersion") != 1 or payload.get("payloadType") != "nl_process_result" or not isinstance(payload.get("items"), list) or len(payload["items"]) != len(expected):
         raise NlProtocolError("NL process result is invalid")
@@ -88,9 +104,10 @@ def parse_outcomes(
             safe_relative_path(item["relativeImagePath"])
         except PathSafetyError as exc:
             raise NlProtocolError("NL result relative path is unsafe") from exc
-        expected_result_type = "nl_result" if response_protocol == "nl-v1" else "nl_result_v2"
+        expected_result_type = "nl_moss_result" if response_protocol == "nl-moss-v1" else "nl_result" if response_protocol == "nl-v1" else "nl_result_v2"
         if item["payloadType"] == expected_result_type:
-            result_fields = {"nl", "requestId", "usage", "httpAttempts"}
+            output_field = "moss" if response_protocol == "nl-moss-v1" else "nl"
+            result_fields = {output_field, "requestId", "usage", "httpAttempts"}
             if response_protocol == "nl-count-v2":
                 result_fields.add("observation")
             if (
@@ -111,16 +128,23 @@ def parse_outcomes(
                     raise NlProtocolError(str(exc)) from exc
                 if observation.status not in {"observed", "invalid"}:
                     raise NlProtocolError("requested NL observation status is invalid")
-            outcomes.append(NlOutcomeV1(
-                item["sampleId"], item["leaseId"], item["relativeImagePath"],
-                validate_nl(item["nl"]), None, False, item["httpAttempts"], observation, None,
-            ))
+            if response_protocol == "nl-moss-v1":
+                moss_json = validate_moss_json(item["moss"])
+                outcomes.append(NlOutcomeV1(
+                    item["sampleId"], item["leaseId"], item["relativeImagePath"],
+                    None, None, False, item["httpAttempts"], None, None, moss_json,
+                ))
+            else:
+                outcomes.append(NlOutcomeV1(
+                    item["sampleId"], item["leaseId"], item["relativeImagePath"],
+                    validate_nl(item["nl"]), None, False, item["httpAttempts"], observation, None,
+                ))
         elif item["payloadType"] == "nl_issue":
             if set(item) != common | {"code", "severity", "blocking", "retriable", "message", "httpAttempts"} or not isinstance(item["code"], str) or item["severity"] != "error" or item["blocking"] is not True or type(item["retriable"]) is not bool or not isinstance(item["message"], str) or type(item["httpAttempts"]) is not int or not 0 <= item["httpAttempts"] <= 5:
                 raise NlProtocolError("NL issue fields are invalid")
             outcomes.append(NlOutcomeV1(
                 item["sampleId"], item["leaseId"], item["relativeImagePath"],
-                None, item["code"], item["retriable"], item["httpAttempts"], None, item["message"],
+                None, item["code"], item["retriable"], item["httpAttempts"], None, item["message"], None,
             ))
         else:
             raise NlProtocolError("NL outcome type is invalid")

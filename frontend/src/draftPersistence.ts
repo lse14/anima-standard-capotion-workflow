@@ -141,7 +141,7 @@ function isDraft(value: unknown): value is Draft {
   if (!record(nl) || !exactKeys(nl, ["enabled", "reuseOriginalNl", "apiEnabled", "useImage", "useFullJson", "systemPrompt", "promptVersion", "captionPreset", "lengthDistribution", "lengthSeed", "apiProfileId", "apiPolicy"])) return false;
   if (typeof nl.enabled !== "boolean" || typeof nl.reuseOriginalNl !== "boolean" || typeof nl.apiEnabled !== "boolean"
     || typeof nl.useImage !== "boolean" || typeof nl.useFullJson !== "boolean" || typeof nl.systemPrompt !== "string"
-    || typeof nl.promptVersion !== "string" || !["general", "style", "character"].includes(String(nl.captionPreset))
+    || typeof nl.promptVersion !== "string" || !["general", "style", "character", "moss-general", "moss-style", "moss-character"].includes(String(nl.captionPreset))
     || typeof nl.lengthSeed !== "string" || typeof nl.apiProfileId !== "string") return false;
   if (!record(nl.lengthDistribution) || !exactKeys(nl.lengthDistribution, ["short", "medium", "long"])
     || !Object.values(nl.lengthDistribution).every((item) => integerInRange(item, 0, 100))) return false;
@@ -157,7 +157,9 @@ function isDraft(value: unknown): value is Draft {
   const dropout = value.dropout;
   if (!record(dropout) || !exactKeys(dropout, ["enabled", "policyVersion", "seed", "artist", "quality", "appearanceNl"]) || typeof dropout.enabled !== "boolean" || typeof dropout.policyVersion !== "string" || typeof dropout.seed !== "string") return false;
   const artist = dropout.artist;
-  if (!record(artist) || !exactKeys(artist, ["enabled", "dropoutProbability"]) || typeof artist.enabled !== "boolean" || !integerOrFloatInRange(artist.dropoutProbability, 0, 1)) return false;
+  if (!record(artist) || !exactKeys(artist, ["enabled", "dropoutProbability"], ["addAtPrefix"])
+    || typeof artist.enabled !== "boolean" || !integerOrFloatInRange(artist.dropoutProbability, 0, 1)
+    || (hasOwn(artist, "addAtPrefix") && typeof artist.addAtPrefix !== "boolean")) return false;
   const quality = dropout.quality;
   if (!record(quality) || !exactKeys(quality, ["enabled", "dropoutProbability", "device", "batchSize"], ["resourceId"]) || typeof quality.enabled !== "boolean"
     || !integerOrFloatInRange(quality.dropoutProbability, 0, 1) || !["auto", "cuda", "cpu"].includes(String(quality.device))
