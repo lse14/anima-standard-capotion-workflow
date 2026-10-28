@@ -168,11 +168,11 @@ class FoundationTests(unittest.TestCase):
             finally:
                 database.close()
 
-    def test_fresh_state_database_uses_schema4_without_a_job_profile_column(self) -> None:
+    def test_fresh_state_database_uses_current_schema_without_a_job_profile_column(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = StateDatabase.open(Path(temporary) / "state.db")
             try:
-                self.assertEqual(4, int(database.connection.execute("PRAGMA user_version").fetchone()[0]))
+                self.assertEqual(SCHEMA_VERSION, int(database.connection.execute("PRAGMA user_version").fetchone()[0]))
                 columns = {
                     str(row["name"])
                     for row in database.connection.execute("PRAGMA table_info(jobs)")

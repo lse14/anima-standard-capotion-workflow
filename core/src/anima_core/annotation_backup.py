@@ -93,7 +93,8 @@ def restore_to_staging(backup_zip: str | Path, staging_root: str | Path) -> int:
         with zipfile.ZipFile(backup) as archive:
             if archive.testzip() is not None or "manifest.jsonl" not in archive.namelist():
                 raise AnnotationBackupError("backup verification failed")
-            restored, last_key, last_suffix_rank = 0, "", -1
+            restored = 0
+            seen_entries: set[tuple[str, str]] = set()
             with archive.open("manifest.jsonl") as manifest:
                 for raw in manifest:
                     try:
@@ -106,12 +107,14 @@ def restore_to_staging(backup_zip: str | Path, staging_root: str | Path) -> int:
                     if not relative.endswith((".txt", ".json")):
                         raise AnnotationBackupError("backup manifest path is invalid")
                     suffix = Path(relative).suffix.lower()
-                    key, rank = relative[:-len(suffix)], 0 if suffix == ".txt" else 1
-                    if key.casefold() < last_key.casefold() or (key.casefold() == last_key.casefold() and rank <= last_suffix_rank):
-                        raise AnnotationBackupError("backup manifest ordering is invalid")
-                    if key.casefold() != last_key.casefold():
-                        last_key, last_suffix_rank = key, -1
-                    last_suffix_rank = rank
+                    key = relative[:-len(suffix)]
+                    # The writer emits entries in the task's own sample order, which is
+                    # not a lexical order once nested directories or `foo` / `foo-bar`
+                    # style names appear. Rejecting repeats keeps the manifest a set of
+                    # unique (path, suffix) pairs without assuming any ordering.
+                    if (key.casefold(), suffix) in seen_entries:
+                        raise AnnotationBackupError("backup manifest repeats an annotation")
+                    seen_entries.add((key.casefold(), suffix))
                     if type(entry.get("exists")) is not bool:
                         raise AnnotationBackupError("backup manifest existence flag is invalid")
                     if not entry["exists"]:

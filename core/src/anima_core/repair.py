@@ -15,7 +15,7 @@ from .custom_classification_resource import (
 from .db import MAX_PAGE_SIZE, StateDatabase
 from .job_preflight import config_from_dict
 from .locks import DatasetLock, release_completed_dataset_lock
-from .overlay import BaselineView, OverlayLayout, WorkingAnnotationView
+from .overlay import BaselineView, OverlayError, OverlayLayout, WorkingAnnotationView
 from .path_safety import PathSafetyError, ensure_within, windows_key
 
 

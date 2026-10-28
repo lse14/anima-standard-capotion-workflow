@@ -44,6 +44,9 @@ class TokenBudgetOverlayContractTests(unittest.TestCase):
         config = JobConfig(schemaVersion=10, workMode="in_place", overwriteMode="incremental", sourceRoot=str(dataset))
         config.caption["enabled"] = config.classify["enabled"] = config.replace["enabled"] = config.ocr["enabled"] = config.nl["enabled"] = config.dropout["enabled"] = False
         config.countReview["enabled"] = False  # type: ignore[index]
+        # Incremental mode freezes existing annotations as preserved, which
+        # skips the sample past Token Budget; this contract needs a leased sample.
+        config.classify["overwriteJson"] = True
         config.export["format"] = "json"
         preparation = JobPreparationService(root / "state.db")
         job_id = preparation.preflight(config.to_dict()).jobId

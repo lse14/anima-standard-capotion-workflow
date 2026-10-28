@@ -35,16 +35,17 @@ class SourceBootstrapPowerShellTests(unittest.TestCase):
         remote_payload = b"fixture remote artifact"
         bootstrap_payload = b"fixture bootstrap artifact"
         mandatory = (
-            "core", "caption-e621", "classify-e621", "replace-e621", "nl", "policy",
-            "export", "token-budget", "e621-tagger", "qwen3-tokenizer", "quality-stack",
+            "core", "caption-e621", "classify-e621", "replace-e621", "nl",
+            "export", "token-budget", "e621-tagger", "qwen3-tokenizer",
         )
+        optional = ("policy", "quality-stack")
         components: list[dict[str, object]] = []
-        for component_id in mandatory:
+        for component_id in mandatory + optional:
             components.append(
                 {
                     "componentId": component_id,
                     "kind": "runtime",
-                    "required": True,
+                    "required": component_id not in optional,
                     "licenseReference": "fixture-license",
                     "targetRelativePath": f".runtime-build/runtimes/{component_id}",
                     "variants": {

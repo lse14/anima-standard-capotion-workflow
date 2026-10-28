@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from pathlib import Path
 from typing import Mapping, Protocol
 
 from .contracts import CURRENT_JOB_CONFIG_SCHEMA_VERSION, SampleIssue, WorkLease, sha256_json
@@ -25,8 +24,30 @@ class TokenBudgetTransport(Protocol):
     def exchange(self, request: ProtocolEnvelopeV1) -> ProtocolEnvelopeV1: ...
 
 
+# The stdio transport rejects any frame above 1 MiB, so a batch has to be split
+# by serialized size rather than by sample count alone.
+MAX_REQUEST_BYTES = 900_000
+
+
 class TokenBudgetRunnerError(RuntimeError):
     pass
+
+
+def split_request_batches(items: list[tuple[object, object, dict[str, object]]], limit: int = MAX_REQUEST_BYTES) -> list[list[tuple[object, object, dict[str, object]]]]:
+    """Group request items so each serialized process_batch frame fits the transport limit."""
+    batches: list[list[tuple[object, object, dict[str, object]]]] = []
+    current: list[tuple[object, object, dict[str, object]]] = []
+    size = 0
+    for item in items:
+        encoded = len(json.dumps(item[2], ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) + 1
+        if current and size + encoded > limit:
+            batches.append(current)
+            current, size = [], 0
+        current.append(item)
+        size += encoded
+    if current:
+        batches.append(current)
+    return batches
 
 
 class TokenBudgetRunner:
@@ -161,38 +182,58 @@ class TokenBudgetRunner:
                 rows = [self.database.get_leased_sample(self.job_id, "token_budget", lease.sampleId, lease_id=str(lease.leaseId), worker_instance_id=self.worker_instance_id) for lease in active]
                 if not self._hello_done:
                     self._hello(config_hash, section)
-                payload = self._exchange("process_batch", {"schemaVersion": 1, "payloadType": "token_budget_process_request", "captionFormat": dict(caption_format), "items": [{"schemaVersion": 1, "sampleId": lease.sampleId, "leaseId": lease.leaseId, "annotation": json.loads(self.view.read(str(row["annotation_key"]), ".json") or b"null")} for lease, row in zip(active, rows, strict=True)]}, config_hash)
-                if payload.get("schemaVersion") != 1 or payload.get("payloadType") != "token_budget_process_result":
-                    raise TokenBudgetRunnerError("Token Budget batch result is invalid")
-                prepared = self._prepare_batch(active, rows, payload.get("outcomes"), caption_format, max_tokens)
-                job = self.database.get_job(self.job_id)
-                if job["status"] in {"cancelling", "paused"}:
+                items = [
+                    (lease, row, {"schemaVersion": 1, "sampleId": lease.sampleId, "leaseId": lease.leaseId, "annotation": json.loads(self.view.read(str(row["annotation_key"]), ".json") or b"null")})
+                    for lease, row in zip(active, rows, strict=True)
+                ]
+                cancelled = False
+                for chunk in split_request_batches(items):
+                    if len(chunk) == 1:
+                        encoded = len(json.dumps(chunk[0][2], ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+                        if encoded > MAX_REQUEST_BYTES:
+                            # One annotation cannot fit a single frame at all; fail only that sample.
+                            lease, row, _ = chunk[0]
+                            self._issue(lease, row, code="token_budget_annotation_too_large", message="Token Budget annotation exceeds the worker frame limit")
+                            active.remove(lease)
+                            continue
+                    payload = self._exchange("process_batch", {"schemaVersion": 1, "payloadType": "token_budget_process_request", "captionFormat": dict(caption_format), "items": [item for _, _, item in chunk]}, config_hash)
+                    if payload.get("schemaVersion") != 1 or payload.get("payloadType") != "token_budget_process_result":
+                        raise TokenBudgetRunnerError("Token Budget batch result is invalid")
+                    chunk_leases = [lease for lease, _, _ in chunk]
+                    chunk_rows = [row for _, row, _ in chunk]
+                    prepared = self._prepare_batch(chunk_leases, chunk_rows, payload.get("outcomes"), caption_format, max_tokens)
+                    job = self.database.get_job(self.job_id)
+                    if job["status"] in {"cancelling", "paused"}:
+                        cancelled = True
+                        break
+                    try:
+                        for lease in chunk_leases:
+                            self.database.get_leased_sample(
+                                self.job_id, "token_budget", lease.sampleId,
+                                lease_id=str(lease.leaseId), worker_instance_id=self.worker_instance_id,
+                            )
+                    except (KeyError, ValueError) as exc:
+                        raise TokenBudgetRunnerError("Token Budget worker response lease is stale") from exc
+                    for lease, row, value in prepared:
+                        if isinstance(value, TokenBudgetProtocolError):
+                            self._issue(lease, row, code="token_budget_protocol_violation", message="Token Budget worker outcome failed validation")
+                        elif value.status == "failed":
+                            self._issue(lease, row, code="token_budget_worker_failed", message="Token Budget worker could not process the sample")
+                        elif value.status == "overflow":
+                            writer.write_overflow_review(sample_id=lease.sampleId, lease_id=str(lease.leaseId), original_tokens=int(value.original_tokens), final_tokens=int(value.final_tokens), removed=value.removed or {}, max_tokens=max_tokens, resource_id=str(section["resourceId"]), resource_fingerprint=str(section["resourceFingerprint"]))
+                            self._issue(lease, row, code="token_budget_overflow", message="Token Budget exceeded the frozen maximum")
+                        else:
+                            writer.prepare_and_commit(sample_id=lease.sampleId, lease_id=str(lease.leaseId), annotation_key=str(row["annotation_key"]), outcome=value, caption_format=caption_format, max_tokens=max_tokens)
+                            self.scheduler.complete(lease)
+                        active.remove(lease)
+                if cancelled:
+                    job = self.database.get_job(self.job_id)
                     for lease in active:
                         state = self.database.get_sample_state(self.job_id, lease.sampleId)
                         if state["status"] == "leased" and state["lease_id"] == lease.leaseId:
                             self.scheduler.release_unstarted(lease)
                     active = []
                     return str(job["status"])
-                try:
-                    for lease in active:
-                        self.database.get_leased_sample(
-                            self.job_id, "token_budget", lease.sampleId,
-                            lease_id=str(lease.leaseId), worker_instance_id=self.worker_instance_id,
-                        )
-                except (KeyError, ValueError) as exc:
-                    raise TokenBudgetRunnerError("Token Budget worker response lease is stale") from exc
-                for lease, row, value in prepared:
-                    if isinstance(value, TokenBudgetProtocolError):
-                        self._issue(lease, row, code="token_budget_protocol_violation", message="Token Budget worker outcome failed validation")
-                    elif value.status == "failed":
-                        self._issue(lease, row, code="token_budget_worker_failed", message="Token Budget worker could not process the sample")
-                    elif value.status == "overflow":
-                        writer.write_overflow_review(sample_id=lease.sampleId, lease_id=str(lease.leaseId), original_tokens=int(value.original_tokens), final_tokens=int(value.final_tokens), removed=value.removed or {}, max_tokens=max_tokens, resource_id=str(section["resourceId"]), resource_fingerprint=str(section["resourceFingerprint"]))
-                        self._issue(lease, row, code="token_budget_overflow", message="Token Budget exceeded the frozen maximum")
-                    else:
-                        writer.prepare_and_commit(sample_id=lease.sampleId, lease_id=str(lease.leaseId), annotation_key=str(row["annotation_key"]), outcome=value, caption_format=caption_format, max_tokens=max_tokens)
-                        self.scheduler.complete(lease)
-                    active.remove(lease)
         except (TokenBudgetRunnerError, TokenBudgetOverlayError, SchedulerError, ProtocolError):
             for lease in active:
                 state = self.database.get_sample_state(self.job_id, lease.sampleId)

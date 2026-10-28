@@ -6,6 +6,19 @@ from .replacement import ReplacementError, replace_projection
 from .resource import ReplaceResource, ReplaceResourceError, load_custom_replace_resource, load_replace_resource
 
 
+def bounded_message(message: str, limit: int = 1_024) -> str:
+    """Truncate an error message to the parent's UTF-8 byte limit.
+
+    The core validates `message` by encoded byte length, while slicing a Python
+    string counts characters. Text with three-byte characters would therefore
+    pass the slice and still be rejected, which fails a whole worker batch.
+    """
+    raw = message.encode("utf-8")
+    if len(raw) <= limit:
+        return message
+    return raw[:limit].decode("utf-8", errors="ignore")
+
+
 class ReplaceWorkerError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -56,7 +69,7 @@ class ReplaceWorker:
             return {
                 "schemaVersion": 1, "payloadType": "replace_issue", "sampleId": item["sampleId"], "leaseId": item["leaseId"],
                 "source": "e621", "relativeImagePath": item["relativeImagePath"], "code": "replace_json_invalid",
-                "severity": "error", "blocking": True, "retriable": False, "message": str(exc)[:1024],
+                "severity": "error", "blocking": True, "retriable": False, "message": bounded_message(str(exc)),
             }
         return {
             "schemaVersion": 1, "payloadType": "replace_result", "sampleId": item["sampleId"], "leaseId": item["leaseId"],

@@ -21,36 +21,43 @@ def _display_tag(value: str, policy: CaptionDisplayPolicy) -> str:
     return result
 
 
-def _tag_section(payload: Mapping[str, object], field: str, policy: CaptionDisplayPolicy) -> str:
+def _field_values(payload: Mapping[str, object], field: str) -> list[str]:
     value = payload[field]
     if field in ARRAY_FIELDS:
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise FlatTextSerializationError(f"{field} is not a normalized string array")
-        values = value
-    elif field == "character":
+        return list(value)
+    if field == "character":
         if not isinstance(value, str):
             raise FlatTextSerializationError("character is not a normalized string")
-        values = [part.strip() for part in value.split(",") if part.strip()]
-    else:
-        if not isinstance(value, str):
-            raise FlatTextSerializationError(f"{field} is not a normalized string")
-        values = [value] if value else []
-    return ", ".join(_display_tag(item, policy) for item in values)
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if not isinstance(value, str):
+        raise FlatTextSerializationError(f"{field} is not a normalized string")
+    return [value] if value else []
 
 
 def serialize_flat_txt(payload: Mapping[str, object], caption_policy: CaptionDisplayPolicy) -> bytes:
     """Serialize a normalized payload without changing JSON field semantics."""
     if set(payload) != set(FIELDS):
         raise FlatTextSerializationError("flat TXT requires exactly the normalized nine fields")
-    tag_sections = [_tag_section(payload, field, caption_policy) for field in _TAG_FIELDS]
-    first = next((index for index, section in enumerate(tag_sections) if section), None)
-    triggers = [_display_tag(term, caption_policy) for term in caption_policy.trigger_terms] if caption_policy.triggers_enabled else []
-    if triggers:
-        if first is None:
-            tag_sections.insert(0, ", ".join(triggers))
-        else:
-            tag_sections[first] = ", ".join([*triggers, tag_sections[first]])
-    tags = [section for section in tag_sections if section]
+    # Trigger terms come first, then the eight tag-bearing fields in their
+    # frozen order. `count` legitimately repeats a bucket label that also
+    # appears in `tags`, so the flat TXT prints the first occurrence only;
+    # the JSON payload stays untouched.
+    values: list[str] = []
+    if caption_policy.triggers_enabled:
+        values.extend(caption_policy.trigger_terms)
+    for field in _TAG_FIELDS:
+        values.extend(_field_values(payload, field))
+    seen: set[str] = set()
+    tags: list[str] = []
+    for value in values:
+        displayed = _display_tag(value, caption_policy)
+        key = displayed.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(displayed)
     nl = payload["nl"]
     if not isinstance(nl, str):
         raise FlatTextSerializationError("nl is not a normalized string")

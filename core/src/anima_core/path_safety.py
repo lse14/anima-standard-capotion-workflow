@@ -56,6 +56,29 @@ def windows_compare(left: str, right: str) -> int:
     return (left_key > right_key) - (left_key < right_key)
 
 
+_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def long_path(path: str | Path) -> str | Path:
+    """Return an extended-length path for filesystem calls on Windows.
+
+    Windows still enforces MAX_PATH (260) on most APIs unless the path carries
+    the ``\\\\?\\`` prefix. A dataset near that limit plus the workspace's
+    `stage`/`rollback`/`backup` segments easily exceeds it, so every path that
+    creates, renames or links gets this prefix. Short paths are returned unchanged
+    so normal behaviour, error messages and comparisons stay identical.
+    """
+    raw = os.fspath(path)
+    if os.name != "nt" or not raw or raw.startswith(_LONG_PATH_PREFIX):
+        return path
+    absolute = os.path.abspath(os.path.normpath(raw))
+    if len(absolute) < 240:
+        return path
+    if absolute.startswith("\\\\"):
+        return _LONG_PATH_PREFIX + "UNC" + absolute[1:]
+    return _LONG_PATH_PREFIX + absolute
+
+
 def _is_reparse(path: Path) -> bool:
     try:
         information = os.lstat(path)
@@ -270,6 +293,7 @@ def file_fingerprint(path: str | Path) -> dict[str, int | str]:
 
 
 def replace_with_sharing_retry(source: str | Path, destination: str | Path) -> None:
+    source, destination = long_path(source), long_path(destination)
     for attempt in range(5):
         try:
             os.replace(source, destination)
@@ -287,7 +311,7 @@ def atomic_write_bytes(root: str | Path, relative_path: str, data: bytes) -> Pat
     destination.parent.mkdir(parents=True, exist_ok=True)
     if _is_reparse(destination.parent):
         raise PathSafetyError(f"destination parent is a reparse point: {destination.parent}")
-    fd, temporary = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=destination.parent)
+    fd, temporary = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=long_path(destination.parent))
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)

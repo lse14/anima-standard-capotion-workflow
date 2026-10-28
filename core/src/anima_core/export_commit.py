@@ -22,11 +22,12 @@ from .commit_journal import (
 from .db import StateDatabase
 from .db_primitives import repair_target_clause
 from .directory_commit import DirectoryCommitError, restore_rollback
-from .export_staging import StagingError, create_hardlink_staging, replace_business_annotation, replace_ocr_sidecar, reveal_staging
+from .export_staging import StagingError, create_hardlink_staging, replace_business_annotation, replace_moss_sidecar, replace_ocr_sidecar, reveal_staging
 from .export_summary import UNLABELED_IMAGES_CODE, unlabeled_output_folder
-from .overlay import OverlayLayout
+from .moss_sidecar import MossSidecarError, parse_moss_json
+from .overlay import MOSS_ANNOTATIONS_DIRECTORY, OverlayLayout
 from .ocr_sidecar import OcrSidecarError, parse_ocr_sidecar
-from .path_safety import PathSafetyError, assert_no_reparse_tree, canonicalize, ensure_within, read_annotation_state, safe_relative_path, sha256_file, windows_paths_equal
+from .path_safety import PathSafetyError, assert_no_reparse_tree, canonicalize, ensure_within, long_path, read_annotation_state, safe_relative_path, sha256_file, windows_paths_equal
 from .replace_overlay import ReplaceOverlayWriter
 from .replace_provenance import ReplaceProvenanceChange, apply_provenance_changes, provenance_database_path
 
@@ -73,7 +74,7 @@ class ExportCommitCoordinator:
         self.layout = layout
         self.job_id = job_id
 
-    def _configuration(self) -> tuple[str, Path, bool]:
+    def _configuration(self) -> tuple[str, Path, bool, bool]:
         job = self.database.get_job(self.job_id)
         try:
             config = json.loads(str(job["config_json"]))
@@ -89,9 +90,15 @@ class ExportCommitCoordinator:
             ocr_enabled = ocr_config["enabled"]
         else:
             raise ExportCommitError("frozen OCR configuration is invalid")
+        nl_config = config.get("nl")
+        moss_enabled = (
+            isinstance(nl_config, dict)
+            and nl_config.get("enabled") is True
+            and nl_config.get("promptVersion") == "nl-default-prompt-moss-v1"
+        )
         if job["status"] != "exporting" or job["current_module_id"] != "export":
             raise ExportCommitError("export commit is not active")
-        return str(format_value), Path(str(job["dataset_root"])), ocr_enabled
+        return str(format_value), Path(str(job["dataset_root"])), ocr_enabled, moss_enabled
 
     @staticmethod
     def _expected_kinds(format_value: str) -> set[str]:
@@ -100,6 +107,7 @@ class ExportCommitCoordinator:
     @staticmethod
     def _replace_directory_with_retry(source: Path, destination: Path) -> None:
         """Retry short-lived Windows directory locks from sync/indexing tools."""
+        source, destination = long_path(source), long_path(destination)
         for attempt in range(20):
             try:
                 os.replace(source, destination)
@@ -170,7 +178,7 @@ class ExportCommitCoordinator:
             cursor = int(rows[-1]["sample_id"])
 
     @staticmethod
-    def _has_annotation(staging: Path, annotation_key: str) -> bool:
+    def _has_annotation(staging: Path, annotation_key: str, *, relative_image_path: str | None = None, moss_enabled: bool = False) -> bool:
         for suffix in (".txt", ".json"):
             target = ExportCommitCoordinator._baseline_annotation(staging, annotation_key, suffix)
             try:
@@ -180,16 +188,29 @@ class ExportCommitCoordinator:
                 # An existing malformed annotation is still user data.  It is
                 # preserved and must not make the image look unannotated.
                 return True
+        if moss_enabled and relative_image_path is not None:
+            try:
+                relative = safe_relative_path(f"{MOSS_ANNOTATIONS_DIRECTORY}\\{relative_image_path}.moss.json")
+                sidecar = ensure_within(staging, staging / Path(relative.replace("\\", os.sep)))
+                if sidecar.is_file():
+                    return True
+            except PathSafetyError:
+                return True
         return False
 
-    def _copy_unlabeled_images_to_staging(self, staging: Path) -> tuple[int, str]:
+    def _copy_unlabeled_images_to_staging(self, staging: Path, *, moss_enabled: bool = False) -> tuple[int, str]:
         relative_root = safe_relative_path(unlabeled_output_folder(self.job_id))
         output_root = ensure_within(staging, staging / Path(relative_root.replace("\\", os.sep)))
         if output_root.exists():
             raise ExportCommitError("task-scoped unlabeled output already exists")
         copied = 0
         for row in self._scoped_samples():
-            if self._has_annotation(staging, str(row["annotation_key"])):
+            if self._has_annotation(
+                staging,
+                str(row["annotation_key"]),
+                relative_image_path=str(row["relative_image_path"]),
+                moss_enabled=moss_enabled,
+            ):
                 continue
             relative_image_path = safe_relative_path(str(row["relative_image_path"]))
             source = ensure_within(staging, staging / Path(relative_image_path.replace("\\", os.sep)))
@@ -198,7 +219,7 @@ class ExportCommitCoordinator:
             target = ensure_within(output_root, output_root / Path(relative_image_path.replace("\\", os.sep)))
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
-                os.link(source, target)
+                os.link(long_path(source), long_path(target))
             except OSError as link_error:
                 if target.exists() or target.is_symlink():
                     raise ExportCommitError("unlabeled image target already exists") from link_error
@@ -240,6 +261,37 @@ class ExportCommitCoordinator:
             copied += 1
         return copied
 
+    def _overlay_moss_sidecars(self):
+        """Yield only path-safe, scoped and schema-valid MOSS sidecars."""
+        try:
+            assert_no_reparse_tree(self.layout.root / MOSS_ANNOTATIONS_DIRECTORY)
+        except PathSafetyError as exc:
+            raise ExportCommitError("MOSS overlay contains a reparse point") from exc
+        for row in self._scoped_samples():
+            relative_image_path = str(row["relative_image_path"])
+            try:
+                source = self.layout.moss_sidecar_path(relative_image_path)
+                if not source.exists():
+                    if source.is_symlink():
+                        raise PathSafetyError("MOSS overlay sidecar is a symbolic link")
+                    continue
+                source = canonicalize(source, must_exist=True, directory=False).value
+                raw = source.read_bytes()
+                parse_moss_json(raw)
+            except (OSError, MossSidecarError, PathSafetyError) as exc:
+                raise ExportCommitError("MOSS overlay sidecar is invalid") from exc
+            yield relative_image_path, raw
+
+    def _copy_moss_sidecars_to_staging(self, staging: Path) -> int:
+        copied = 0
+        for relative_image_path, raw in self._overlay_moss_sidecars():
+            try:
+                replace_moss_sidecar(staging, relative_image_path, raw)
+            except StagingError as exc:
+                raise ExportCommitError("MOSS sidecar staging write failed") from exc
+            copied += 1
+        return copied
+
     def _provenance_changes(self, staging: Path, format_value: str):
         writer = ReplaceOverlayWriter(self.database, self.layout, self.job_id)
         for annotation_key, _ in self._artifacts(format_value):
@@ -277,7 +329,7 @@ class ExportCommitCoordinator:
                 if path.exists():
                     path.unlink()
 
-    def _verify_capacity(self, dataset: Path, parent: Path, *, ocr_enabled: bool) -> None:
+    def _verify_capacity(self, dataset: Path, parent: Path, *, ocr_enabled: bool, moss_enabled: bool) -> None:
         """ROADMAP.md:1051 — hard links still cost directory entries, new annotations and a backup."""
         required = 0
         # The hard-link staging tree mirrors the complete dataset, while
@@ -296,6 +348,9 @@ class ExportCommitCoordinator:
                     required += baseline.stat().st_size * 2
         if ocr_enabled:
             for _, raw in self._overlay_ocr_sidecars():
+                required += STAGING_ENTRY_BYTES + len(raw)
+        if moss_enabled:
+            for _, raw in self._overlay_moss_sidecars():
                 required += STAGING_ENTRY_BYTES + len(raw)
         provenance = provenance_database_path(dataset)
         required += provenance.stat().st_size if provenance.is_file() else 64 * 1024
@@ -348,7 +403,7 @@ class ExportCommitCoordinator:
         )
 
     def commit(self, *, reuse_verified_backup: bool = False) -> ExportCommitResult:
-        format_value, dataset, ocr_enabled = self._configuration()
+        format_value, dataset, ocr_enabled, moss_enabled = self._configuration()
         summary = self.database.module_summary(self.job_id, "export")
         if summary["status"] != "completed":
             raise ExportCommitError("Export must settle every sample before staging")
@@ -386,7 +441,7 @@ class ExportCommitCoordinator:
         if reuse_verified_backup:
             verify_backup(backup)
         self._probe_hardlink_support(workspace_parent)
-        self._verify_capacity(dataset, workspace_parent, ocr_enabled=ocr_enabled)
+        self._verify_capacity(dataset, workspace_parent, ocr_enabled=ocr_enabled, moss_enabled=moss_enabled)
         rollback_created = False
         staging_promoted = False
         try:
@@ -405,11 +460,17 @@ class ExportCommitCoordinator:
                 dataset=dataset, staging=staging, rollback=rollback, backup=backup,
             )
             exported = self._copy_to_staging(staging, format_value)
+            if moss_enabled:
+                _advance_journal(
+                    self.layout, job_id=self.job_id, state="staging", phase="copying_moss",
+                    dataset=dataset, staging=staging, rollback=rollback, backup=backup,
+                )
+                self._copy_moss_sidecars_to_staging(staging)
             _advance_journal(
                 self.layout, job_id=self.job_id, state="staging", phase="copying_unlabeled",
                 dataset=dataset, staging=staging, rollback=rollback, backup=backup,
             )
-            unlabeled, unlabeled_folder = self._copy_unlabeled_images_to_staging(staging)
+            unlabeled, unlabeled_folder = self._copy_unlabeled_images_to_staging(staging, moss_enabled=moss_enabled)
             self.database.set_module_diagnostic_count(
                 self.job_id, "export", UNLABELED_IMAGES_CODE, severity="warning", count=unlabeled,
             )
@@ -457,18 +518,31 @@ class ExportCommitCoordinator:
             )
             if not dataset.is_dir():
                 raise ExportCommitError("committed dataset is unavailable")
-            shutil.rmtree(rollback)
-            self.database.update_repair_parent_baselines(
-                self.job_id,
-                self._repair_parent_baselines(dataset),
-            )
-            self.database.resolve_repaired_parent_issues(self.job_id)
-            # A committed journal is resolved, so the task-local overlay is no longer needed for recovery.
-            self.layout.discard()
-            self.database.clear_workspace_metadata(self.job_id)
+            # Everything below runs after the irreversible directory switch, so a
+            # failure here must never turn a committed dataset into a failed job.
+            # Cleanup is therefore best effort and the terminal status is written
+            # first, before any bookkeeping that could raise.
             self.database.set_job_status(
                 self.job_id, "succeeded_with_issues" if unlabeled > 0 else "succeeded", current_module_id="export",
             )
+            shutil.rmtree(rollback, ignore_errors=True)
+            try:
+                self.database.update_repair_parent_baselines(
+                    self.job_id,
+                    self._repair_parent_baselines(dataset),
+                )
+                self.database.resolve_repaired_parent_issues(self.job_id)
+            except Exception:
+                # Parent bookkeeping is retried by the next repair commit; the
+                # exported dataset itself is already correct on disk.
+                pass
+            try:
+                # A committed journal is resolved, so the task-local overlay is no
+                # longer needed for recovery.
+                self.layout.discard()
+                self.database.clear_workspace_metadata(self.job_id)
+            except Exception:
+                pass
             return ExportCommitResult(exported, backup, unlabeled, unlabeled_folder)
         except Exception as exc:
             restored = False

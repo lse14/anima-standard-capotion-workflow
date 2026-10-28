@@ -7,13 +7,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 MAX_NL_BYTES = 16_384
 MAX_RESPONSE_BODY_BYTES = 1_048_576
+# Snippets that are unambiguous refusal wording. Words like "moderation" or
+# "content policy" also occur in ordinary descriptions of screenshots and posters,
+# so they are matched only inside a refusing sentence by REFUSAL_PATTERN below.
 REFUSAL_SNIPPETS = (
     "no image was provided", "i cannot analyze images", "i can't analyze images",
     "i cannot assist with that", "i can't assist with that", "i cannot help with that",
     "i can't help with that", "i cannot generate", "i can't generate",
     "i am unable to help", "i'm unable to help", "as an ai language model",
-    "content policy", "content_policy", "request was blocked", "request has been blocked",
-    "request was rejected", "moderation", "policy violation",
+    "content_policy", "request was blocked", "request has been blocked",
+    "request was rejected",
 )
 # F29: third-party proxies answer HTTP 200 with localized or custom moderation text.
 REFUSAL_PATTERN = re.compile("|".join((
@@ -26,10 +29,16 @@ REFUSAL_PATTERN = re.compile("|".join((
     r"(?:已)?被(?:拦截|屏蔽|拒绝)",
     r"敏感(?:词|内容|信息)",
     r"请求(?:被)?(?:拒绝|拦截|屏蔽)",
+    # Refusal wording that names moderation only when the sentence refuses.
+    r"(?:cannot|can't|can not|unable to|won't|will not|not allowed to|not permitted to)"
+    r"[^\n]{0,48}?(?:content policy|moderation|policy violation|safety guidelines|filter)",
+    r"(?:content policy|moderation policy|policy violation|safety guidelines)"
+    r"[^\n]{0,24}?(?:does not allow|do not allow|prohibits|forbids|blocks|prevent)",
 )))
 TRAILING_CONNECTORS = frozenset({"and", "or", "with", "of", "the", "a", "an", "to", "for", "in", "on", "at", "by", "from"})
 OBSERVATION_COUNTS = frozenset({"solo", "duo", "trio", "group", "unknown"})
 OBSERVATION_LAYOUTS = frozenset({"single_scene", "multi_view", "character_sheet", "multi_panel", "unknown"})
+MOSS_BORDER_DIRECTIONS = frozenset({"left", "right", "up", "down"})
 # F25: weak prompts return the caption wrapped in code fences, labels, quotes or emphasis.
 CODE_FENCE = re.compile(r"^```[^\n`]*\n(?P<body>.*?)\n?```$", re.DOTALL)
 STRUCTURED_CODE_FENCE = re.compile(r"^```(?:json)?\s*\n(?P<body>.*?)\n?```$", re.IGNORECASE | re.DOTALL)
@@ -193,6 +202,68 @@ def validate_completion_response_v2(
         "notRequestedReason": None,
     }
     return nl, observation, request_id, summary
+
+
+def _validate_moss_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise NlValidationError(f"MOSS {field} is empty or exceeds its limit")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise NlValidationError(f"MOSS {field} is empty or exceeds its limit") from exc
+    if size > MAX_NL_BYTES:
+        raise NlValidationError(f"MOSS {field} is empty or exceeds its limit")
+    return value
+
+
+def validate_completion_response_moss(
+    body: bytes,
+) -> tuple[dict[str, object], str | None, dict[str, int]]:
+    content, request_id, summary = _completion_parts(body)
+    value = _strict_object(_strip_structured_code_fence(content))
+    if set(value) != {"caption", "watermark", "borders"} or not isinstance(value["caption"], dict):
+        raise NlValidationError("MOSS response fields are invalid")
+    caption = value["caption"]
+    if set(caption) != {"long", "medium", "short"}:
+        raise NlValidationError("MOSS caption fields are invalid")
+    normalized_caption = {
+        key: _validate_moss_text(caption[key], f"caption.{key}")
+        for key in ("long", "medium", "short")
+    }
+    watermark = value["watermark"]
+    if not isinstance(watermark, list) or len(watermark) > 1024:
+        raise NlValidationError("MOSS watermark is invalid")
+    normalized_watermark: list[dict[str, object]] = []
+    for index, entry in enumerate(watermark):
+        if not isinstance(entry, dict) or set(entry) != {"box_2d", "label"}:
+            raise NlValidationError(f"MOSS watermark[{index}] is invalid")
+        box = entry["box_2d"]
+        if (
+            not isinstance(box, list) or len(box) != 4
+            or any(type(coordinate) is not int or not 0 <= coordinate <= 1000 for coordinate in box)
+            or box[0] > box[2] or box[1] > box[3]
+        ):
+            raise NlValidationError(f"MOSS watermark[{index}].box_2d is invalid")
+        label = _validate_moss_text(entry["label"], f"watermark[{index}].label")
+        normalized_watermark.append({"box_2d": box, "label": label})
+    borders = value["borders"]
+    if not isinstance(borders, list) or not borders or len(borders) > 4 or any(not isinstance(direction, str) for direction in borders):
+        raise NlValidationError("MOSS borders are invalid")
+    if borders == ["none"]:
+        normalized_borders = ["none"]
+    elif len(set(borders)) != len(borders) or any(direction not in MOSS_BORDER_DIRECTIONS for direction in borders):
+        raise NlValidationError("MOSS borders are invalid")
+    else:
+        normalized_borders = list(borders)
+    normalized = {"caption": normalized_caption, "watermark": normalized_watermark, "borders": normalized_borders}
+    serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    try:
+        serialized_size = len(serialized.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise NlValidationError("MOSS response contains invalid Unicode") from exc
+    if serialized_size > MAX_NL_BYTES:
+        raise NlValidationError("MOSS response exceeds its limit")
+    return normalized, request_id, summary
 
 
 def _unwrap(text: str) -> str:

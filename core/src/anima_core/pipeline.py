@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .contracts import (
+    NL_MOSS_PROMPT_VERSION,
     SampleIssue,
     job_config_supports_ocr_device,
     job_config_supports_token_budget,
@@ -16,7 +17,7 @@ from .contracts import (
     sha256_json,
 )
 from .count_review_service import CountReviewService
-from .credentials import DpapiCredentialStore
+from .credentials import CredentialStoreError, DpapiCredentialStore
 from .db import StateDatabase
 from .db_primitives import repair_target_clause
 from .export_commit import ExportCommitCoordinator
@@ -28,7 +29,7 @@ from .overlay import BaselineView, OverlayLayout, WorkingAnnotationView
 from .pipeline_dispatch import PipelineDispatchMixin, PipelineError, _RUNTIMES
 from .pipeline_recovery import PipelineRecoveryMixin
 from .resource_catalog import ResourceCatalog, default_resource_library_root
-from .scheduler import BoundedScheduler, SchedulerError
+from .scheduler import FINAL_MODULE_STATUSES, BoundedScheduler, SchedulerError
 from .stdio_transport import StdioJsonlTransportError
 from .token_budget_overlay import TokenBudgetOverlayError, TokenBudgetOverlayWriter
 
@@ -665,6 +666,12 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
                     return
                 if module_id == "export" and not self._token_budget_export_gate(database, job_id, config):
                     return
+                nl_config = config.get("nl")
+                moss_nl = (
+                    isinstance(nl_config, dict)
+                    and nl_config.get("enabled") is True
+                    and nl_config.get("promptVersion") == NL_MOSS_PROMPT_VERSION
+                )
                 section = config.get("countReview" if module_id == "count_review" else "tokenBudget" if module_id == "token_budget" else module_id)
                 if module_id == "export":
                     if not isinstance(section, dict) or section.get("format") not in {"json", "flat_txt", "both"}:
@@ -678,30 +685,41 @@ class PipelineService(PipelineRecoveryMixin, PipelineDispatchMixin):
                         children = (section.get("artist"), section.get("quality"), section.get("appearanceNl"))
                         if any(not isinstance(child, dict) or type(child.get("enabled")) is not bool for child in children):
                             raise PipelineError("frozen dropout subfeature configuration is invalid")
-                        # With no policy action selected, starting the worker would only read and rewrite JSON.
-                        enabled = enabled and any(child["enabled"] for child in children)
+                        # MOSS sidecars are standalone captions and must not be changed by NL dropout.
+                        enabled = enabled and not moss_nl and any(child["enabled"] for child in children)
                 state = scheduler.start_module(job_id, module_id, enabled=enabled)
                 if state == "paused":
                     return
-                if state == "running":
+                if state in FINAL_MODULE_STATUSES:
+                    # Resume after a crash that landed between finish_module() and the
+                    # next module: this module is already done, so move on instead of
+                    # failing the whole task. Export still has to commit its artifacts.
+                    finished = state
+                elif state == "running":
                     summary = database.module_summary(job_id, module_id)
                     if module_id != "export" and int(summary["total"]) == 0:
                         finished = scheduler.finish_module(job_id, module_id)
                     else:
                         finished = self._run_module_with_restarts(database, scheduler, job_id, module_id, config)
-                    if finished in {"paused", "reviewing", "cancelling"}:
-                        if finished == "cancelling" and not database.count_in_flight(job_id):
-                            database.settle_cancellation(job_id)
+                else:
+                    finished = state
+                if finished in {"paused", "reviewing", "cancelling"}:
+                    if finished == "cancelling" and not database.count_in_flight(job_id):
+                        database.settle_cancellation(job_id)
+                    return
+                if module_id == "export":
+                    if finished == "completed_with_issues":
+                        database.set_job_status(job_id, "reviewing", current_module_id="export")
                         return
-                    if module_id == "export":
-                        if finished == "completed_with_issues":
-                            database.set_job_status(job_id, "reviewing", current_module_id="export")
-                            return
-                        job = database.get_job(job_id)
-                        layout = OverlayLayout.open_existing(str(job["overlay_root"]), job_id)
-                        ExportCommitCoordinator(database, layout, job_id=job_id).commit()
-                        database.resolve_repaired_parent_issues(job_id)
-                        return
+                    if finished != "completed":
+                        raise PipelineError(f"Export module did not complete: {finished}")
+                    job = database.get_job(job_id)
+                    if job["status"] != "exporting":
+                        database.set_job_status(job_id, "exporting", current_module_id="export")
+                    layout = OverlayLayout.open_existing(str(job["overlay_root"]), job_id)
+                    ExportCommitCoordinator(database, layout, job_id=job_id).commit()
+                    database.resolve_repaired_parent_issues(job_id)
+                    return
         except Exception:
             job = database.get_job(job_id)
             if job["status"] not in {"cancelled_recoverable", "failed", "succeeded", "succeeded_with_issues"}:

@@ -42,6 +42,9 @@ class RetentionManager:
         rows = list(self.database.connection.execute(
             """SELECT job_id,overlay_root,commit_journal_path FROM jobs
                WHERE status IN ('succeeded','succeeded_with_issues') AND pinned=0
+                 AND NOT EXISTS(
+                     SELECT 1 FROM repair_jobs AS child WHERE child.parent_job_id=jobs.job_id
+                 )
                ORDER BY COALESCE(finished_at,created_at) DESC, job_id DESC"""
         ))
         # A succeeded job with a journal pointer remains protected until its
@@ -72,20 +75,35 @@ class RetentionManager:
         overlays = 0
         logs = 0
         for candidate in self.candidates():
+            # The control record is the only piece that can fail on a constraint,
+            # so it is removed first: a failure here must not leave the overlay
+            # deleted while the record survives and blocks every later startup.
+            try:
+                self.database.delete_job_control_record(candidate.jobId)
+            except (KeyError, ValueError):
+                continue
+            except Exception:
+                # A foreign-key or locking failure must never take the whole
+                # backend down at startup; the record is simply retried later.
+                continue
+            deleted.append(candidate.jobId)
             if candidate.overlayRoot:
                 root = Path(candidate.overlayRoot)
                 if root.exists():
-                    layout = OverlayLayout.open_existing(root, candidate.jobId)
-                    if layout.has_unresolved_journal():
-                        continue
-                    layout.discard()
-                    overlays += 1
+                    try:
+                        OverlayLayout.open_existing(root, candidate.jobId).discard()
+                        overlays += 1
+                    except Exception:
+                        # The record is already gone, so a leftover directory is
+                        # orphaned scratch data and must not fail retention.
+                        pass
             log = self._log_path(candidate.jobId)
             if log is not None and log.exists():
-                log.unlink()
-                logs += 1
-            self.database.delete_job_control_record(candidate.jobId)
-            deleted.append(candidate.jobId)
+                try:
+                    log.unlink()
+                    logs += 1
+                except OSError:
+                    pass
         return RetentionResult(tuple(deleted), overlays, logs)
 
     def _log_path(self, job_id: str) -> Path | None:

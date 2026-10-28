@@ -147,7 +147,7 @@ export type NlApiConfigUpdate = {
   jsonMode?: "prompt_only" | "json_object";
   policy: Record<string, unknown>;
 };
-export type NlPresetType = "general" | "style" | "character";
+export type NlPresetType = "general" | "style" | "character" | "moss-general" | "moss-style" | "moss-character";
 export type NlPromptPresetSummary = {
   presetId: string;
   name: string;
@@ -324,7 +324,9 @@ export function fetchDefaultNlPrompt(promptVersion?: string): Promise<DefaultNlP
 }
 
 export function listNlProfiles(): Promise<{ defaultProfileId: string | null; profiles: NlProfile[] }> { return request("/api/nl/profiles"); }
-export function listNlPromptPresets(): Promise<{ presets: NlPromptPresetSummary[] }> { return request("/api/nl/prompt-presets"); }
+export function listNlPromptPresets(includeMoss = false): Promise<{ presets: NlPromptPresetSummary[] }> {
+  return request(`/api/nl/prompt-presets${includeMoss ? "?includeMoss=true" : ""}`);
+}
 export function getNlPromptPreset(presetId: string): Promise<NlPromptPresetDetail> {
   return request(`/api/nl/prompt-presets/${encodeURIComponent(presetId)}`);
 }
@@ -357,8 +359,23 @@ export function selectLocalPath(purpose: PathPickerPurpose, currentPath: string 
   });
 }
 export function saveNlProfile(profile: NlProfile): Promise<NlProfile> {
-  const { profileId, hasCredential: _hasCredential, ...body } = profile;
-  return request(`/api/nl/profiles/${encodeURIComponent(profileId)}`, { method: "PUT", body: JSON.stringify(body) });
+  // The server body model forbids unknown keys, so response-only fields such as
+  // `updatedAt` and `hasCredential` would make every save fail with a 422.
+  // Whitelist the writable fields instead of spreading the whole profile.
+  const body: Record<string, unknown> = {
+    endpoint: profile.endpoint,
+    model: profile.model,
+    backupModel: profile.backupModel,
+    credentialRef: profile.credentialRef ?? profile.apiCredentialRef,
+    systemPrompt: profile.systemPrompt,
+    policy: profile.policy ?? profile.apiPolicy ?? {},
+  };
+  if (profile.name !== undefined) body.name = profile.name;
+  if (profile.protocol !== undefined) body.protocol = profile.protocol;
+  if (profile.providerLabel !== undefined) body.providerLabel = profile.providerLabel;
+  if (profile.jsonMode !== undefined) body.jsonMode = profile.jsonMode;
+  if (profile.revision !== undefined) body.revision = profile.revision;
+  return request(`/api/nl/profiles/${encodeURIComponent(profile.profileId)}`, { method: "PUT", body: JSON.stringify(body) });
 }
 export function setNlProfileDefault(profileId: string, revision?: number): Promise<{ defaultProfileId: string }> {
   return request(`/api/nl/profiles/${encodeURIComponent(profileId)}/default`, {

@@ -17,6 +17,7 @@ from .api_models import (
 )
 from .commit_journal import CommitJournalError, load as load_journal
 from .contracts import job_config_supports_ocr_device, pipeline_module_ids
+from .dataset_workspace import DatasetWorkspace
 from .db import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, StateDatabase
 from .export_recommit import ExportRecommitError, ExportRecommitService
 from .export_summary import build_export_summary
@@ -169,6 +170,25 @@ def _preflight_progress_response(database: StateDatabase, job_id: str) -> dict[s
         # Preflight progress is intentionally independent from the event ring.
         "lastEventId": int(job["last_event_id"]),
     }
+
+
+def _annotation_backup_path(job_id: str, dataset: Path) -> Path | None:
+    """Locate the ZIP an Export commit recorded, for both workspace layouts.
+
+    Export writes into the dataset's workspace beside the dataset
+    (``DatasetWorkspace.backup_zip``) for new overlays and into the legacy
+    ``.<dataset>.anima-backups`` sibling for older ones, so both are probed.
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.append(DatasetWorkspace.for_dataset(dataset, must_exist=False).backup_zip(job_id))
+    except (OSError, ValueError):
+        pass
+    candidates.append(dataset.parent / f".{dataset.name}.anima-backups" / f"{job_id}.zip")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
@@ -602,8 +622,8 @@ def build_jobs_router(context: ControlPlaneContext) -> APIRouter:
             except KeyError as exc:
                 raise not_found(exc) from exc
             dataset = Path(str(job["dataset_root"]))
-            backup = dataset.parent / f".{dataset.name}.anima-backups" / f"{job_id}.zip"
-            if job["status"] not in {"succeeded", "succeeded_with_issues"} or not backup.is_file():
+            backup = _annotation_backup_path(job_id, dataset)
+            if job["status"] not in {"succeeded", "succeeded_with_issues"} or backup is None:
                 raise bad_request(ValueError("only a completed task with its annotation backup can restore originals"))
             # A committed task no longer owns an overlay, so restoration carries its own
             # one-shot overlay for the commit journal (ROADMAP.md:1056).

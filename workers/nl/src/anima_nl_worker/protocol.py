@@ -13,13 +13,27 @@ MAX_OCR_CONTEXT_ITEMS = 1024
 MAX_OCR_TEXT_BYTES = 16_384
 MAX_USER_SUPPLEMENT_BYTES = 16_384
 MAX_CHARACTER_NAME_BYTES = 512
-CAPTION_PRESETS = frozenset({"general", "style", "character"})
+CAPTION_PRESETS = frozenset({"general", "style", "character", "moss-general", "moss-style", "moss-character"})
+MOSS_CAPTION_PRESETS = frozenset({"moss-general", "moss-style", "moss-character"})
 LENGTH_TIERS = frozenset({"short", "medium", "long"})
 OCR_POSITIONS = frozenset({
     "top-left", "top-center", "top-right",
     "middle-left", "middle-center", "middle-right",
     "bottom-left", "bottom-center", "bottom-right",
 })
+
+
+def bounded_message(message: str, limit: int = 1_024) -> str:
+    """Truncate an error message to the parent's UTF-8 byte limit.
+
+    The core validates `message` by encoded byte length, while slicing a Python
+    string counts characters. Text with three-byte characters would therefore
+    pass the slice and still be rejected, which fails a whole worker batch.
+    """
+    raw = message.encode("utf-8")
+    if len(raw) <= limit:
+        return message
+    return raw[:limit].decode("utf-8", errors="ignore")
 
 
 class NlProtocolError(ValueError):
@@ -138,14 +152,16 @@ def parse_hello(value: object) -> NlHelloV1:
     if item["schemaVersion"] != 1 or item["payloadType"] != "nl_hello_request":
         raise NlProtocolError("nl hello identity is invalid")
     response_protocol = item.get("responseProtocol", "nl-v1")
-    if response_protocol not in {"nl-v1", "nl-count-v2"} or (
+    if response_protocol not in {"nl-v1", "nl-count-v2", "nl-moss-v1"} or (
         response_protocol == "nl-v1" and "responseProtocol" in item
     ):
         raise NlProtocolError("NL response protocol is invalid")
     prompt_version = item.get("promptVersion")
     if prompt_version is not None and (
-        response_protocol != "nl-count-v2"
-        or prompt_version not in {"nl-default-prompt-v3", "nl-default-prompt-v4"}
+        response_protocol not in {"nl-count-v2", "nl-moss-v1"}
+        or prompt_version not in {"nl-default-prompt-v3", "nl-default-prompt-v4", "nl-default-prompt-moss-v1"}
+        or (response_protocol == "nl-moss-v1" and prompt_version != "nl-default-prompt-moss-v1")
+        or (response_protocol == "nl-count-v2" and prompt_version == "nl-default-prompt-moss-v1")
     ):
         raise NlProtocolError("NL prompt version is invalid")
     protocol = item.get("protocol", "openai_chat_completions")
@@ -226,9 +242,9 @@ def parse_process(value: object) -> tuple[tuple[NlWorkItemV1, ...], int]:
             primary_character_name = work["primaryCharacterName"]
             if primary_character_name is not None:
                 primary_character_name = _string(primary_character_name, "primaryCharacterName", MAX_CHARACTER_NAME_BYTES)
-            if caption_preset == "character" and primary_character_name is None:
+            if caption_preset in {"character", "moss-character"} and primary_character_name is None:
                 raise NlProtocolError("character preset requires primaryCharacterName")
-            if caption_preset != "character" and primary_character_name is not None:
+            if caption_preset not in {"character", "moss-character"} and primary_character_name is not None:
                 raise NlProtocolError("non-character preset must not include primaryCharacterName")
             user_supplement = _string(work["userSupplement"], "userSupplement", MAX_USER_SUPPLEMENT_BYTES, blank=True)
         parsed.append(NlWorkItemV1(
@@ -252,27 +268,35 @@ def parse_process(value: object) -> tuple[tuple[NlWorkItemV1, ...], int]:
 def process_result(
     item: NlWorkItemV1,
     *,
-    nl: str,
+    nl: str | None = None,
+    moss: dict[str, object] | None = None,
     request_id: str | None,
     usage: dict[str, int],
     http_attempts: int,
     observation: dict[str, object] | None = None,
 ) -> dict[str, Any]:
+    if (nl is None) == (moss is None):
+        raise NlProtocolError("NL result must contain exactly one output")
+    if moss is not None and observation is not None:
+        raise NlProtocolError("MOSS result must not contain an NL count observation")
     result: dict[str, Any] = {
         "schemaVersion": 1,
-        "payloadType": "nl_result" if observation is None else "nl_result_v2",
+        "payloadType": "nl_moss_result" if moss is not None else "nl_result" if observation is None else "nl_result_v2",
         "sampleId": item.sampleId,
         "leaseId": item.leaseId,
         "relativeImagePath": item.relativeImagePath,
-        "nl": nl,
         "requestId": request_id,
         "usage": usage,
         "httpAttempts": http_attempts,
     }
+    if moss is not None:
+        result["moss"] = moss
+    else:
+        result["nl"] = nl
     if observation is not None:
         result["observation"] = observation
     return result
 
 
 def process_issue(item: NlWorkItemV1, code: str, message: str, *, retriable: bool, http_attempts: int = 0) -> dict[str, Any]:
-    return {"schemaVersion": 1, "payloadType": "nl_issue", "sampleId": item.sampleId, "leaseId": item.leaseId, "relativeImagePath": item.relativeImagePath, "code": code, "severity": "error", "blocking": True, "retriable": retriable, "message": message[:1024], "httpAttempts": http_attempts}
+    return {"schemaVersion": 1, "payloadType": "nl_issue", "sampleId": item.sampleId, "leaseId": item.leaseId, "relativeImagePath": item.relativeImagePath, "code": code, "severity": "error", "blocking": True, "retriable": retriable, "message": bounded_message(message), "httpAttempts": http_attempts}

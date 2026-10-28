@@ -126,9 +126,10 @@ class ManifestBuilder:
                         raise ManifestCancelled()
                     path = Path(entry.path)
                     if entry.is_dir(follow_symlinks=False):
-                        if entry.name in {".mikazuki-cache", ".anima-idg"} or (
-                            current == root and entry.name == "_unlabeled"
-                        ):
+                        # `_unlabeled` is where an earlier Export put images it could
+                        # not label. Scanning into it would re-import those images as
+                        # new samples, so it is skipped at every depth.
+                        if entry.name in {".mikazuki-cache", ".anima-idg", "_unlabeled"}:
                             continue
                         directories.append((path, is_scope and self.recursive))
                         continue

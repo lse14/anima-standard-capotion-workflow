@@ -67,4 +67,10 @@ class AnnotationRestoreCoordinator:
                     restore_rollback(dataset, rollback)
             except (DirectoryCommitError, OSError):
                 pass
+            # The staging tree is a full hard-link mirror of the dataset, so leaving
+            # it behind wastes a directory entry per sample and makes every retry
+            # fail on `annotation restore workspace already exists`. It is only kept
+            # when the dataset itself still has to be rebuilt from the rollback.
+            if dataset.is_dir() and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
             raise AnnotationRestoreError("annotation restore failed") from exc

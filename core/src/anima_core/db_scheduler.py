@@ -378,7 +378,9 @@ class SchedulerDatabaseMixin:
         predicate = ""
         if lease_ids is not None:
             bounded = list(lease_ids)
-            if len(bounded) > MAX_PAGE_SIZE:
+            # OCR may lease up to 1024 samples per batch, which exceeds the generic
+            # page bound, so the heartbeat tolerates that module's own ceiling.
+            if len(bounded) > MAX_LEASE_BOUND:
                 raise ValueError("heartbeat lease list is unbounded")
             if not bounded:
                 return 0
@@ -1066,6 +1068,22 @@ class SchedulerDatabaseMixin:
         )
         if result.rowcount != 1:
             raise ValueError("job is not in a cancellable state")
+
+    def abandon_cancellation_work(self, job_id: str) -> int:
+        """Drop the in-flight sample rows a dead process left behind during cancellation.
+
+        A restart has no worker left to finish or release those rows, and
+        `settle_cancellation` only accepts an empty in-flight set, so the job would
+        otherwise stay `cancelling` forever while it still held its dataset claim.
+        """
+        result = self.connection.execute(
+            """UPDATE sample_state SET status='pending',lease_id=NULL,worker_instance_id=NULL,
+               lease_expires_at=NULL,prepared_artifact_relative_path=NULL,
+               prepared_artifact_sha256=NULL,updated_at=?
+               WHERE job_id=? AND status IN ('leased','prepared','request_started','response_staged')""",
+            (utc_now(), job_id),
+        )
+        return result.rowcount
 
     def settle_cancellation(self, job_id: str, *, succeeded: bool = False) -> None:
         if self.count_in_flight(job_id):

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .db import StateDatabase
-from .overlay import OverlayLayout
+from .overlay import OverlayError, OverlayLayout
 from .state_machine import can_discard, require_discard_confirmation
 
 
@@ -90,10 +90,18 @@ class JobLifecycle:
             current = self.database.get_job(job_id)
             if not can_discard(str(current["status"]), journal_state=journal_state):
                 raise JobLifecycleError("job cannot be discarded before recovery and journal resolution")
-            if layout is not None:
-                layout.discard()
-                overlay_deleted = True
             self.database.set_job_status(job_id, "discarded")
             # A discarded job can never run again, so it must stop claiming its dataset.
             self.database.release_dataset_claim(job_id)
+        # The overlay is unrecoverable once deleted, so it is removed only after the
+        # control record is durable. A leftover directory is orphaned scratch data;
+        # deleting it first would leave the job inconsistent when the commit failed.
+        if layout is not None:
+            # Best effort: the job is already discarded, so a leftover overlay
+            # directory is harmless scratch data rather than a failed discard.
+            try:
+                layout.discard()
+                overlay_deleted = True
+            except (OSError, OverlayError):
+                overlay_deleted = False
         return DiscardResult(job_id, overlay_deleted)

@@ -413,6 +413,9 @@ function Assert-Manifest([object]$Manifest) {
     if ([Int64](Get-RequiredProperty $bootstrap 'peakBytes' 'bootstrap') -le 0) { Stop-ReleaseGate 'bootstrap peakBytes is invalid' }
 
     $mandatory = @('core', 'caption-e621', 'classify-e621', 'replace-e621', 'nl', 'export', 'token-budget', 'e621-indexes', 'e621-replacement-indexes', 'e621-tagger', 'qwen3-tokenizer')
+    # The optional OCR runtime and models, the policy scorer and the quality
+    # stack may be absent from a valid release; when present they must not
+    # claim to be mandatory.
     $optionalComponents = @('ocr-cpu', 'ocr-gpu', 'ocr-models', 'policy', 'quality-stack')
     $components = @($Manifest.components)
     if ($components.Count -eq 0) { Stop-ReleaseGate 'install manifest has no components' }

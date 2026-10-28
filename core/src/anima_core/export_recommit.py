@@ -286,11 +286,15 @@ class ExportRecommitService:
             "cleanupSafe": cleanup_safe,
         }
 
-    def _build_preview(self, database: StateDatabase, job_id: str) -> dict[str, object]:
+    def _build_preview(
+        self, database: StateDatabase, job_id: str, *, persist_child_baselines: bool = False,
+    ) -> dict[str, object]:
         context = self._context(database, job_id)
         # A successful nested repair may have committed a subset of this task's
         # targets first. Advance only the parent baselines covered by those
         # persisted child links before validating the outer Export overlay.
+        # The same fingerprints are computed for a read-only preview; persisting
+        # them is the recommit's job, so a GET never writes the database.
         for child in database.repair_children(job_id):
             if str(child["status"]) not in {"succeeded", "succeeded_with_issues"}:
                 continue
@@ -298,7 +302,8 @@ class ExportRecommitService:
             fingerprints = ExportCommitCoordinator(
                 database, context.layout, job_id=child_job_id,
             )._repair_parent_baselines(context.dataset)
-            database.update_repair_parent_baselines(child_job_id, fingerprints)
+            if persist_child_baselines:
+                database.update_repair_parent_baselines(child_job_id, fingerprints)
         inventory = _scan_inventory(
             context.journal.staging_root,
             max_entries=self.max_inventory_entries,
@@ -382,7 +387,7 @@ class ExportRecommitService:
             database = StateDatabase.open(self.database_path)
             try:
                 context = self._context(database, job_id)
-                final_check = self._build_preview(database, job_id)
+                final_check = self._build_preview(database, job_id, persist_child_baselines=True)
                 if final_check["inventoryFingerprint"] != inventory_fingerprint:
                     raise ExportRecommitError("fingerprint_conflict", "inventory fingerprint changed before cleanup")
                 stage = context.journal.staging_root

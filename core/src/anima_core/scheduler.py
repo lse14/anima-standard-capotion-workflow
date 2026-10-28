@@ -220,6 +220,11 @@ class BoundedScheduler:
                 resume_status="exporting" if module_id == "export" else "running",
             )
             return "paused"
+        # A crash between finish_module() and the next start_module() leaves the
+        # module in a terminal state while the job still points at it. Report that
+        # state instead of asking the state machine for an illegal re-transition.
+        if summary["status"] in FINAL_MODULE_STATUSES:
+            return str(summary["status"])
         if summary["status"] == "running":
             expected_job_status = "exporting" if module_id == "export" else "running"
             if job["current_module_id"] == module_id and job["status"] == expected_job_status:

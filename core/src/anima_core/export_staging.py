@@ -2,8 +2,10 @@
 from __future__ import annotations
 import os, shutil
 from pathlib import Path
+from .moss_sidecar import MossSidecarError, parse_moss_json
 from .ocr_sidecar import OcrSidecarError, ocr_sidecar_relative_path, parse_ocr_sidecar
-from .path_safety import PathSafetyError, assert_no_reparse_tree, atomic_write_bytes, canonicalize, ensure_within, image_format, safe_relative_path
+from .overlay import MOSS_ANNOTATIONS_DIRECTORY
+from .path_safety import PathSafetyError, assert_no_reparse_tree, atomic_write_bytes, canonicalize, ensure_within, image_format, long_path, safe_relative_path
 
 class StagingError(RuntimeError): pass
 
@@ -40,7 +42,7 @@ def create_hardlink_staging(dataset_root:str|Path,staging_root:str|Path)->Path:
                 for entry in entries:
                     source_path=Path(entry.path);target_path=ensure_within(staging, target/entry.name)
                     if entry.is_dir(follow_symlinks=False):target_path.mkdir();stack.append((source_path,target_path))
-                    elif entry.is_file(follow_symlinks=False):os.link(source_path,target_path)
+                    elif entry.is_file(follow_symlinks=False):os.link(long_path(source_path),long_path(target_path))
                     else:raise StagingError(f"unsupported filesystem entry: {source_path}")
     except Exception:
         shutil.rmtree(staging,ignore_errors=True);raise
@@ -72,3 +74,22 @@ def replace_ocr_sidecar(staging_root: str | Path, relative_image_path: str, data
         return atomic_write_bytes(root, relative, data)
     except (OcrSidecarError, PathSafetyError) as exc:
         raise StagingError("OCR sidecar staging input is invalid") from exc
+
+
+def replace_moss_sidecar(staging_root: str | Path, relative_image_path: str, data: bytes) -> Path:
+    """Atomically replace one MOSS JSON sidecar in the export staging tree."""
+    try:
+        image_format(relative_image_path)
+        relative = safe_relative_path(f"{MOSS_ANNOTATIONS_DIRECTORY}\\{relative_image_path}.moss.json")
+        root = canonicalize(staging_root, must_exist=True, directory=True).value
+        target = ensure_within(root, root / Path(relative.replace("\\", os.sep)))
+        if target.is_symlink():
+            raise StagingError("MOSS staging sidecar path is a symbolic link")
+        if target.exists():
+            canonicalize(target, must_exist=True, directory=False)
+        if not isinstance(data, bytes) or not data:
+            raise StagingError("MOSS staging sidecar is empty")
+        parse_moss_json(data)
+        return atomic_write_bytes(root, relative, data)
+    except (MossSidecarError, PathSafetyError) as exc:
+        raise StagingError("MOSS sidecar staging path is invalid") from exc

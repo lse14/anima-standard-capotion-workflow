@@ -41,8 +41,15 @@ def prepare_dataset(
         raise ValueError("unsafe jobId")
     staging = output.value.parent / f".{output.value.name}.anima-copy-{safe_job}"
     ensure_within(output.value.parent, staging)
+    discarded_path = output.value.with_name(output.value.name + ".anima-empty")
+    # A crash during the publish step can leave a staging tree or emptied
+    # placeholder behind. Both are discardable scratch: publishing only ever
+    # requires an absent or empty output directory, so the copy restarts cleanly
+    # instead of failing forever on `copy staging already exists`.
     if staging.exists():
-        raise FileExistsError(f"copy staging already exists: {staging}")
+        shutil.rmtree(staging, ignore_errors=True)
+    if discarded_path.exists():
+        shutil.rmtree(discarded_path, ignore_errors=True)
     staging.mkdir()
     files = 0
     total_bytes = 0
@@ -75,8 +82,16 @@ def prepare_dataset(
         if output.value.exists():
             if any(output.value.iterdir()):
                 raise OSError("output changed and is no longer empty")
-            output.value.rmdir()
+            # Move the emptied placeholder aside instead of deleting it, so the
+            # publish step below is a single atomic rename. A crash between an
+            # rmdir and the replace would otherwise leave no output directory and
+            # a stranded staging tree that blocks every later attempt.
+            if discarded_path.exists():
+                shutil.rmtree(discarded_path, ignore_errors=True)
+            os.replace(output.value, discarded_path)
         os.replace(staging, output.value)
+        if discarded_path.exists():
+            shutil.rmtree(discarded_path, ignore_errors=True)
     except Exception:
         for _, _, entries in reversed(stack):
             try:
@@ -84,6 +99,6 @@ def prepare_dataset(
             except OSError:
                 pass
         if staging.exists():
-            shutil.rmtree(staging)
+            shutil.rmtree(staging, ignore_errors=True)
         raise
     return CopyResult(output.value, files, total_bytes, True)

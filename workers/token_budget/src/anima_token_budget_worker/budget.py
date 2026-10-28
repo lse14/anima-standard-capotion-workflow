@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
 from anima_caption_format import normalize_annotation, serialize_flat_txt
+from anima_caption_format.flat_txt import FlatTextSerializationError
 from anima_caption_format.normalizer import CaptionDisplayPolicy
 
 
@@ -80,7 +81,20 @@ def fit(
         candidates: list[tuple[int, dict[str, object], bytes]] = []
         for keep in range(len(values), -1, -1):
             candidate = {**current, field: values[:keep]}
-            candidates.append((keep, candidate, serialize_flat_txt(candidate, policy)))
+            try:
+                candidates.append((keep, candidate, serialize_flat_txt(candidate, policy)))
+            except FlatTextSerializationError:
+                # Dropping the last remaining field can leave nothing to serialize.
+                # That keep is simply not a usable candidate; it must not abort a
+                # trim that a larger keep still satisfies.
+                continue
+            if keep == 0:
+                # keep=0 is the most aggressive trim; smaller keeps cannot exist.
+                break
+        if not candidates:
+            current = {**current, field: []}
+            removed[field] = values
+            continue
         counts = _counts(count_many, [candidate[2] for candidate in candidates])
         fitting = [(candidate, count) for candidate, count in zip(candidates, counts) if count <= max_tokens]
         if fitting:
@@ -89,5 +103,8 @@ def fit(
             return FitResult("trimmed", original, final, removed, current)
         current = {**current, field: []}
         removed[field] = values
-    final = _counts(count_many, [serialize_flat_txt(current, policy)])[0]
+    try:
+        final = _counts(count_many, [serialize_flat_txt(current, policy)])[0]
+    except FlatTextSerializationError:
+        return FitResult("overflow", original, original, removed, None)
     return FitResult("overflow", original, final, removed, None)

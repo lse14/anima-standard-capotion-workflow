@@ -39,6 +39,13 @@ ExportRecoveryKind = Literal["manual_recommit", "automatic_switch_recovery", "re
 def classify_export_recovery(journal: CommitJournal) -> ExportRecoveryKind:
     """Classify directory recovery without changing any filesystem state."""
     if journal.state in {"prepared", "declared", "staging", "staged", "backup_verified"}:
+        # The dataset is renamed to the rollback path one statement before the
+        # journal records `rollback_created`. When a crash lands in that window the
+        # dataset is absent and its full old copy sits in the rollback directory, so
+        # the journal's own `recover()` can put it back; asking the user for a
+        # recommit there would refuse because a rollback directory exists.
+        if not journal.dataset_root.exists() and journal.rollback_root.exists():
+            return "automatic_switch_recovery"
         return "manual_recommit"
     if journal.state in {"rollback_created", "rollback_required"}:
         return "automatic_switch_recovery"
@@ -150,7 +157,19 @@ class PipelineRecoveryMixin:
                 if not page:
                     break
                 for row in page:
-                    database.mark_interrupted(str(row["job_id"]))
+                    job_id_value = str(row["job_id"])
+                    if str(row["status"]) == "cancelling":
+                        # No worker survives a restart, so the leases it held can never
+                        # be released and the job could never finish cancelling.
+                        database.abandon_cancellation_work(job_id_value)
+                        if not database.count_in_flight(job_id_value):
+                            try:
+                                # Nothing is left to drain, so finish the cancellation
+                                # instead of parking the job in a state no action accepts.
+                                database.settle_cancellation(job_id_value)
+                            except ValueError:
+                                pass
+                    database.mark_interrupted(job_id_value)
                     interrupted += 1
                 cursor = str(page[-1]["job_id"])
             claims = database.clear_stale_dataset_claims()
@@ -309,10 +328,13 @@ class PipelineRecoveryMixin:
                 target_status = self._recovery_target_status(module_id)
                 if not isinstance(resume_status, str):
                     raise PipelineError("interrupted job has no recoverable worker state")
+                # A module that finished with issues moves the job to `reviewing`
+                # before the crash, so that persisted status is a legal resume target
+                # for every module and not only the review-owned ones.
                 allowed_resume_statuses = (
                     {"running", "reviewing"}
                     if module_id in {"count_review", "token_budget"}
-                    else {target_status}
+                    else {target_status, "reviewing"}
                 )
                 if resume_status not in allowed_resume_statuses:
                     raise PipelineError("persisted recovery target is incompatible with current module")
