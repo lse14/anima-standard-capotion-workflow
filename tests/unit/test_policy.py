@@ -121,14 +121,16 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual("", result["artist"])
 
     def test_quality_boundaries_cover_the_frozen_one_to_five_range(self) -> None:
+        # Tiers are cut on the score plus the shared +0.5 offset, so each
+        # boundary sits half a point below the round numbers.
         cases = (
             (1.0, ["low quality"]),
-            (2.0, ["low quality"]),
-            (2.01, ["normal quality"]),
-            (3.0, ["normal quality"]),
-            (3.01, ["good quality"]),
-            (4.0, ["good quality"]),
-            (4.01, ["masterpiece", "best quality"]),
+            (1.5, ["low quality"]),
+            (1.51, ["normal quality"]),
+            (2.5, ["normal quality"]),
+            (2.51, ["good quality"]),
+            (3.5, ["good quality"]),
+            (3.51, ["masterpiece", "best quality"]),
             (5.0, ["masterpiece", "best quality"]),
         )
         for score, expected in cases:

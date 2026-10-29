@@ -242,7 +242,7 @@ class JobConfig:
         if job_config_supports_token_budget(self.schemaVersion) and self.tokenBudget is None:
             object.__setattr__(self, "tokenBudget", {
                 "enabled": True,
-                "maxTokens": 512,
+                "maxTokens": 490,
                 "resourceId": "tokenizer-qwen3-0.6b-anima-v1",
             })
         if job_config_supports_caption_input_txt_mode(self.schemaVersion) and isinstance(self.caption, dict):

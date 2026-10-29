@@ -140,7 +140,7 @@ Export 的成功终态分为 `succeeded` 和 `succeeded_with_issues`。两者都
 
 ## Token Budget
 
-Tokenizer 导入 preview by default。支持 `Qwen/Qwen3-0.6B` 和 `Qwen/Qwen3-VL-4B-Instruct`。Token Budget validation is enabled by default；`maxTokens defaults to `512`，范围为 `1..selected resource.contextLimit`，not linked to `nl.apiPolicy.maxTokens`。Disabling Token Budget validation does not guarantee the training token limit。
+Tokenizer 导入 preview by default。支持 `Qwen/Qwen3-0.6B` 和 `Qwen/Qwen3-VL-4B-Instruct`。Token Budget validation is enabled by default；`maxTokens defaults to `490`，范围为 `1..selected resource.contextLimit`，not linked to `nl.apiPolicy.maxTokens`。Disabling Token Budget validation does not guarantee the training token limit。
 
 NL 预设提供 `general`, `style`, and `character`，以及 stable short/medium/long selection，对应 `2-3`, `4-5`, and `6-8` sentences。超限时进入 overflow review page，由用户执行 edit, recount, `rewrite-short`, and `apply`；这些是 explicit user action，may incur NL API usage。proposal does not change the final JSON until `apply`，并 never automatically loops rewrites。
 

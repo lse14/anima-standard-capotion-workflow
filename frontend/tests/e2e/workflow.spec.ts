@@ -83,7 +83,7 @@ function expectedE621Draft(sourceRoot: string, systemPrompt: string): Record<str
         unknown: { dropNl: 0.15, dropAppearance: 0.15 },
       },
     },
-    tokenBudget: { enabled: true, maxTokens: 512, resourceId: "tokenizer-qwen3-0.6b-anima-v1" },
+    tokenBudget: { enabled: true, maxTokens: 490, resourceId: "tokenizer-qwen3-0.6b-anima-v1" },
     export: { format: "both" },
   };
 }

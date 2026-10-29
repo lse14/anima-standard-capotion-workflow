@@ -142,7 +142,7 @@ test.describe("workflow guidance for remaining modules", () => {
     await openApp(page, { language: "en" });
     await page.locator(".workflow-rail").getByRole("button", { name: /Token Budget/ }).click();
     await page.getByRole("button", { name: "Maximum training tokens information" }).click();
-    await expect(page.getByRole("tooltip")).toContainText("Default: 512");
+    await expect(page.getByRole("tooltip")).toContainText("Default: 490");
     await expect(page.getByRole("tooltip")).toContainText("Range: 1-40960");
     const tokenizerInfo = page.getByRole("button", { name: "Tokenizer resource information" });
     await tokenizerInfo.click();

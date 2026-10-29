@@ -198,7 +198,7 @@ export function newDraft(): Draft {
       artist: { enabled: true, dropoutProbability: 0, addAtPrefix: true }, quality: { enabled: true, dropoutProbability: 0, device: "auto", batchSize: 4, resourceId: "lse14-scorer-5k-v1" },
       appearanceNl: { enabled: true, solo: { dropNl: 0.7, dropAppearance: 0.05 }, nonSolo: { dropNl: 0.05, dropAppearance: 0.7 }, unknown: { dropNl: 0.15, dropAppearance: 0.15 } },
     },
-    tokenBudget: { enabled: true, maxTokens: 512, resourceId: "tokenizer-qwen3-0.6b-anima-v1" },
+    tokenBudget: { enabled: true, maxTokens: 490, resourceId: "tokenizer-qwen3-0.6b-anima-v1" },
     export: { format: "both" },
   };
 }

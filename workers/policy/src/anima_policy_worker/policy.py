@@ -126,12 +126,20 @@ def merge_artists(existing: str, appended: str) -> str:
     return ", ".join(values)
 
 
+# The bundled LSE14 scorer runs pessimistic against real training sets: its 1-5
+# scale lands most usable images in the middle tiers. Shift the raw score up by
+# this offset before tiering so the tiers match how the dataset is actually
+# judged, then clamp at the scale maximum.
+AESTHETIC_SCORE_OFFSET = 0.5
+
+
 def quality_for_score(score: float) -> list[str]:
     if isinstance(score, bool) or not isinstance(score, (int, float)):
         raise PolicyError("aesthetic score must be numeric")
     value = float(score)
     if not math.isfinite(value) or not 1.0 <= value <= 5.0:
         raise PolicyError("aesthetic score must be finite and between 1 and 5")
+    value = min(5.0, value + AESTHETIC_SCORE_OFFSET)
     quantized = math.ceil(value * 2.0)
     if quantized <= 4:
         return ["low quality"]

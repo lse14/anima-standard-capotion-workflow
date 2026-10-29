@@ -31,7 +31,7 @@ test.describe("v10 Token Budget configuration", () => {
     const config = (mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: Record<string, unknown> }).config;
     expect(config.schemaVersion).toBe(10);
     expect(config.nl).toMatchObject({ promptVersion: "nl-default-prompt-v4", captionPreset: "style", lengthDistribution: { short: 20, medium: 30, long: 50 }, lengthSeed: "anima-nl-length-v1" });
-    expect(config.tokenBudget).toEqual({ enabled: true, maxTokens: 512, resourceId: "tokenizer-qwen3-0.6b-anima-v1" });
+    expect(config.tokenBudget).toEqual({ enabled: true, maxTokens: 490, resourceId: "tokenizer-qwen3-0.6b-anima-v1" });
     expect(config).not.toHaveProperty("resourceManifestRelativePath");
     expect(config).not.toHaveProperty("resourceFingerprint");
     expect(config).not.toHaveProperty("contextLimit");
@@ -50,7 +50,7 @@ test.describe("v10 Token Budget configuration", () => {
     await openPrecheck(page);
     await page.getByRole("button", { name: "Preflight", exact: true }).click();
     await expect.poll(() => mutationsFor(api, "POST", "/api/jobs/preflight").length).toBe(1);
-    expect((mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: { tokenBudget: unknown } }).config.tokenBudget).toEqual({ enabled: false, maxTokens: 512, resourceId: "tokenizer-qwen3-0.6b-anima-v1" });
+    expect((mutationsFor(api, "POST", "/api/jobs/preflight")[0].body as { config: { tokenBudget: unknown } }).config.tokenBudget).toEqual({ enabled: false, maxTokens: 490, resourceId: "tokenizer-qwen3-0.6b-anima-v1" });
   });
 
   test("uses the selected Krea resource context limit without a browser constant", async ({ page, api }) => {

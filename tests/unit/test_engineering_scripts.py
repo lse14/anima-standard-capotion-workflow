@@ -1539,7 +1539,7 @@ class ReadmeDocumentationTests(unittest.TestCase):
             "Qwen/Qwen3-0.6B",
             "Qwen/Qwen3-VL-4B-Instruct",
             "Token Budget validation is enabled by default",
-            "maxTokens defaults to `512`",
+            "maxTokens defaults to `490`",
             "`1..selected resource.contextLimit`",
             "not linked to `nl.apiPolicy.maxTokens`",
             "Disabling Token Budget validation",
