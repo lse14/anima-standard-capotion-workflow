@@ -17,6 +17,7 @@ from anima_policy_worker.policy import (
     PolicyError,
     apply_policy,
     artist_from_image_path,
+    lift_aesthetic_score,
     quality_for_score,
     stable_random,
 )
@@ -121,16 +122,16 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual("", result["artist"])
 
     def test_quality_boundaries_cover_the_frozen_one_to_five_range(self) -> None:
-        # Tiers are cut on the score plus the shared +0.5 offset, so each
-        # boundary sits half a point below the round numbers.
+        # The tier cuts themselves are frozen; the worker lifts every inferred
+        # score by AESTHETIC_SCORE_OFFSET before it gets here.
         cases = (
             (1.0, ["low quality"]),
-            (1.5, ["low quality"]),
-            (1.51, ["normal quality"]),
-            (2.5, ["normal quality"]),
-            (2.51, ["good quality"]),
-            (3.5, ["good quality"]),
-            (3.51, ["masterpiece", "best quality"]),
+            (2.0, ["low quality"]),
+            (2.01, ["normal quality"]),
+            (3.0, ["normal quality"]),
+            (3.01, ["good quality"]),
+            (4.0, ["good quality"]),
+            (4.01, ["masterpiece", "best quality"]),
             (5.0, ["masterpiece", "best quality"]),
         )
         for score, expected in cases:
@@ -139,6 +140,17 @@ class PolicyTests(unittest.TestCase):
         for invalid in (float("nan"), float("inf"), 0.99, 5.01):
             with self.subTest(score=invalid), self.assertRaises(PolicyError):
                 quality_for_score(invalid)
+
+    def test_lift_aesthetic_score_raises_by_the_offset_and_clamps_at_five(self) -> None:
+        cases = ((1.0, 1.5), (3.0, 3.5), (4.49, 4.99), (4.6, 5.0), (5.0, 5.0))
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertAlmostEqual(expected, lift_aesthetic_score(raw))
+        for invalid in (float("nan"), float("inf")):
+            with self.subTest(score=invalid), self.assertRaises(PolicyError):
+                lift_aesthetic_score(invalid)
+        with self.assertRaises(PolicyError):
+            lift_aesthetic_score(True)
 
     def test_coupled_dropout_can_never_remove_appearance_and_nl_together(self) -> None:
         config = _config()

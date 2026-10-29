@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .model import AestheticScorer, load_lse14_scorer
-from .policy import PolicyError, apply_policy
+from .policy import PolicyError, apply_policy, lift_aesthetic_score
 from .protocol import MAX_BATCH_SIZE, PolicyHelloV1, PolicyWorkItemV1, parse_hello
 from .resource import PolicyResourceError, load_policy_resource
 
@@ -223,7 +223,13 @@ class PolicyWorker:
                         values = self.scorer.score([images[item.sampleId] for item in micro_items])
                         if len(values) != len(micro_items):
                             raise RuntimeError("policy scorer returned the wrong result count")
-                        scores.update((item.sampleId, score) for item, score in zip(micro_items, values, strict=True))
+                        # The offset is applied to the inferred score itself, not to the
+                        # tier cut, so the reported aestheticScore and the frozen tiers
+                        # both see the same raised value.
+                        scores.update(
+                            (item.sampleId, lift_aesthetic_score(score))
+                            for item, score in zip(micro_items, values, strict=True)
+                        )
                     except Exception as exc:
                         error = PolicyWorkerError("policy_inference_failed", f"aesthetic inference failed: {exc}")
                         for item in micro_items:
